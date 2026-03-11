@@ -1,4 +1,4 @@
-use crate::app::App;
+use crate::app::{App, TreeRow};
 use crate::data::PreviewMessage;
 use chrono::{Local, TimeZone};
 use ratatui::{
@@ -17,31 +17,71 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     let main_chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+        .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
         .split(chunks[0]);
 
-    // Session list (filtered)
-    let items: Vec<ListItem> = app
-        .filtered_indices
-        .iter()
-        .map(|&i| &app.sessions[i])
-        .map(|s| {
-            let date = format_relative_date(s.last_timestamp);
-            let line = Line::from(vec![
-                Span::styled(
-                    truncate(&s.project_name, 28),
-                    Style::default().fg(Color::White),
-                ),
-                Span::raw("  "),
-                Span::styled(date, Style::default().fg(Color::DarkGray)),
-            ]);
-            ListItem::new(line)
-        })
-        .collect();
+    // Session list (filtered or tree)
+    let items: Vec<ListItem> = if app.tree_view {
+        app.tree_rows
+            .iter()
+            .map(|row| match row {
+                TreeRow::Header {
+                    project_name,
+                    session_count,
+                    project,
+                } => {
+                    let arrow = if app.collapsed.contains(project) {
+                        "▸"
+                    } else {
+                        "▾"
+                    };
+                    let line = Line::from(vec![Span::styled(
+                        format!("{} {} ({})", arrow, project_name, session_count),
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    )]);
+                    ListItem::new(line)
+                }
+                TreeRow::Session { session_index } => {
+                    let s = &app.sessions[*session_index];
+                    let date = format_relative_date(s.last_timestamp);
+                    let line = Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled(date, Style::default().fg(Color::DarkGray)),
+                        Span::raw(format!("  {} msg", s.entry_count)),
+                    ]);
+                    ListItem::new(line)
+                }
+            })
+            .collect()
+    } else {
+        app.filtered_indices
+            .iter()
+            .map(|&i| &app.sessions[i])
+            .map(|s| {
+                let date = format_relative_date(s.last_timestamp);
+                let line = Line::from(vec![
+                    Span::styled(
+                        truncate(&s.project_name, 28),
+                        Style::default().fg(Color::White),
+                    ),
+                    Span::raw("  "),
+                    Span::styled(date, Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!("  {} msg", s.entry_count),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]);
+                ListItem::new(line)
+            })
+            .collect()
+    };
 
+    let view_label = if app.tree_view { "[tree]" } else { "[flat]" };
     let title = match &app.filter_path {
-        Some(p) => format!(" Sessions ({}) ", p),
-        None => " Sessions ".to_string(),
+        Some(p) => format!(" Sessions {} ({}) ", view_label, p),
+        None => format!(" Sessions {} ", view_label),
     };
 
     let list = List::new(items)
@@ -113,6 +153,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             Span::raw(" scroll  "),
             Span::styled("/", Style::default().fg(Color::Yellow)),
             Span::raw(" search  "),
+            Span::styled("Tab", Style::default().fg(Color::Yellow)),
+            Span::raw(" tree  "),
             Span::styled("q", Style::default().fg(Color::Yellow)),
             Span::raw(" quit"),
         ]))

@@ -31,8 +31,12 @@ fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     sessions: Vec<data::SessionInfo>,
     filter_path: Option<String>,
+    flat: bool,
 ) -> Result<()> {
     let mut app = App::new(sessions, filter_path);
+    if flat {
+        app.tree_view = false;
+    }
 
     loop {
         terminal.draw(|frame| ui::draw(frame, &mut app))?;
@@ -56,10 +60,12 @@ fn run_app(
 }
 
 fn main() -> Result<()> {
-    let filter_path = std::env::args().nth(1).map(|arg| {
-        std::fs::canonicalize(&arg)
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let flat = args.iter().any(|a| a == "--flat");
+    let filter_path = args.iter().find(|a| !a.starts_with('-')).map(|arg| {
+        std::fs::canonicalize(arg)
             .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or(arg)
+            .unwrap_or_else(|_| arg.clone())
     });
 
     let sessions = data::load_sessions(filter_path.as_deref())?;
@@ -80,7 +86,7 @@ fn main() -> Result<()> {
     }));
 
     let mut terminal = setup_terminal()?;
-    let result = run_app(&mut terminal, sessions, filter_path);
+    let result = run_app(&mut terminal, sessions, filter_path, flat);
     restore_terminal()?;
     result
 }
