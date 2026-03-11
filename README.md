@@ -19,6 +19,14 @@ A terminal UI for browsing your Claude Code session history, previewing conversa
 - [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) installed and on your `PATH`
 - Existing session history in `~/.claude/`
 
+## Install
+
+```sh
+./install.sh
+```
+
+This builds a release binary and symlinks it to `~/.local/bin/ccsm`. Make sure `~/.local/bin` is in your `PATH`.
+
 ## Build
 
 ```sh
