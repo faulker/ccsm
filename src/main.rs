@@ -27,15 +27,12 @@ fn restore_terminal() -> Result<()> {
     Ok(())
 }
 
-fn main() -> Result<()> {
-    let sessions = data::load_sessions()?;
-    if sessions.is_empty() {
-        eprintln!("No Claude Code sessions found in ~/.claude/history.jsonl");
-        return Ok(());
-    }
-
-    let mut terminal = setup_terminal()?;
-    let mut app = App::new(sessions);
+fn run_app(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    sessions: Vec<data::SessionInfo>,
+    filter_path: Option<String>,
+) -> Result<()> {
+    let mut app = App::new(sessions, filter_path);
 
     loop {
         terminal.draw(|frame| ui::draw(frame, &mut app))?;
@@ -51,10 +48,39 @@ fn main() -> Result<()> {
         if let Some((session_id, cwd)) = app.launch_session.take() {
             restore_terminal()?;
             App::launch_claude(&session_id, &cwd)?;
-            terminal = setup_terminal()?;
+            *terminal = setup_terminal()?;
         }
     }
 
-    restore_terminal()?;
     Ok(())
+}
+
+fn main() -> Result<()> {
+    let filter_path = std::env::args().nth(1).map(|arg| {
+        std::fs::canonicalize(&arg)
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or(arg)
+    });
+
+    let sessions = data::load_sessions(filter_path.as_deref())?;
+    if sessions.is_empty() {
+        if filter_path.is_some() {
+            eprintln!("No Claude Code sessions found for the specified path");
+        } else {
+            eprintln!("No Claude Code sessions found in ~/.claude/history.jsonl");
+        }
+        return Ok(());
+    }
+
+    // Install panic hook to restore terminal on panic
+    let original_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        let _ = restore_terminal();
+        original_hook(panic_info);
+    }));
+
+    let mut terminal = setup_terminal()?;
+    let result = run_app(&mut terminal, sessions, filter_path);
+    restore_terminal()?;
+    result
 }

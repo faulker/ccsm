@@ -20,10 +20,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
         .split(chunks[0]);
 
-    // Session list
+    // Session list (filtered)
     let items: Vec<ListItem> = app
-        .sessions
+        .filtered_indices
         .iter()
+        .map(|&i| &app.sessions[i])
         .map(|s| {
             let date = format_relative_date(s.last_timestamp);
             let line = Line::from(vec![
@@ -38,11 +39,16 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         })
         .collect();
 
+    let title = match &app.filter_path {
+        Some(p) => format!(" Sessions ({}) ", p),
+        None => " Sessions ".to_string(),
+    };
+
     let list = List::new(items)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" Sessions "),
+                .title(title),
         )
         .highlight_style(
             Style::default()
@@ -59,6 +65,16 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let preview = app.current_preview().to_vec();
     let preview_text = build_preview_text(&preview);
 
+    // Calculate content height to resolve scroll-to-bottom
+    let preview_area = main_chunks[1];
+    let inner_width = preview_area.width.saturating_sub(2) as usize; // borders
+    let inner_height = preview_area.height.saturating_sub(2); // borders
+    let content_height = estimate_wrapped_height(&preview_text, inner_width);
+    let max_scroll = (content_height as u16).saturating_sub(inner_height);
+    if app.preview_scroll > max_scroll {
+        app.preview_scroll = max_scroll;
+    }
+
     let preview_widget = Paragraph::new(preview_text)
         .block(
             Block::default()
@@ -68,21 +84,41 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         .wrap(Wrap { trim: false })
         .scroll((app.preview_scroll, 0));
 
-    frame.render_widget(preview_widget, main_chunks[1]);
+    frame.render_widget(preview_widget, preview_area);
 
-    // Help bar
-    let help = Paragraph::new(Line::from(vec![
-        Span::styled(" ↑↓/jk", Style::default().fg(Color::Yellow)),
-        Span::raw(" navigate  "),
-        Span::styled("Enter", Style::default().fg(Color::Yellow)),
-        Span::raw(" open in claude  "),
-        Span::styled("J/K", Style::default().fg(Color::Yellow)),
-        Span::raw(" scroll preview  "),
-        Span::styled("q", Style::default().fg(Color::Yellow)),
-        Span::raw(" quit"),
-    ]));
+    // Help / search bar
+    let bottom_bar = if app.filter_active {
+        Paragraph::new(Line::from(vec![
+            Span::styled(" /", Style::default().fg(Color::Yellow)),
+            Span::raw(&app.filter_text),
+            Span::styled("█", Style::default().fg(Color::Yellow)),
+        ]))
+    } else if !app.filter_text.is_empty() {
+        Paragraph::new(Line::from(vec![
+            Span::styled(" filter: ", Style::default().fg(Color::DarkGray)),
+            Span::raw(&app.filter_text),
+            Span::raw("  "),
+            Span::styled("/", Style::default().fg(Color::Yellow)),
+            Span::raw(" edit  "),
+            Span::styled("Esc", Style::default().fg(Color::Yellow)),
+            Span::raw(" clear"),
+        ]))
+    } else {
+        Paragraph::new(Line::from(vec![
+            Span::styled(" ↑↓/jk", Style::default().fg(Color::Yellow)),
+            Span::raw(" navigate  "),
+            Span::styled("Enter", Style::default().fg(Color::Yellow)),
+            Span::raw(" open  "),
+            Span::styled("J/K", Style::default().fg(Color::Yellow)),
+            Span::raw(" scroll  "),
+            Span::styled("/", Style::default().fg(Color::Yellow)),
+            Span::raw(" search  "),
+            Span::styled("q", Style::default().fg(Color::Yellow)),
+            Span::raw(" quit"),
+        ]))
+    };
 
-    frame.render_widget(help, chunks[1]);
+    frame.render_widget(bottom_bar, chunks[1]);
 }
 
 fn build_preview_text(messages: &[PreviewMessage]) -> Text<'static> {
@@ -100,9 +136,10 @@ fn build_preview_text(messages: &[PreviewMessage]) -> Text<'static> {
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         )));
 
-        // Truncate very long messages
-        let text = if msg.text.len() > 2000 {
-            format!("{}...", &msg.text[..2000])
+        // Truncate very long messages (char-aware to avoid UTF-8 panics)
+        let text = if msg.text.chars().count() > 2000 {
+            let truncated: String = msg.text.chars().take(2000).collect();
+            format!("{}...", truncated)
         } else {
             msg.text.clone()
         };
@@ -141,10 +178,29 @@ fn format_relative_date(timestamp_ms: i64) -> String {
     }
 }
 
+fn estimate_wrapped_height(text: &Text, width: usize) -> usize {
+    if width == 0 {
+        return text.lines.len();
+    }
+    text.lines
+        .iter()
+        .map(|line| {
+            let line_width: usize = line.spans.iter().map(|s| s.content.len()).sum();
+            if line_width == 0 {
+                1
+            } else {
+                (line_width + width - 1) / width
+            }
+        })
+        .sum()
+}
+
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
+    let char_count = s.chars().count();
+    if char_count <= max {
         format!("{:<width$}", s, width = max)
     } else {
-        format!("{}…", &s[..max - 1])
+        let truncated: String = s.chars().take(max - 1).collect();
+        format!("{}…", truncated)
     }
 }

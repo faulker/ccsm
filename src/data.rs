@@ -61,7 +61,7 @@ struct ContentBlock {
     text: Option<String>,
 }
 
-pub fn load_sessions() -> Result<Vec<SessionInfo>> {
+pub fn load_sessions(filter_path: Option<&str>) -> Result<Vec<SessionInfo>> {
     let history_path = dirs::home_dir()
         .context("No home directory")?
         .join(".claude/history.jsonl");
@@ -94,6 +94,12 @@ pub fn load_sessions() -> Result<Vec<SessionInfo>> {
             None => continue,
         };
         let project = entry.project.unwrap_or_default();
+
+        if let Some(fp) = filter_path {
+            if !project.starts_with(fp) {
+                continue;
+            }
+        }
         let timestamp = entry.timestamp.unwrap_or(0);
 
         let project_name = Path::new(&project)
