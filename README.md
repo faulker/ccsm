@@ -72,12 +72,12 @@ Use `--flat` to start in flat view instead of the default grouped tree view:
 | `h` / `←` | Collapse group (tree view) |
 | `Enter` | Resume session / toggle group |
 | `Tab` | Cycle: tree [name] → tree [short dir] → tree [full dir] → flat → tree [name] |
-| `J` (shift) | Scroll preview down |
-| `K` (shift) | Scroll preview up |
+| `Shift + J` | Scroll preview down |
+| `Shift + K` | Scroll preview up |
 | `/` | Activate search/filter mode |
 | `e` | Toggle show/hide empty sessions |
 | `n` | New Claude session in selected project's directory |
-| `N` (shift) | Open directory browser to start a new session anywhere |
+| `Shift + N` | Open directory browser to start a new session anywhere |
 | `q` / `Esc` / `Ctrl+C` | Quit |
 
 ### Filter Mode
@@ -108,16 +108,16 @@ When the directory browser is open (triggered by `N`):
 
 ### Tree View (default)
 ```
-┌─ Sessions [tree] [name] ────┬─ Preview ─────────────────────────┐
-│ ▶ ▸ my-project (3)          │  ~/Dev/my-project  ⎇ main        │
-│   ▸ other-project (2)       │───────────────────────────────────│
-│   ...                       │ ▎ USER:                           │
+┌─ Sessions [tree] [name] ─────┬─ Preview ─────────────────────────┐
+│ ▶ ▸ my-project (3)           │  ~/Dev/my-project  ⎇ main        │
+│   ▸ other-project (2)        │───────────────────────────────────│
+│   ...                        │ ▎ USER:                           │
 │                              │ can you update the readme         │
 │                              │                                   │
-│                              │ ▎ ASSISTANT:                     │
+│                              │ ▎ ASSISTANT:                      │
 │                              │ Sure, let me read the file...     │
 ├──────────────────────────────┴───────────────────────────────────┤
-│ ↑↓/jk navigate  Enter open  J/K scroll  / search  Tab view      │
+│ ↑↓/jk navigate  Enter open  J/K scroll  / search  Tab view       │
 │ e show empty  n new  N browse  q quit                            │
 └──────────────────────────────────────────────────────────────────┘
 ```
@@ -129,7 +129,7 @@ When the directory browser is open (triggered by `N`):
 │   other-project     3d ago  │ can you update the readme         │
 │   ...                       │                                   │
 ├─────────────────────────────┴───────────────────────────────────┤
-│ ↑↓/jk navigate  Enter open  J/K scroll  / search  Tab view     │
+│ ↑↓/jk navigate  Enter open  J/K scroll  / search  Tab view      │
 │ e show empty  n new  N browse  q quit                           │
 └─────────────────────────────────────────────────────────────────┘
 ```
