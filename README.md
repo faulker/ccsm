@@ -108,16 +108,15 @@ When the directory browser is open (triggered by `N`):
 
 ### Tree View (default)
 ```
-┌─ Sessions [tree] [name] ─────┬─ Preview ────────────────────────┐
-│ ▶ ▸ my-project (3)            │ ┌────────────────────────────────┐│
-│   ▸ other-project (2)         │ │  ~/Dev/my-project  ⎇ main    ││
-│   ...                         │ ├────────────────────────────────┤│
-│                               │ │▎ USER:                        ││
-│                               │ │can you update the readme       ││
-│                               │ │                                ││
-│                               │ │▎ ASSISTANT:                   ││
-│                               │ │Sure, let me read the file...   ││
-├───────────────────────────────┴─┴────────────────────────────────┤
+┌─ Sessions [tree] [name] ────┬─ Preview ─────────────────────────┐
+│ ▶ ▸ my-project (3)          │  ~/Dev/my-project  ⎇ main        │
+│   ▸ other-project (2)       │───────────────────────────────────│
+│   ...                       │ ▎ USER:                           │
+│                              │ can you update the readme         │
+│                              │                                   │
+│                              │ ▎ ASSISTANT:                     │
+│                              │ Sure, let me read the file...     │
+├──────────────────────────────┴───────────────────────────────────┤
 │ ↑↓/jk navigate  Enter open  J/K scroll  / search  Tab view      │
 │ e show empty  n new  N browse  q quit                            │
 └──────────────────────────────────────────────────────────────────┘
@@ -125,13 +124,14 @@ When the directory browser is open (triggered by `N`):
 
 ### Flat View
 ```
-┌─ Sessions [flat] ────────────┬─ Preview ─────────────────────────┐
-│ ▶ my-project         2h ago  │ ▎ USER:                           │
-│   other-project      3d ago  │ can you update the readme          │
-│   ...                        │                                    │
-├──────────────────────────────┴────────────────────────────────────┤
-│ ↑↓/jk navigate  Enter open  J/K scroll  / search  Tab view  q quit│
-└───────────────────────────────────────────────────────────────────┘
+┌─ Sessions [flat] ───────────┬─ Preview ─────────────────────────┐
+│ ▶ my-project        2h ago  │ ▎ USER:                           │
+│   other-project     3d ago  │ can you update the readme         │
+│   ...                       │                                   │
+├─────────────────────────────┴───────────────────────────────────┤
+│ ↑↓/jk navigate  Enter open  J/K scroll  / search  Tab view     │
+│ e show empty  n new  N browse  q quit                           │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
 ## Configuration
