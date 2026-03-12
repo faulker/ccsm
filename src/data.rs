@@ -13,6 +13,13 @@ pub struct SessionInfo {
     pub first_timestamp: i64,
     pub last_timestamp: i64,
     pub entry_count: usize,
+    pub has_data: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SessionMeta {
+    pub cwd: Option<String>,
+    pub git_branch: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -39,6 +46,9 @@ struct SessionEntry {
     #[serde(rename = "isMeta")]
     is_meta: Option<bool>,
     message: Option<MessageData>,
+    cwd: Option<String>,
+    #[serde(rename = "gitBranch")]
+    git_branch: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -125,16 +135,21 @@ pub fn load_sessions(filter_path: Option<&str>) -> Result<Vec<SessionInfo>> {
                 first_timestamp: timestamp,
                 last_timestamp: timestamp,
                 entry_count: 1,
+                has_data: false,
             });
     }
 
     let mut result: Vec<SessionInfo> = sessions.into_values().collect();
+    for session in &mut result {
+        session.has_data = session_file_path(&session.project, &session.session_id).is_some();
+    }
     result.sort_by(|a, b| b.last_timestamp.cmp(&a.last_timestamp));
+
     Ok(result)
 }
 
 fn project_to_dir_name(project: &str) -> String {
-    project.replace('/', "-")
+    project.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect()
 }
 
 fn session_file_path(project: &str, session_id: &str) -> Option<PathBuf> {
@@ -151,25 +166,26 @@ fn session_file_path(project: &str, session_id: &str) -> Option<PathBuf> {
     }
 }
 
-pub fn load_preview(project: &str, session_id: &str) -> Vec<PreviewMessage> {
+pub fn load_preview(project: &str, session_id: &str) -> (SessionMeta, Vec<PreviewMessage>) {
     let path = match session_file_path(project, session_id) {
         Some(p) => p,
-        None => return vec![PreviewMessage {
+        None => return (SessionMeta::default(), vec![PreviewMessage {
             role: "system".to_string(),
             text: "No session data available".to_string(),
-        }],
+        }]),
     };
 
     let file = match File::open(&path) {
         Ok(f) => f,
-        Err(_) => return vec![PreviewMessage {
+        Err(_) => return (SessionMeta::default(), vec![PreviewMessage {
             role: "system".to_string(),
             text: "Failed to read session file".to_string(),
-        }],
+        }]),
     };
 
     let reader = BufReader::new(file);
     let mut messages = Vec::new();
+    let mut meta = SessionMeta::default();
 
     for line in reader.lines() {
         let line = match line {
@@ -184,6 +200,18 @@ pub fn load_preview(project: &str, session_id: &str) -> Vec<PreviewMessage> {
             Ok(e) => e,
             Err(_) => continue,
         };
+
+        // Track the last seen cwd and gitBranch
+        if let Some(cwd) = entry.cwd {
+            if !cwd.is_empty() {
+                meta.cwd = Some(cwd);
+            }
+        }
+        if let Some(branch) = entry.git_branch {
+            if !branch.is_empty() {
+                meta.git_branch = Some(branch);
+            }
+        }
 
         if entry.is_meta.unwrap_or(false) {
             continue;
@@ -226,7 +254,7 @@ pub fn load_preview(project: &str, session_id: &str) -> Vec<PreviewMessage> {
 
     // Keep last 20 turns
     let start = messages.len().saturating_sub(20);
-    messages[start..].to_vec()
+    (meta, messages[start..].to_vec())
 }
 
 #[cfg(test)]
@@ -238,6 +266,18 @@ mod tests {
         assert_eq!(
             project_to_dir_name("/Users/sane/Dev/foo"),
             "-Users-sane-Dev-foo"
+        );
+        assert_eq!(
+            project_to_dir_name("/Users/sane/My Drive/Dev/foo"),
+            "-Users-sane-My-Drive-Dev-foo"
+        );
+        assert_eq!(
+            project_to_dir_name("/Users/sane/.claude"),
+            "-Users-sane--claude"
+        );
+        assert_eq!(
+            project_to_dir_name("/Users/sane/Dev/reki_base"),
+            "-Users-sane-Dev-reki-base"
         );
     }
 
@@ -280,8 +320,10 @@ mod tests {
 
     #[test]
     fn test_load_preview_missing_file() {
-        let msgs = load_preview("/nonexistent/path", "fake-id");
+        let (meta, msgs) = load_preview("/nonexistent/path", "fake-id");
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].role, "system");
+        assert!(meta.cwd.is_none());
+        assert!(meta.git_branch.is_none());
     }
 }

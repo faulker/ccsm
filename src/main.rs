@@ -1,11 +1,12 @@
 mod app;
+mod config;
 mod data;
 mod ui;
 
 use anyhow::Result;
 use app::App;
 use crossterm::{
-    event,
+    event::{self, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags},
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
 };
@@ -16,12 +17,18 @@ use std::io;
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
     terminal::enable_raw_mode()?;
     io::stdout().execute(EnterAlternateScreen)?;
+    let _ = io::stdout().execute(PushKeyboardEnhancementFlags(
+        KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+            | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+            | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES,
+    ));
     let backend = CrosstermBackend::new(io::stdout());
     let terminal = Terminal::new(backend)?;
     Ok(terminal)
 }
 
 fn restore_terminal() -> Result<()> {
+    let _ = io::stdout().execute(PopKeyboardEnhancementFlags);
     terminal::disable_raw_mode()?;
     io::stdout().execute(LeaveAlternateScreen)?;
     Ok(())
@@ -33,7 +40,8 @@ fn run_app(
     filter_path: Option<String>,
     flat: bool,
 ) -> Result<()> {
-    let mut app = App::new(sessions, filter_path);
+    let config = config::Config::load();
+    let mut app = App::new(sessions, filter_path, config);
     if flat {
         app.tree_view = false;
     }
@@ -49,9 +57,16 @@ fn run_app(
             break;
         }
 
-        if let Some((session_id, cwd)) = app.launch_session.take() {
+        if let Some(req) = app.launch_session.take() {
             restore_terminal()?;
-            App::launch_claude(&session_id, &cwd)?;
+            match req {
+                app::LaunchRequest::Resume { session_id, cwd } => {
+                    App::launch_claude(&session_id, &cwd)?;
+                }
+                app::LaunchRequest::New { cwd } => {
+                    App::launch_claude_new(&cwd)?;
+                }
+            }
             *terminal = setup_terminal()?;
         }
     }

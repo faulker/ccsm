@@ -1,13 +1,25 @@
-use crate::app::{App, TreeRow};
+use crate::app::{App, AppMode, TreeRow};
 use crate::data::PreviewMessage;
 use chrono::{Local, TimeZone};
 use ratatui::{
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
     Frame,
 };
+
+// Catppuccin Mocha-inspired palette
+const BG_SURFACE: Color = Color::Rgb(30, 30, 46);
+const FG_TEXT: Color = Color::Rgb(205, 214, 244);
+const FG_SUBTEXT: Color = Color::Rgb(147, 153, 178);
+const FG_OVERLAY: Color = Color::Rgb(88, 91, 112);
+const ACCENT_BLUE: Color = Color::Rgb(137, 180, 250);
+const ACCENT_GREEN: Color = Color::Rgb(166, 218, 149);
+const ACCENT_MAUVE: Color = Color::Rgb(203, 166, 247);
+const ACCENT_PEACH: Color = Color::Rgb(250, 179, 135);
+const ACCENT_TEAL: Color = Color::Rgb(148, 226, 213);
+const HIGHLIGHT_BG: Color = Color::Rgb(69, 71, 90);
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
@@ -38,7 +50,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                     let line = Line::from(vec![Span::styled(
                         format!("{} {} ({})", arrow, project_name, session_count),
                         Style::default()
-                            .fg(Color::Cyan)
+                            .fg(ACCENT_TEAL)
                             .add_modifier(Modifier::BOLD),
                     )]);
                     ListItem::new(line)
@@ -48,8 +60,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                     let date = format_relative_date(s.last_timestamp);
                     let line = Line::from(vec![
                         Span::raw("  "),
-                        Span::styled(date, Style::default().fg(Color::DarkGray)),
-                        Span::raw(format!("  {} msg", s.entry_count)),
+                        Span::styled(date, Style::default().fg(FG_SUBTEXT)),
+                        Span::styled(
+                            format!("  {} msg", s.entry_count),
+                            Style::default()
+                                .fg(FG_OVERLAY)
+                                .add_modifier(Modifier::DIM),
+                        ),
                     ]);
                     ListItem::new(line)
                 }
@@ -60,17 +77,20 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             .iter()
             .map(|&i| &app.sessions[i])
             .map(|s| {
+                let name = app.display_name(s);
                 let date = format_relative_date(s.last_timestamp);
                 let line = Line::from(vec![
                     Span::styled(
-                        truncate(&s.project_name, 28),
-                        Style::default().fg(Color::White),
+                        truncate(&name, 28),
+                        Style::default().fg(FG_TEXT),
                     ),
                     Span::raw("  "),
-                    Span::styled(date, Style::default().fg(Color::DarkGray)),
+                    Span::styled(date, Style::default().fg(FG_SUBTEXT)),
                     Span::styled(
                         format!("  {} msg", s.entry_count),
-                        Style::default().fg(Color::DarkGray),
+                        Style::default()
+                            .fg(FG_OVERLAY)
+                            .add_modifier(Modifier::DIM),
                     ),
                 ]);
                 ListItem::new(line)
@@ -78,21 +98,39 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             .collect()
     };
 
+    let title_style = Style::default().fg(ACCENT_BLUE).add_modifier(Modifier::BOLD);
+    let mode_style = Style::default().fg(ACCENT_GREEN).add_modifier(Modifier::BOLD);
     let view_label = if app.tree_view { "[tree]" } else { "[flat]" };
-    let title = match &app.filter_path {
-        Some(p) => format!(" Sessions {} ({}) ", view_label, p),
-        None => format!(" Sessions {} ", view_label),
-    };
+
+    let mut title_spans = vec![
+        Span::styled(" Sessions ", title_style),
+        Span::styled(view_label, title_style),
+    ];
+    if app.tree_view {
+        title_spans.push(Span::styled(" ", title_style));
+        title_spans.push(Span::styled(app.display_mode.label(), mode_style));
+    }
+    if !app.hide_empty {
+        title_spans.push(Span::styled(" [showing empty]", title_style));
+    }
+    if let Some(p) = &app.filter_path {
+        title_spans.push(Span::styled(format!(" ({})", p), title_style));
+    }
+    title_spans.push(Span::styled(" ", title_style));
 
     let list = List::new(items)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(title),
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(ACCENT_BLUE))
+                .title(Line::from(title_spans))
+                .style(Style::default().bg(BG_SURFACE)),
         )
         .highlight_style(
             Style::default()
-                .bg(Color::DarkGray)
+                .bg(HIGHLIGHT_BG)
+                .fg(ACCENT_BLUE)
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("▶ ");
@@ -102,11 +140,53 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     frame.render_stateful_widget(list, main_chunks[0], &mut state);
 
     // Preview
-    let preview = app.current_preview().to_vec();
+    let (meta, preview_slice) = app.current_preview();
+    let meta = meta.clone();
+    let preview = preview_slice.to_vec();
     let preview_text = build_preview_text(&preview);
 
-    // Calculate content height to resolve scroll-to-bottom
-    let preview_area = main_chunks[1];
+    let has_meta = meta.cwd.is_some() || meta.git_branch.is_some();
+    let right_area = main_chunks[1];
+
+    let right_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(if has_meta {
+            vec![Constraint::Length(3), Constraint::Min(3)]
+        } else {
+            vec![Constraint::Length(0), Constraint::Min(3)]
+        })
+        .split(right_area);
+
+    // Session info bar
+    if has_meta {
+        let mut spans: Vec<Span> = Vec::new();
+        if let Some(cwd) = &meta.cwd {
+            spans.push(Span::styled(" ", Style::default().fg(FG_OVERLAY)));
+            spans.push(Span::styled(cwd.clone(), Style::default().fg(FG_SUBTEXT)));
+        }
+        if let Some(branch) = &meta.git_branch {
+            if !spans.is_empty() {
+                spans.push(Span::raw("  "));
+            }
+            spans.push(Span::styled(" ⎇ ", Style::default().fg(ACCENT_MAUVE)));
+            spans.push(Span::styled(
+                branch.clone(),
+                Style::default().fg(ACCENT_MAUVE),
+            ));
+        }
+
+        let info_bar = Paragraph::new(Line::from(spans)).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(FG_OVERLAY))
+                .style(Style::default().bg(BG_SURFACE)),
+        );
+        frame.render_widget(info_bar, right_chunks[0]);
+    }
+
+    // Preview pane
+    let preview_area = right_chunks[1];
     let inner_width = preview_area.width.saturating_sub(2) as usize; // borders
     let inner_height = preview_area.height.saturating_sub(2); // borders
     let content_height = estimate_wrapped_height(&preview_text, inner_width);
@@ -119,7 +199,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" Preview "),
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(FG_OVERLAY))
+                .title(Span::styled(
+                    " Preview ",
+                    Style::default().fg(FG_SUBTEXT),
+                ))
+                .style(Style::default().bg(BG_SURFACE)),
         )
         .wrap(Wrap { trim: false })
         .scroll((app.preview_scroll, 0));
@@ -127,56 +213,117 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     frame.render_widget(preview_widget, preview_area);
 
     // Help / search bar
+    let bar_style = Style::default().bg(HIGHLIGHT_BG);
     let bottom_bar = if app.filter_active {
         Paragraph::new(Line::from(vec![
-            Span::styled(" /", Style::default().fg(Color::Yellow)),
-            Span::raw(&app.filter_text),
-            Span::styled("█", Style::default().fg(Color::Yellow)),
+            Span::styled(
+                " /",
+                Style::default()
+                    .fg(ACCENT_PEACH)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(&app.filter_text, Style::default().fg(FG_TEXT)),
+            Span::styled("█", Style::default().fg(ACCENT_BLUE)),
         ]))
+        .style(bar_style)
     } else if !app.filter_text.is_empty() {
         Paragraph::new(Line::from(vec![
-            Span::styled(" filter: ", Style::default().fg(Color::DarkGray)),
-            Span::raw(&app.filter_text),
+            Span::styled(" filter: ", Style::default().fg(FG_SUBTEXT)),
+            Span::styled(&app.filter_text, Style::default().fg(FG_TEXT)),
             Span::raw("  "),
-            Span::styled("/", Style::default().fg(Color::Yellow)),
-            Span::raw(" edit  "),
-            Span::styled("Esc", Style::default().fg(Color::Yellow)),
-            Span::raw(" clear"),
+            Span::styled(
+                "/",
+                Style::default()
+                    .fg(ACCENT_PEACH)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" edit  ", Style::default().fg(FG_SUBTEXT)),
+            Span::styled(
+                "Esc",
+                Style::default()
+                    .fg(ACCENT_PEACH)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" clear", Style::default().fg(FG_SUBTEXT)),
         ]))
+        .style(bar_style)
     } else {
+        let key_style = Style::default()
+            .fg(ACCENT_PEACH)
+            .add_modifier(Modifier::BOLD);
+        let hint_style = Style::default().fg(FG_SUBTEXT);
+        let shift_key_style = if app.shift_active {
+            Style::default().fg(FG_TEXT).add_modifier(Modifier::BOLD)
+        } else {
+            key_style
+        };
+        let shift_hint_style = if app.shift_active {
+            Style::default().fg(FG_TEXT).add_modifier(Modifier::BOLD)
+        } else {
+            hint_style
+        };
+
         Paragraph::new(Line::from(vec![
-            Span::styled(" ↑↓/jk", Style::default().fg(Color::Yellow)),
-            Span::raw(" navigate  "),
-            Span::styled("Enter", Style::default().fg(Color::Yellow)),
-            Span::raw(" open  "),
-            Span::styled("J/K", Style::default().fg(Color::Yellow)),
-            Span::raw(" scroll  "),
-            Span::styled("/", Style::default().fg(Color::Yellow)),
-            Span::raw(" search  "),
-            Span::styled("Tab", Style::default().fg(Color::Yellow)),
-            Span::raw(" tree  "),
-            Span::styled("q", Style::default().fg(Color::Yellow)),
-            Span::raw(" quit"),
+            Span::styled(" ↑↓/jk", key_style),
+            Span::styled(" navigate  ", hint_style),
+            Span::styled("Enter", key_style),
+            Span::styled(" open  ", hint_style),
+            Span::styled("J/K", shift_key_style),
+            Span::styled(" scroll  ", shift_hint_style),
+            Span::styled("/", key_style),
+            Span::styled(" search  ", hint_style),
+            Span::styled("Tab", key_style),
+            Span::styled(" view  ", hint_style),
+            Span::styled("e", key_style),
+            Span::styled(" show empty  ", hint_style),
+            Span::styled("n", key_style),
+            Span::styled(" new  ", hint_style),
+            Span::styled("N", shift_key_style),
+            Span::styled(" browse  ", shift_hint_style),
+            Span::styled("q", key_style),
+            Span::styled(" quit", hint_style),
         ]))
+        .style(bar_style)
     };
 
     frame.render_widget(bottom_bar, chunks[1]);
+
+    // Directory browser overlay
+    if app.mode == AppMode::DirBrowser {
+        if let Some(browser) = &app.dir_browser {
+            draw_dir_browser(frame, browser);
+        }
+    }
 }
 
 fn build_preview_text(messages: &[PreviewMessage]) -> Text<'static> {
     let mut lines: Vec<Line<'static>> = Vec::new();
 
-    for msg in messages {
+    for (i, msg) in messages.iter().enumerate() {
+        if i > 0 {
+            // Separator between messages
+            lines.push(Line::from(Span::styled(
+                "───────────────────────────────────────",
+                Style::default().fg(FG_OVERLAY),
+            )));
+        }
+
         let (label, color) = match msg.role.as_str() {
-            "user" => ("USER", Color::Cyan),
-            "assistant" => ("ASSISTANT", Color::Green),
-            _ => ("SYSTEM", Color::Yellow),
+            "user" => ("USER", ACCENT_MAUVE),
+            "assistant" => ("ASSISTANT", ACCENT_GREEN),
+            _ => ("SYSTEM", ACCENT_PEACH),
         };
 
-        lines.push(Line::from(Span::styled(
-            format!("{}:", label),
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        )));
+        lines.push(Line::from(vec![
+            Span::styled(
+                "▎ ",
+                Style::default().fg(color),
+            ),
+            Span::styled(
+                format!("{}:", label),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+        ]));
 
         // Truncate very long messages (char-aware to avoid UTF-8 panics)
         let text = if msg.text.chars().count() > 2000 {
@@ -187,7 +334,10 @@ fn build_preview_text(messages: &[PreviewMessage]) -> Text<'static> {
         };
 
         for line in text.lines() {
-            lines.push(Line::from(Span::raw(line.to_string())));
+            lines.push(Line::from(Span::styled(
+                line.to_string(),
+                Style::default().fg(FG_TEXT),
+            )));
         }
 
         lines.push(Line::from(""));
@@ -235,6 +385,147 @@ fn estimate_wrapped_height(text: &Text, width: usize) -> usize {
             }
         })
         .sum()
+}
+
+fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+    let popup_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(area);
+
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(popup_layout[1])[1]
+}
+
+fn draw_dir_browser(frame: &mut Frame, browser: &crate::app::DirBrowser) {
+    let area = centered_rect(60, 70, frame.area());
+    frame.render_widget(Clear, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(3),
+            Constraint::Length(1),
+        ])
+        .split(area);
+
+    // Path bar
+    let path_content = if browser.input_active {
+        Line::from(vec![
+            Span::styled(&browser.input_text, Style::default().fg(FG_TEXT)),
+            Span::styled("█", Style::default().fg(ACCENT_BLUE)),
+        ])
+    } else {
+        Line::from(Span::styled(
+            browser.current_dir.to_string_lossy().to_string(),
+            Style::default().fg(FG_TEXT),
+        ))
+    };
+
+    let path_bar = Paragraph::new(path_content).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(ACCENT_BLUE))
+            .title(Span::styled(
+                " New Session — Directory ",
+                Style::default()
+                    .fg(ACCENT_BLUE)
+                    .add_modifier(Modifier::BOLD),
+            ))
+            .style(Style::default().bg(BG_SURFACE)),
+    );
+    frame.render_widget(path_bar, chunks[0]);
+
+    // Directory list
+    let items: Vec<ListItem> = browser
+        .entries
+        .iter()
+        .map(|entry| {
+            let style = if entry.name == ".." {
+                Style::default().fg(FG_SUBTEXT)
+            } else {
+                Style::default().fg(ACCENT_GREEN)
+            };
+            let prefix = if entry.is_dir { "📁 " } else { "  " };
+            ListItem::new(Line::from(Span::styled(
+                format!("{}{}", prefix, entry.name),
+                style,
+            )))
+        })
+        .collect();
+
+    let dir_list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(FG_OVERLAY))
+                .style(Style::default().bg(BG_SURFACE)),
+        )
+        .highlight_style(
+            Style::default()
+                .bg(HIGHLIGHT_BG)
+                .fg(ACCENT_BLUE)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▶ ");
+
+    let mut state = ListState::default();
+    state.select(Some(browser.selected));
+    frame.render_stateful_widget(dir_list, chunks[1], &mut state);
+
+    // Help bar
+    let help = Paragraph::new(Line::from(vec![
+        Span::styled(
+            " ↑↓",
+            Style::default()
+                .fg(ACCENT_PEACH)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" nav  ", Style::default().fg(FG_SUBTEXT)),
+        Span::styled(
+            "Enter",
+            Style::default()
+                .fg(ACCENT_PEACH)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" open  ", Style::default().fg(FG_SUBTEXT)),
+        Span::styled(
+            "Space",
+            Style::default()
+                .fg(ACCENT_PEACH)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" select  ", Style::default().fg(FG_SUBTEXT)),
+        Span::styled(
+            "/",
+            Style::default()
+                .fg(ACCENT_PEACH)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" type path  ", Style::default().fg(FG_SUBTEXT)),
+        Span::styled(
+            "Esc",
+            Style::default()
+                .fg(ACCENT_PEACH)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" cancel", Style::default().fg(FG_SUBTEXT)),
+    ]))
+    .style(Style::default().bg(HIGHLIGHT_BG));
+    frame.render_widget(help, chunks[2]);
 }
 
 fn truncate(s: &str, max: usize) -> String {
