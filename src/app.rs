@@ -174,6 +174,17 @@ impl App {
         app
     }
 
+    pub fn reload_sessions(&mut self, sessions: Vec<SessionInfo>) {
+        self.sessions = sessions;
+        self.preview_cache.clear();
+        self.preview_scroll = u16::MAX;
+        self.recompute_filter();
+        self.recompute_tree();
+        if self.selected >= self.filtered_indices.len() {
+            self.selected = self.filtered_indices.len().saturating_sub(1);
+        }
+    }
+
     fn save_config(&mut self) {
         self.config.tree_view = self.tree_view;
         self.config.display_mode = self.display_mode;
@@ -1206,6 +1217,32 @@ mod tests {
             LaunchRequest::New { cwd } => assert_eq!(cwd, "/tmp"),
             _ => panic!("expected New variant"),
         }
+    }
+
+    #[test]
+    fn test_reload_sessions_updates_list() {
+        let mut app = App::new(make_sessions(), None, Config::default());
+        let original_count = app.sessions.len();
+
+        // Simulate a new session appearing after a Claude session ends
+        let mut updated = make_sessions();
+        updated.push(SessionInfo {
+            session_id: "new-session".into(),
+            project: "/Users/sane/Dev/new-project".into(),
+            project_name: "new-project".into(),
+            first_timestamp: 9000,
+            last_timestamp: 9500,
+            entry_count: 3,
+            has_data: true,
+        });
+
+        app.reload_sessions(updated);
+        assert_eq!(app.sessions.len(), original_count + 1);
+        assert!(app.sessions.iter().any(|s| s.session_id == "new-session"));
+        // Preview cache should be cleared
+        assert!(app.preview_cache.is_empty());
+        // Filtered indices should be recomputed
+        assert_eq!(app.filtered_indices.len(), app.sessions.len());
     }
 
     fn make_sessions_mixed_data() -> Vec<SessionInfo> {

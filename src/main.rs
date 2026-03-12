@@ -41,7 +41,7 @@ fn run_app(
     flat: bool,
 ) -> Result<()> {
     let config = config::Config::load();
-    let mut app = App::new(sessions, filter_path, config);
+    let mut app = App::new(sessions, filter_path.clone(), config);
     if flat {
         app.tree_view = false;
     }
@@ -66,6 +66,10 @@ fn run_app(
                 app::LaunchRequest::New { cwd } => {
                     App::launch_claude_new(&cwd)?;
                 }
+            }
+            // Reload sessions so the just-finished session appears in the list
+            if let Ok(sessions) = data::load_sessions(filter_path.as_deref()) {
+                app.reload_sessions(sessions);
             }
             *terminal = setup_terminal()?;
         }
