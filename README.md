@@ -15,8 +15,11 @@ A terminal UI for browsing your Claude Code session history, previewing conversa
 - Search and filter sessions by project name or path
 - Toggle visibility of empty sessions (no data file) with `e`
 - Lazy-loads and caches session previews for fast navigation
-- **Persistent config** — view mode, display mode, and hide-empty preference saved to `~/.config/ccsm/config.json`
+- **Auto-update** — checks GitHub Releases in the background on startup (every 24h), shows a centered prompt with current vs new version, and self-updates the binary on confirm
+- **Session names** — custom titles loaded in the background for fast startup
+- **Persistent config** — view mode, display mode, hide-empty preference, and update check timestamp saved to `~/.config/ccsm/config.json`
 - Optional path argument to scope sessions to a specific directory
+- Version label displayed in the bottom-right of the help bar
 - Catppuccin Mocha-inspired color theme
 
 ## Requirements
@@ -62,6 +65,12 @@ Use `--flat` to start in flat view instead of the default grouped tree view:
 ./target/release/ccsm --flat ~/projects/my-app
 ```
 
+Use `--check-update` to force an update check regardless of the 24h cooldown:
+
+```sh
+./target/release/ccsm --check-update
+```
+
 ## Key Bindings
 
 | Key | Action |
@@ -78,7 +87,17 @@ Use `--flat` to start in flat view instead of the default grouped tree view:
 | `e` | Toggle show/hide empty sessions |
 | `n` | New Claude session in selected project's directory |
 | `Shift + N` | Open directory browser to start a new session anywhere |
+| `r` | Rename selected session |
 | `q` / `Esc` / `Ctrl+C` | Quit |
+
+### Update Prompt
+
+When an update is available, a centered dialog appears:
+
+| Key | Action |
+|---|---|
+| `y` | Download and install the update |
+| `n` / `Esc` | Dismiss until next run |
 
 ### Filter Mode
 
@@ -142,7 +161,8 @@ Settings are persisted to `~/.config/ccsm/config.json` and automatically saved w
 {
   "tree_view": true,
   "display_mode": "name",
-  "hide_empty": true
+  "hide_empty": true,
+  "last_update_check": 1710200000
 }
 ```
 
@@ -151,6 +171,7 @@ Settings are persisted to `~/.config/ccsm/config.json` and automatically saved w
 | `tree_view` | `true` / `false` | Start in tree or flat view |
 | `display_mode` | `"name"`, `"short_dir"`, `"full_dir"` | How project groups are labeled in tree view |
 | `hide_empty` | `true` / `false` | Whether to hide sessions with no data file |
+| `last_update_check` | Unix timestamp | When the last update check was performed (auto-managed) |
 
 ## How It Works
 
@@ -158,9 +179,12 @@ Settings are persisted to `~/.config/ccsm/config.json` and automatically saved w
 2. On selection, loads the session file from `~/.claude/projects/{path}/{sessionId}.jsonl`
 3. Extracts session metadata (working directory, git branch) and displays it in an info bar
 4. Filters to user/assistant messages and displays the last 20 turns as a preview
-5. On Enter, suspends the TUI and runs `claude --resume <id>` in the session's original directory
-6. On `n`/`N`, launches a new `claude` session in the chosen directory
-7. After Claude exits, the TUI resumes
+5. On startup, spawns a background thread to check GitHub Releases for newer versions (respects 24h cooldown)
+6. Session custom titles are loaded in the background to avoid blocking startup
+7. On Enter, suspends the TUI and runs `claude --resume <id>` in the session's original directory
+8. On `n`/`N`, launches a new `claude` session in the chosen directory
+9. If the user accepts an update, the TUI suspends, downloads the new binary, replaces the current executable, and resumes
+10. After Claude exits, the TUI resumes
 
 ## Dependencies
 
@@ -170,6 +194,9 @@ Settings are persisted to `~/.config/ccsm/config.json` and automatically saved w
 - `dirs` — home directory and config directory detection
 - `chrono` — relative timestamp formatting
 - `anyhow` — error handling
+- `ureq` — lightweight HTTP client for GitHub Releases API
+- `flate2` — gzip decompression for release archives
+- `tar` — tar archive extraction
 
 ## Tests
 
