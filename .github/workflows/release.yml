@@ -65,12 +65,22 @@ jobs:
           echo "new_tag=$NEW_TAG" >> "$GITHUB_OUTPUT"
           echo "Bumping $LATEST_TAG -> $NEW_TAG ($BUMP_TYPE)"
 
+      - name: Update Cargo.toml version
+        env:
+          NEW_TAG: ${{ steps.bump.outputs.new_tag }}
+        run: |
+          VERSION="${NEW_TAG#v}"
+          sed -i "s/^version = \".*\"/version = \"${VERSION}\"/" Cargo.toml
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml
+          git commit -m "chore: bump version to ${VERSION}"
+          git push origin HEAD:main
+
       - name: Create and push tag
         env:
           NEW_TAG: ${{ steps.bump.outputs.new_tag }}
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
           git tag "$NEW_TAG"
           git push origin "$NEW_TAG"
 
@@ -90,6 +100,11 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin
+
+      - name: Set version in Cargo.toml
+        run: |
+          VERSION="${RELEASE_TAG#v}"
+          sed -i '' "s/^version = \".*\"/version = \"${VERSION}\"/" Cargo.toml
 
       - name: Build release binary
         run: cargo build --release --target aarch64-apple-darwin
