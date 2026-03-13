@@ -2,6 +2,51 @@
 
 A terminal UI for browsing your Claude Code session history, previewing conversations, and resuming or starting sessions in their original working directory.
 
+## Screenshots
+
+### Tree View with Session Preview
+Sessions grouped by project with an expanded group showing individual sessions. The right pane displays a scrollable conversation preview with the session's working directory and git branch in the info bar.
+
+![Tree view with session preview](screenshots/session-bug-fixes-tree-view.png)
+
+### Display Modes
+
+Cycle through display modes with `Tab` to change how projects are labeled in the session list.
+
+**Tree view — short directory path:**
+
+![Tree view with short directory labels](screenshots/sessions-tree-short-dir-view.png)
+
+**Tree view — full directory path:**
+
+![Tree view with full directory labels](screenshots/sessions-tree-full-dir-view.png)
+
+### Flat View
+
+All sessions in a single chronological list with project name, relative timestamp, and message count.
+
+**Flat view — project name:**
+
+![Flat view with name labels](screenshots/sessions-flat-name-view.png)
+
+**Flat view — short directory path:**
+
+![Flat view with short directory labels](screenshots/sessions-flat-short-dir-view.png)
+
+**Flat view — full directory path:**
+
+![Flat view with full directory labels](screenshots/sessions-flat-full-dir-view.png)
+
+### Rename Session
+Press `r` to rename a session with a custom title that appears alongside the timestamp and message count.
+
+![Rename session dialog](screenshots/rename-session-dialog.png)
+
+### Directory Browser
+Press `N` to open a full directory browser overlay for starting a new Claude session in any directory.
+
+![New session directory picker](screenshots/new-session-directory-picker.png)
+
 ## Features
 
 - **Tree view** (default) — sessions grouped by project, collapsed on startup, expand/collapse with arrow keys
@@ -132,36 +177,6 @@ When the directory browser is open (triggered by `N`):
 | `Space` | Select current directory and launch new session |
 | `/` | Type a path directly |
 | `Esc` | Cancel and close browser |
-
-## Layout
-
-### Tree View (default)
-```
-┌─ Sessions [tree] [name] ─────┬─ Preview ─────────────────────────┐
-│ ▶ ▸ my-project (3)           │  ~/Dev/my-project  ⎇ main        │
-│   ▸ other-project (2)        │───────────────────────────────────│
-│   ...                        │ ▎ USER:                           │
-│                              │ can you update the readme         │
-│                              │                                   │
-│                              │ ▎ ASSISTANT:                      │
-│                              │ Sure, let me read the file...     │
-├──────────────────────────────┴───────────────────────────────────┤
-│ ↑↓/jk navigate  Enter open  J/K scroll  / search  Tab view       │
-│ e show empty  n new  N browse  q quit                            │
-└──────────────────────────────────────────────────────────────────┘
-```
-
-### Flat View
-```
-┌─ Sessions [flat] ───────────┬─ Preview ─────────────────────────┐
-│ ▶ my-project        2h ago  │ ▎ USER:                           │
-│   other-project     3d ago  │ can you update the readme         │
-│   ...                       │                                   │
-├─────────────────────────────┴───────────────────────────────────┤
-│ ↑↓/jk navigate  Enter open  J/K scroll  / search  Tab view      │
-│ e show empty  n new  N browse  q quit                           │
-└─────────────────────────────────────────────────────────────────┘
-```
 
 ## Configuration
 
