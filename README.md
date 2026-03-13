@@ -24,17 +24,27 @@ A terminal UI for browsing your Claude Code session history, previewing conversa
 
 ## Requirements
 
-- Rust 1.75+
+- macOS (ARM64) — additional platforms coming soon
 - [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) installed and on your `PATH`
 - Existing session history in `~/.claude/`
 
 ## Install
 
+### Quick Install (pre-built binary)
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/faulker/ccsm/main/remote-install.sh | bash
+```
+
+This downloads the latest release binary from GitHub and installs it to `~/.local/bin/ccsm`. Make sure `~/.local/bin` is in your `PATH`.
+
+### Build from Source
+
 ```sh
 ./install.sh
 ```
 
-This builds a release binary and symlinks it to `~/.local/bin/ccsm`. Make sure `~/.local/bin` is in your `PATH`.
+This builds a release binary and symlinks it to `~/.local/bin/ccsm`. Requires Rust 1.75+.
 
 ## Build
 
