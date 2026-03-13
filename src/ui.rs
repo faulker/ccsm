@@ -1,5 +1,6 @@
 use crate::app::{App, AppMode, TreeRow};
 use crate::data::PreviewMessage;
+use crate::update::UpdateStatus;
 use chrono::{Local, TimeZone};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -58,7 +59,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 TreeRow::Session { session_index } => {
                     let s = &app.sessions[*session_index];
                     let date = format_relative_date(s.last_timestamp);
-                    let line = Line::from(vec![
+                    let mut spans = vec![
                         Span::raw("  "),
                         Span::styled(date, Style::default().fg(FG_SUBTEXT)),
                         Span::styled(
@@ -67,8 +68,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                                 .fg(FG_OVERLAY)
                                 .add_modifier(Modifier::DIM),
                         ),
-                    ]);
-                    ListItem::new(line)
+                    ];
+                    if let Some(name) = &s.name {
+                        spans.push(Span::styled(
+                            format!("  {}", name),
+                            Style::default().fg(ACCENT_PEACH),
+                        ));
+                    }
+                    ListItem::new(Line::from(spans))
                 }
             })
             .collect()
@@ -106,10 +113,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Span::styled(" Sessions ", title_style),
         Span::styled(view_label, title_style),
     ];
-    if app.tree_view {
-        title_spans.push(Span::styled(" ", title_style));
-        title_spans.push(Span::styled(app.display_mode.label(), mode_style));
-    }
+    title_spans.push(Span::styled(" ", title_style));
+    title_spans.push(Span::styled(app.display_mode.label(), mode_style));
     if !app.hide_empty {
         title_spans.push(Span::styled(" [showing empty]", title_style));
     }
@@ -145,7 +150,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let preview = preview_slice.to_vec();
     let preview_text = build_preview_text(&preview);
 
-    let has_meta = meta.cwd.is_some() || meta.git_branch.is_some();
+    let has_meta = meta.session_id.is_some()
+        || meta.cwd.is_some()
+        || meta.git_branch.is_some();
     let right_area = main_chunks[1];
 
     let right_chunks = Layout::default()
@@ -160,7 +167,26 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // Session info bar
     if has_meta {
         let mut spans: Vec<Span> = Vec::new();
+        if let Some(id) = &meta.session_id {
+            let short_id: String = id.chars().take(8).collect();
+            spans.push(Span::styled(
+                format!(" # {}", short_id),
+                Style::default().fg(ACCENT_BLUE),
+            ));
+        }
+        if let Some(name) = &meta.session_name {
+            if !spans.is_empty() {
+                spans.push(Span::raw("  "));
+            }
+            spans.push(Span::styled(
+                name.clone(),
+                Style::default().fg(ACCENT_PEACH).add_modifier(Modifier::BOLD),
+            ));
+        }
         if let Some(cwd) = &meta.cwd {
+            if !spans.is_empty() {
+                spans.push(Span::raw("  "));
+            }
             spans.push(Span::styled(" ", Style::default().fg(FG_OVERLAY)));
             spans.push(Span::styled(cwd.clone(), Style::default().fg(FG_SUBTEXT)));
         }
@@ -263,7 +289,32 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             hint_style
         };
 
-        Paragraph::new(Line::from(vec![
+        let mut spans = Vec::new();
+
+        // Show post-update status in help bar
+        match &app.update_status {
+            UpdateStatus::Downloading => {
+                spans.push(Span::styled(
+                    " Updating... ",
+                    Style::default().fg(ACCENT_PEACH).add_modifier(Modifier::BOLD),
+                ));
+            }
+            UpdateStatus::Done(v) => {
+                spans.push(Span::styled(
+                    format!(" Updated to {} (restart to apply) ", v),
+                    Style::default().fg(ACCENT_GREEN).add_modifier(Modifier::BOLD),
+                ));
+            }
+            UpdateStatus::Failed(msg) => {
+                spans.push(Span::styled(
+                    format!(" Update failed: {} ", msg),
+                    Style::default().fg(Color::Rgb(243, 139, 168)).add_modifier(Modifier::BOLD),
+                ));
+            }
+            _ => {}
+        }
+
+        spans.extend_from_slice(&[
             Span::styled(" ↑↓/jk", key_style),
             Span::styled(" navigate  ", hint_style),
             Span::styled("Enter", key_style),
@@ -276,22 +327,57 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             Span::styled(" view  ", hint_style),
             Span::styled("e", key_style),
             Span::styled(" show empty  ", hint_style),
+            Span::styled("r", key_style),
+            Span::styled(" rename  ", hint_style),
             Span::styled("n", key_style),
             Span::styled(" new  ", hint_style),
             Span::styled("N", shift_key_style),
             Span::styled(" browse  ", shift_hint_style),
             Span::styled("q", key_style),
             Span::styled(" quit", hint_style),
-        ]))
+        ]);
+
+        Paragraph::new(Line::from(spans))
         .style(bar_style)
     };
 
-    frame.render_widget(bottom_bar, chunks[1]);
+    let version_label = format!("v{} ", env!("CARGO_PKG_VERSION"));
+    let version_width = version_label.len() as u16;
+    let bar_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Min(0),
+            Constraint::Length(version_width),
+        ])
+        .split(chunks[1]);
+
+    frame.render_widget(bottom_bar, bar_chunks[0]);
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            version_label,
+            Style::default().fg(FG_OVERLAY),
+        ))
+        .style(bar_style)
+        .alignment(ratatui::layout::Alignment::Right),
+        bar_chunks[1],
+    );
+
+    // Rename popup overlay
+    if app.mode == AppMode::Renaming {
+        draw_rename_popup(frame, &app.rename_text);
+    }
 
     // Directory browser overlay
     if app.mode == AppMode::DirBrowser {
         if let Some(browser) = &app.dir_browser {
             draw_dir_browser(frame, browser);
+        }
+    }
+
+    // Update prompt overlay
+    if app.mode == AppMode::UpdatePrompt {
+        if let UpdateStatus::Available(ref info) = app.update_status {
+            draw_update_prompt(frame, info);
         }
     }
 }
@@ -526,6 +612,85 @@ fn draw_dir_browser(frame: &mut Frame, browser: &crate::app::DirBrowser) {
     ]))
     .style(Style::default().bg(HIGHLIGHT_BG));
     frame.render_widget(help, chunks[2]);
+}
+
+fn draw_rename_popup(frame: &mut Frame, text: &str) {
+    let area = centered_rect(40, 15, frame.area());
+    // Ensure minimum usable height of 3 lines
+    let area = if area.height < 3 {
+        Rect { height: 3, ..area }
+    } else {
+        area
+    };
+    frame.render_widget(Clear, area);
+
+    let content = Line::from(vec![
+        Span::styled(text, Style::default().fg(FG_TEXT)),
+        Span::styled("\u{2588}", Style::default().fg(ACCENT_BLUE)),
+    ]);
+
+    let popup = Paragraph::new(content).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(ACCENT_PEACH))
+            .title(Span::styled(
+                " Rename Session ",
+                Style::default()
+                    .fg(ACCENT_PEACH)
+                    .add_modifier(Modifier::BOLD),
+            ))
+            .style(Style::default().bg(BG_SURFACE)),
+    );
+    frame.render_widget(popup, area);
+}
+
+fn draw_update_prompt(frame: &mut Frame, info: &crate::update::UpdateInfo) {
+    let area = centered_rect(40, 15, frame.area());
+    let area = if area.height < 6 {
+        Rect { height: 6, ..area }
+    } else {
+        area
+    };
+    frame.render_widget(Clear, area);
+
+    let key_style = Style::default()
+        .fg(ACCENT_PEACH)
+        .add_modifier(Modifier::BOLD);
+    let text_style = Style::default().fg(FG_TEXT);
+
+    let content = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(format!("v{}", info.current), Style::default().fg(FG_SUBTEXT)),
+            Span::styled("  →  ", Style::default().fg(FG_OVERLAY)),
+            Span::styled(info.tag.clone(), Style::default().fg(ACCENT_GREEN).add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  y", key_style),
+            Span::styled(" update   ", text_style),
+            Span::styled("n/Esc", key_style),
+            Span::styled(" skip", text_style),
+        ]),
+    ];
+
+    let popup = Paragraph::new(content)
+        .alignment(ratatui::layout::Alignment::Center)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(ACCENT_GREEN))
+                .title(Span::styled(
+                    " Update Available ",
+                    Style::default()
+                        .fg(ACCENT_GREEN)
+                        .add_modifier(Modifier::BOLD),
+                ))
+                .style(Style::default().bg(BG_SURFACE)),
+        );
+    frame.render_widget(popup, area);
 }
 
 fn truncate(s: &str, max: usize) -> String {
