@@ -13,6 +13,10 @@ Sessions grouped by project with an expanded group showing individual sessions. 
 
 Cycle through display modes with `Tab` to change how projects are labeled in the session list.
 
+**Tree view - project:**
+
+![Tree view with project labels](screenshots/sessions-tree-project-view.png)
+
 **Tree view — short directory path:**
 
 ![Tree view with short directory labels](screenshots/sessions-tree-short-dir-view.png)
