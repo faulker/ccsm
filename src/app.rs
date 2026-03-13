@@ -1,5 +1,6 @@
 use crate::config::{Config, DisplayMode};
 use crate::data::{self, PreviewMessage, SessionInfo, SessionMeta};
+use crate::update;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, ModifierKeyCode};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -27,6 +28,8 @@ pub enum LaunchRequest {
 pub enum AppMode {
     Normal,
     DirBrowser,
+    Renaming,
+    UpdatePrompt,
 }
 
 #[derive(Debug, Clone)]
@@ -133,6 +136,13 @@ pub struct App {
     pub dir_browser: Option<DirBrowser>,
     pub config: Config,
     pub shift_active: bool,
+    pub rename_text: String,
+    pub rename_session_id: Option<String>,
+    pub rename_project: Option<String>,
+    pub update_status: update::UpdateStatus,
+    pub perform_update: Option<update::UpdateInfo>,
+    pub update_receiver: Option<std::sync::mpsc::Receiver<update::UpdateInfo>>,
+    pub names_receiver: Option<std::sync::mpsc::Receiver<HashMap<String, String>>>,
 }
 
 /// Truncate a path to its last 2 components (e.g. "/Users/sane/Dev/ccsm" -> "Dev/ccsm").
@@ -168,14 +178,55 @@ impl App {
             dir_browser: None,
             config,
             shift_active: false,
+            rename_text: String::new(),
+            rename_session_id: None,
+            rename_project: None,
+            update_status: update::UpdateStatus::None,
+            perform_update: None,
+            update_receiver: None,
+            names_receiver: None,
         };
+        app.spawn_load_session_names();
         app.init_tree();
         app.recompute_filter();
         app
     }
 
+    fn spawn_load_session_names(&mut self) {
+        let sessions: Vec<(String, String)> = self
+            .sessions
+            .iter()
+            .filter(|s| s.has_data)
+            .map(|s| (s.project.clone(), s.session_id.clone()))
+            .collect();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.names_receiver = Some(rx);
+
+        std::thread::spawn(move || {
+            let mut names = HashMap::new();
+            for (project, session_id) in sessions {
+                if let Some(title) = data::load_custom_title(&project, &session_id) {
+                    names.insert(session_id, title);
+                }
+            }
+            let _ = tx.send(names);
+        });
+    }
+
+    pub fn apply_session_names(&mut self, names: HashMap<String, String>) {
+        for session in &mut self.sessions {
+            if let Some(title) = names.get(&session.session_id) {
+                session.name = Some(title.clone());
+            }
+        }
+        self.preview_cache.clear();
+        self.recompute_tree();
+    }
+
     pub fn reload_sessions(&mut self, sessions: Vec<SessionInfo>) {
         self.sessions = sessions;
+        self.spawn_load_session_names();
         self.preview_cache.clear();
         self.preview_scroll = u16::MAX;
         self.recompute_filter();
@@ -302,7 +353,7 @@ impl App {
 
     pub fn current_preview(&mut self) -> (&SessionMeta, &[PreviewMessage]) {
         // Static default for the empty case
-        static EMPTY_META: SessionMeta = SessionMeta { cwd: None, git_branch: None };
+        static EMPTY_META: SessionMeta = SessionMeta { cwd: None, git_branch: None, session_id: None, session_name: None };
 
         let idx = match self.selected_session_index() {
             Some(i) => i,
@@ -317,7 +368,10 @@ impl App {
             self.preview_cache.insert(key.clone(), result);
         }
 
-        let (meta, messages) = &self.preview_cache[&key];
+        let session = &self.sessions[idx];
+        let (meta, messages) = self.preview_cache.get_mut(&key).unwrap();
+        meta.session_id = Some(session.session_id.clone());
+        meta.session_name = session.name.clone();
         (meta, messages)
     }
 
@@ -356,6 +410,11 @@ impl App {
                     browser.input_text.pop();
                 }
                 KeyCode::Char(c) => {
+                    let c = if key.modifiers.contains(KeyModifiers::SHIFT) {
+                        c.to_ascii_uppercase()
+                    } else {
+                        c
+                    };
                     browser.input_text.push(c);
                 }
                 _ => {}
@@ -405,6 +464,46 @@ impl App {
         }
     }
 
+    fn handle_rename_event(&mut self, key: crossterm::event::KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.mode = AppMode::Normal;
+                self.rename_text.clear();
+                self.rename_session_id = None;
+                self.rename_project = None;
+            }
+            KeyCode::Enter => {
+                if let Some(session_id) = self.rename_session_id.take() {
+                    let project = self.rename_project.take().unwrap_or_default();
+                    let name = self.rename_text.trim().to_string();
+                    // Write to the session JSONL (even empty to clear)
+                    let _ = data::save_custom_title(&project, &session_id, &name);
+                    let name_opt = if name.is_empty() { None } else { Some(name) };
+                    for s in &mut self.sessions {
+                        if s.session_id == session_id {
+                            s.name = name_opt.clone();
+                        }
+                    }
+                    self.preview_cache.clear();
+                }
+                self.rename_text.clear();
+                self.mode = AppMode::Normal;
+            }
+            KeyCode::Backspace => {
+                self.rename_text.pop();
+            }
+            KeyCode::Char(c) => {
+                let c = if key.modifiers.contains(KeyModifiers::SHIFT) {
+                    c.to_ascii_uppercase()
+                } else {
+                    c
+                };
+                self.rename_text.push(c);
+            }
+            _ => {}
+        }
+    }
+
     pub fn handle_event(&mut self) -> anyhow::Result<()> {
         if let Event::Key(key) = event::read()? {
             // Track shift state for UI highlighting
@@ -426,6 +525,29 @@ impl App {
 
             // Only process actions on key press, not release/repeat
             if key.kind != KeyEventKind::Press {
+                return Ok(());
+            }
+
+            if self.mode == AppMode::UpdatePrompt {
+                match key.code {
+                    KeyCode::Char('y') => {
+                        if let update::UpdateStatus::Available(ref info) = self.update_status {
+                            self.perform_update = Some(info.clone());
+                            self.update_status = update::UpdateStatus::Downloading;
+                        }
+                        self.mode = AppMode::Normal;
+                    }
+                    KeyCode::Char('n') | KeyCode::Esc => {
+                        self.update_status = update::UpdateStatus::None;
+                        self.mode = AppMode::Normal;
+                    }
+                    _ => {}
+                }
+                return Ok(());
+            }
+
+            if self.mode == AppMode::Renaming {
+                self.handle_rename_event(key);
                 return Ok(());
             }
 
@@ -451,6 +573,11 @@ impl App {
                         self.preview_scroll = u16::MAX;
                     }
                     KeyCode::Char(c) => {
+                        let c = if key.modifiers.contains(KeyModifiers::SHIFT) {
+                            c.to_ascii_uppercase()
+                        } else {
+                            c
+                        };
                         self.filter_text.push(c);
                         self.recompute_filter();
                         self.preview_scroll = u16::MAX;
@@ -483,23 +610,31 @@ impl App {
                     self.filter_active = true;
                 }
                 (KeyCode::Tab, _) => {
-                    if !self.tree_view {
-                        self.tree_view = true;
-                        self.display_mode = DisplayMode::Name;
-                        self.recompute_tree();
-                    } else {
-                        match self.display_mode {
-                            DisplayMode::Name => {
-                                self.display_mode = DisplayMode::ShortDir;
-                                self.recompute_tree();
-                            }
-                            DisplayMode::ShortDir => {
-                                self.display_mode = DisplayMode::FullDir;
-                                self.recompute_tree();
-                            }
-                            DisplayMode::FullDir => {
-                                self.tree_view = false;
-                            }
+                    // Cycle: tree[Name] → tree[ShortDir] → tree[FullDir]
+                    //      → flat[Name] → flat[ShortDir] → flat[FullDir] → tree[Name]
+                    match (self.tree_view, self.display_mode) {
+                        (true, DisplayMode::Name) => {
+                            self.display_mode = DisplayMode::ShortDir;
+                            self.recompute_tree();
+                        }
+                        (true, DisplayMode::ShortDir) => {
+                            self.display_mode = DisplayMode::FullDir;
+                            self.recompute_tree();
+                        }
+                        (true, DisplayMode::FullDir) => {
+                            self.tree_view = false;
+                            self.display_mode = DisplayMode::Name;
+                        }
+                        (false, DisplayMode::Name) => {
+                            self.display_mode = DisplayMode::ShortDir;
+                        }
+                        (false, DisplayMode::ShortDir) => {
+                            self.display_mode = DisplayMode::FullDir;
+                        }
+                        (false, DisplayMode::FullDir) => {
+                            self.tree_view = true;
+                            self.display_mode = DisplayMode::Name;
+                            self.recompute_tree();
                         }
                     }
                     self.selected = 0;
@@ -539,6 +674,15 @@ impl App {
                             ".".to_string()
                         };
                         self.launch_session = Some(LaunchRequest::New { cwd: dir });
+                    }
+                }
+                (KeyCode::Char('r'), KeyModifiers::NONE) => {
+                    if let Some(idx) = self.selected_session_index() {
+                        let session = &self.sessions[idx];
+                        self.rename_session_id = Some(session.session_id.clone());
+                        self.rename_project = Some(session.project.clone());
+                        self.rename_text = session.name.clone().unwrap_or_default();
+                        self.mode = AppMode::Renaming;
                     }
                 }
                 (KeyCode::Char('N' | 'n'), KeyModifiers::SHIFT) => {
@@ -670,7 +814,7 @@ mod tests {
                 first_timestamp: 1000,
                 last_timestamp: 2000,
                 entry_count: 5,
-                has_data: true,
+                has_data: true, name: None,
             },
             SessionInfo {
                 session_id: "s2".into(),
@@ -680,7 +824,7 @@ mod tests {
                 first_timestamp: 1500,
                 last_timestamp: 3000,
                 entry_count: 3,
-                has_data: true,
+                has_data: true, name: None,
             },
             SessionInfo {
                 session_id: "s3".into(),
@@ -690,7 +834,7 @@ mod tests {
                 first_timestamp: 500,
                 last_timestamp: 4000,
                 entry_count: 10,
-                has_data: true,
+                has_data: true, name: None,
             },
         ]
     }
@@ -836,7 +980,7 @@ mod tests {
                 first_timestamp: 1000,
                 last_timestamp: 5000,
                 entry_count: 5,
-                has_data: true,
+                has_data: true, name: None,
             },
             SessionInfo {
                 session_id: "s2".into(),
@@ -845,7 +989,7 @@ mod tests {
                 first_timestamp: 1500,
                 last_timestamp: 3000,
                 entry_count: 3,
-                has_data: true,
+                has_data: true, name: None,
             },
             SessionInfo {
                 session_id: "s3".into(),
@@ -854,7 +998,7 @@ mod tests {
                 first_timestamp: 500,
                 last_timestamp: 4000,
                 entry_count: 10,
-                has_data: true,
+                has_data: true, name: None,
             },
             SessionInfo {
                 session_id: "s4".into(),
@@ -863,7 +1007,7 @@ mod tests {
                 first_timestamp: 2000,
                 last_timestamp: 6000,
                 entry_count: 2,
-                has_data: true,
+                has_data: true, name: None,
             },
         ]
     }
@@ -970,7 +1114,7 @@ mod tests {
                 first_timestamp: 1000,
                 last_timestamp: 5000,
                 entry_count: 5,
-                has_data: true,
+                has_data: true, name: None,
             },
             SessionInfo {
                 session_id: "s2".into(),
@@ -979,7 +1123,7 @@ mod tests {
                 first_timestamp: 1500,
                 last_timestamp: 3000,
                 entry_count: 3,
-                has_data: true,
+                has_data: true, name: None,
             },
             SessionInfo {
                 session_id: "s3".into(),
@@ -988,7 +1132,7 @@ mod tests {
                 first_timestamp: 500,
                 last_timestamp: 4000,
                 entry_count: 10,
-                has_data: true,
+                has_data: true, name: None,
             },
             SessionInfo {
                 session_id: "s4".into(),
@@ -997,7 +1141,7 @@ mod tests {
                 first_timestamp: 2000,
                 last_timestamp: 6000,
                 entry_count: 2,
-                has_data: true,
+                has_data: true, name: None,
             },
         ]
     }
@@ -1233,7 +1377,7 @@ mod tests {
             first_timestamp: 9000,
             last_timestamp: 9500,
             entry_count: 3,
-            has_data: true,
+            has_data: true, name: None,
         });
 
         app.reload_sessions(updated);
@@ -1254,7 +1398,7 @@ mod tests {
                 first_timestamp: 1000,
                 last_timestamp: 2000,
                 entry_count: 5,
-                has_data: true,
+                has_data: true, name: None,
             },
             SessionInfo {
                 session_id: "s2".into(),
@@ -1263,7 +1407,7 @@ mod tests {
                 first_timestamp: 1500,
                 last_timestamp: 3000,
                 entry_count: 3,
-                has_data: false,
+                has_data: false, name: None,
             },
             SessionInfo {
                 session_id: "s3".into(),
@@ -1272,7 +1416,7 @@ mod tests {
                 first_timestamp: 500,
                 last_timestamp: 4000,
                 entry_count: 10,
-                has_data: true,
+                has_data: true, name: None,
             },
         ]
     }
@@ -1345,6 +1489,99 @@ mod tests {
     fn test_shift_active_default_false() {
         let app = App::new(make_sessions(), None, Config::default());
         assert!(!app.shift_active);
+    }
+
+    #[test]
+    fn test_tab_cycles_all_six_modes() {
+        let mut app = App::new(make_sessions(), None, Config::default());
+
+        // Helper to simulate tab press logic
+        fn simulate_tab(app: &mut App) {
+            match (app.tree_view, app.display_mode) {
+                (true, DisplayMode::Name) => {
+                    app.display_mode = DisplayMode::ShortDir;
+                    app.recompute_tree();
+                }
+                (true, DisplayMode::ShortDir) => {
+                    app.display_mode = DisplayMode::FullDir;
+                    app.recompute_tree();
+                }
+                (true, DisplayMode::FullDir) => {
+                    app.tree_view = false;
+                    app.display_mode = DisplayMode::Name;
+                }
+                (false, DisplayMode::Name) => {
+                    app.display_mode = DisplayMode::ShortDir;
+                }
+                (false, DisplayMode::ShortDir) => {
+                    app.display_mode = DisplayMode::FullDir;
+                }
+                (false, DisplayMode::FullDir) => {
+                    app.tree_view = true;
+                    app.display_mode = DisplayMode::Name;
+                    app.recompute_tree();
+                }
+            }
+        }
+
+        // Start: tree + Name
+        assert!(app.tree_view);
+        assert_eq!(app.display_mode, DisplayMode::Name);
+
+        simulate_tab(&mut app);
+        assert!(app.tree_view);
+        assert_eq!(app.display_mode, DisplayMode::ShortDir);
+
+        simulate_tab(&mut app);
+        assert!(app.tree_view);
+        assert_eq!(app.display_mode, DisplayMode::FullDir);
+
+        simulate_tab(&mut app);
+        assert!(!app.tree_view);
+        assert_eq!(app.display_mode, DisplayMode::Name);
+
+        simulate_tab(&mut app);
+        assert!(!app.tree_view);
+        assert_eq!(app.display_mode, DisplayMode::ShortDir);
+
+        simulate_tab(&mut app);
+        assert!(!app.tree_view);
+        assert_eq!(app.display_mode, DisplayMode::FullDir);
+
+        // Full cycle back to tree + Name
+        simulate_tab(&mut app);
+        assert!(app.tree_view);
+        assert_eq!(app.display_mode, DisplayMode::Name);
+    }
+
+    #[test]
+    fn test_session_name_set_directly() {
+        let mut app = App::new(make_sessions(), None, Config::default());
+        // Initially no names
+        assert!(app.sessions[0].name.is_none());
+
+        // Directly set a name (simulates what rename does)
+        app.sessions[0].name = Some("My Session".to_string());
+        assert_eq!(app.sessions[0].name, Some("My Session".to_string()));
+    }
+
+    #[test]
+    fn test_rename_mode_transitions() {
+        let mut app = App::new(make_sessions(), None, Config::default());
+        // Select a session (expand first header, then move to session)
+        app.tree_view = false;
+        app.recompute_filter();
+        app.selected = 0;
+
+        // Start renaming
+        let idx = app.selected_session_index().unwrap();
+        let session_id = app.sessions[idx].session_id.clone();
+        app.rename_session_id = Some(session_id.clone());
+        app.rename_text = String::new();
+        app.mode = AppMode::Renaming;
+
+        assert_eq!(app.mode, AppMode::Renaming);
+        assert_eq!(app.rename_session_id, Some(session_id));
     }
 
     #[test]

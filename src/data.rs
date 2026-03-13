@@ -14,12 +14,15 @@ pub struct SessionInfo {
     pub last_timestamp: i64,
     pub entry_count: usize,
     pub has_data: bool,
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct SessionMeta {
     pub cwd: Option<String>,
     pub git_branch: Option<String>,
+    pub session_id: Option<String>,
+    pub session_name: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -49,6 +52,8 @@ struct SessionEntry {
     cwd: Option<String>,
     #[serde(rename = "gitBranch")]
     git_branch: Option<String>,
+    #[serde(rename = "customTitle")]
+    custom_title: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -69,6 +74,55 @@ struct ContentBlock {
     #[serde(rename = "type")]
     block_type: Option<String>,
     text: Option<String>,
+}
+
+/// Strip XML-style tags like `<command-name>` and `</command-name>` from text,
+/// keeping inner content. Only matches tags with lowercase letters, digits, hyphens, underscores.
+pub fn strip_xml_tags(input: &str) -> String {
+    let mut result = String::with_capacity(input.len());
+    let chars: Vec<char> = input.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+
+    while i < len {
+        if chars[i] == '<' {
+            // Try to match a tag
+            let start = i;
+            i += 1;
+            // Optional closing slash
+            if i < len && chars[i] == '/' {
+                i += 1;
+            }
+            // Must start with lowercase letter
+            if i < len && chars[i].is_ascii_lowercase() {
+                i += 1;
+                // Continue with [a-z0-9_-]
+                while i < len
+                    && (chars[i].is_ascii_lowercase()
+                        || chars[i].is_ascii_digit()
+                        || chars[i] == '-'
+                        || chars[i] == '_')
+                {
+                    i += 1;
+                }
+                // Must end with >
+                if i < len && chars[i] == '>' {
+                    i += 1;
+                    // Successfully matched a tag, skip it
+                    continue;
+                }
+            }
+            // Not a valid tag, emit everything from start
+            for &c in &chars[start..i] {
+                result.push(c);
+            }
+        } else {
+            result.push(chars[i]);
+            i += 1;
+        }
+    }
+
+    result
 }
 
 pub fn load_sessions(filter_path: Option<&str>) -> Result<Vec<SessionInfo>> {
@@ -136,6 +190,7 @@ pub fn load_sessions(filter_path: Option<&str>) -> Result<Vec<SessionInfo>> {
                 last_timestamp: timestamp,
                 entry_count: 1,
                 has_data: false,
+                name: None,
             });
     }
 
@@ -213,11 +268,19 @@ pub fn load_preview(project: &str, session_id: &str) -> (SessionMeta, Vec<Previe
             }
         }
 
+        // Track custom title (last one wins)
+        let entry_type = entry.entry_type.as_deref().unwrap_or("");
+        if entry_type == "custom-title" {
+            if let Some(title) = entry.custom_title {
+                meta.session_name = Some(title);
+            }
+            continue;
+        }
+
         if entry.is_meta.unwrap_or(false) {
             continue;
         }
 
-        let entry_type = entry.entry_type.as_deref().unwrap_or("");
         if entry_type != "user" && entry_type != "assistant" {
             continue;
         }
@@ -245,6 +308,8 @@ pub fn load_preview(project: &str, session_id: &str) -> (SessionMeta, Vec<Previe
             None => continue,
         };
 
+        let text = strip_xml_tags(&text);
+
         if text.trim().is_empty() {
             continue;
         }
@@ -255,6 +320,58 @@ pub fn load_preview(project: &str, session_id: &str) -> (SessionMeta, Vec<Previe
     // Keep last 20 turns
     let start = messages.len().saturating_sub(20);
     (meta, messages[start..].to_vec())
+}
+
+/// Load the custom title from a session JSONL file (last `custom-title` entry wins).
+pub fn load_custom_title(project: &str, session_id: &str) -> Option<String> {
+    let path = session_file_path(project, session_id)?;
+    let file = File::open(&path).ok()?;
+    let reader = BufReader::new(file);
+    let mut title = None;
+
+    for line in reader.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+        // Skip JSON parsing for lines that can't be custom-title entries
+        if !line.contains("custom-title") {
+            continue;
+        }
+        let entry: SessionEntry = match serde_json::from_str(&line) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        if entry.entry_type.as_deref() == Some("custom-title") {
+            if let Some(t) = entry.custom_title {
+                title = Some(t);
+            }
+        }
+    }
+
+    title
+}
+
+/// Save a custom title by appending a `custom-title` entry to the session JSONL file.
+pub fn save_custom_title(project: &str, session_id: &str, title: &str) -> Result<()> {
+    use std::io::Write;
+
+    let path = session_file_path(project, session_id)
+        .context("Session file not found")?;
+
+    let entry = serde_json::json!({
+        "type": "custom-title",
+        "customTitle": title,
+        "sessionId": session_id,
+    });
+
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .context("Failed to open session file for appending")?;
+
+    writeln!(file, "{}", entry)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -316,6 +433,44 @@ mod tests {
         } else {
             panic!("Expected blocks content");
         }
+    }
+
+    #[test]
+    fn test_strip_xml_tags_basic() {
+        assert_eq!(strip_xml_tags("<command-name>foo</command-name>"), "foo");
+        assert_eq!(strip_xml_tags("hello <tag>world</tag> end"), "hello world end");
+    }
+
+    #[test]
+    fn test_strip_xml_tags_preserves_non_tags() {
+        assert_eq!(strip_xml_tags("a < b and c > d"), "a < b and c > d");
+        assert_eq!(strip_xml_tags("no tags here"), "no tags here");
+        assert_eq!(strip_xml_tags("<123>not a tag</123>"), "<123>not a tag</123>");
+    }
+
+    #[test]
+    fn test_strip_xml_tags_nested() {
+        assert_eq!(
+            strip_xml_tags("<outer>hello <inner>world</inner></outer>"),
+            "hello world"
+        );
+    }
+
+    #[test]
+    fn test_strip_xml_tags_self_closing_not_matched() {
+        // Our parser only matches <tag> and </tag>, not <tag/>
+        assert_eq!(strip_xml_tags("before <br/> after"), "before <br/> after");
+    }
+
+    #[test]
+    fn test_strip_xml_tags_with_hyphens_underscores() {
+        assert_eq!(strip_xml_tags("<my-tag>content</my-tag>"), "content");
+        assert_eq!(strip_xml_tags("<my_tag>content</my_tag>"), "content");
+    }
+
+    #[test]
+    fn test_strip_xml_tags_empty_input() {
+        assert_eq!(strip_xml_tags(""), "");
     }
 
     #[test]

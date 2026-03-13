@@ -2,6 +2,7 @@ mod app;
 mod config;
 mod data;
 mod ui;
+mod update;
 
 use anyhow::Result;
 use app::App;
@@ -39,11 +40,27 @@ fn run_app(
     sessions: Vec<data::SessionInfo>,
     filter_path: Option<String>,
     flat: bool,
+    force_update_check: bool,
 ) -> Result<()> {
     let config = config::Config::load();
+    let check_update = force_update_check || config.should_check_for_update();
     let mut app = App::new(sessions, filter_path.clone(), config);
     if flat {
         app.tree_view = false;
+    }
+
+    // Spawn background update check
+    if check_update {
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.update_receiver = Some(rx);
+        std::thread::spawn(move || {
+            if let Some(info) = update::check_for_update() {
+                let _ = tx.send(info);
+            }
+            // Mark checked regardless of result
+            let mut config = config::Config::load();
+            config.mark_update_checked();
+        });
     }
 
     loop {
@@ -51,6 +68,26 @@ fn run_app(
 
         if event::poll(std::time::Duration::from_millis(100))? {
             app.handle_event()?;
+        }
+
+        // Check for background update result
+        if let Some(rx) = &app.update_receiver {
+            if let Ok(info) = rx.try_recv() {
+                app.update_status = update::UpdateStatus::Available(info);
+                app.update_receiver = None;
+                // Only show popup if user isn't in a modal (filter, rename, dir browser)
+                if app.mode == app::AppMode::Normal && !app.filter_active {
+                    app.mode = app::AppMode::UpdatePrompt;
+                }
+            }
+        }
+
+        // Check for background session names result
+        if let Some(rx) = &app.names_receiver {
+            if let Ok(names) = rx.try_recv() {
+                app.names_receiver = None;
+                app.apply_session_names(names);
+            }
         }
 
         if app.should_quit {
@@ -73,6 +110,25 @@ fn run_app(
             }
             *terminal = setup_terminal()?;
         }
+
+        if let Some(info) = app.perform_update.take() {
+            restore_terminal()?;
+            eprintln!("Downloading {}...", info.tag);
+            match update::perform_update(&info) {
+                Ok(()) => {
+                    eprintln!("Updated to {} — restart to apply.", info.tag);
+                    app.update_status =
+                        update::UpdateStatus::Done(info.tag.clone());
+                }
+                Err(e) => {
+                    let msg = format!("{:#}", e);
+                    eprintln!("Update failed: {}", msg);
+                    app.update_status = update::UpdateStatus::Failed(msg);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            *terminal = setup_terminal()?;
+        }
     }
 
     Ok(())
@@ -81,6 +137,7 @@ fn run_app(
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let flat = args.iter().any(|a| a == "--flat");
+    let force_update_check = args.iter().any(|a| a == "--check-update");
     let filter_path = args.iter().find(|a| !a.starts_with('-')).map(|arg| {
         std::fs::canonicalize(arg)
             .map(|p| p.to_string_lossy().to_string())
@@ -105,7 +162,7 @@ fn main() -> Result<()> {
     }));
 
     let mut terminal = setup_terminal()?;
-    let result = run_app(&mut terminal, sessions, filter_path, flat);
+    let result = run_app(&mut terminal, sessions, filter_path, flat, force_update_check);
     restore_terminal()?;
     result
 }

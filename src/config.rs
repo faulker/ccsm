@@ -26,6 +26,8 @@ pub struct Config {
     pub display_mode: DisplayMode,
     #[serde(default = "default_true")]
     pub hide_empty: bool,
+    #[serde(default)]
+    pub last_update_check: Option<i64>,
 }
 
 impl Default for Config {
@@ -34,6 +36,7 @@ impl Default for Config {
             tree_view: true,
             display_mode: DisplayMode::Name,
             hide_empty: true,
+            last_update_check: None,
         }
     }
 }
@@ -49,6 +52,7 @@ fn config_path() -> PathBuf {
         .join("config.json")
 }
 
+
 impl Config {
     pub fn load() -> Self {
         let path = config_path();
@@ -56,6 +60,21 @@ impl Config {
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default()
+    }
+
+    pub fn should_check_for_update(&self) -> bool {
+        match self.last_update_check {
+            None => true,
+            Some(ts) => {
+                let now = chrono::Utc::now().timestamp();
+                now - ts > 24 * 60 * 60
+            }
+        }
+    }
+
+    pub fn mark_update_checked(&mut self) {
+        self.last_update_check = Some(chrono::Utc::now().timestamp());
+        self.save();
     }
 
     pub fn save(&self) {
@@ -94,6 +113,7 @@ mod tests {
             tree_view: false,
             display_mode: DisplayMode::FullDir,
             hide_empty: true,
+            last_update_check: None,
         };
         let json = serde_json::to_string_pretty(&config).unwrap();
         let loaded: Config = serde_json::from_str(&json).unwrap();
@@ -119,6 +139,7 @@ mod tests {
             tree_view: false,
             display_mode: DisplayMode::ShortDir,
             hide_empty: false,
+            last_update_check: None,
         };
         let json = serde_json::to_string_pretty(&config).unwrap();
         let mut file = std::fs::File::create(&path).unwrap();
@@ -150,6 +171,7 @@ mod tests {
         let json = r#"{"tree_view": true, "display_mode": "name"}"#;
         let config: Config = serde_json::from_str(json).unwrap();
         assert_eq!(config.hide_empty, true);
+        assert_eq!(config.last_update_check, None);
     }
 
     #[test]
@@ -165,8 +187,43 @@ mod tests {
             tree_view: true,
             display_mode: DisplayMode::ShortDir,
             hide_empty: false,
+            last_update_check: None,
         };
         let json = serde_json::to_string(&config).unwrap();
         assert!(json.contains("\"short_dir\""));
+    }
+
+    #[test]
+    fn test_should_check_for_update_none() {
+        let config = Config {
+            last_update_check: None,
+            ..Config::default()
+        };
+        assert!(config.should_check_for_update());
+    }
+
+    #[test]
+    fn test_should_check_for_update_recent() {
+        let config = Config {
+            last_update_check: Some(chrono::Utc::now().timestamp()),
+            ..Config::default()
+        };
+        assert!(!config.should_check_for_update());
+    }
+
+    #[test]
+    fn test_should_check_for_update_stale() {
+        let config = Config {
+            last_update_check: Some(chrono::Utc::now().timestamp() - 25 * 60 * 60),
+            ..Config::default()
+        };
+        assert!(config.should_check_for_update());
+    }
+
+    #[test]
+    fn test_config_backward_compat_without_last_update_check() {
+        let json = r#"{"tree_view": true, "display_mode": "name", "hide_empty": true}"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(config.last_update_check, None);
     }
 }
