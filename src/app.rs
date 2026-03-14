@@ -240,7 +240,9 @@ impl App {
         self.config.tree_view = self.tree_view;
         self.config.display_mode = self.display_mode;
         self.config.hide_empty = self.hide_empty;
-        self.config.save();
+        if let Err(e) = self.config.save() {
+            eprintln!("Failed to save config: {e}");
+        }
     }
 
     fn init_tree(&mut self) {
@@ -477,7 +479,9 @@ impl App {
                     let project = self.rename_project.take().unwrap_or_default();
                     let name = self.rename_text.trim().to_string();
                     // Write to the session JSONL (even empty to clear)
-                    let _ = data::save_custom_title(&project, &session_id, &name);
+                    if let Err(e) = data::save_custom_title(&project, &session_id, &name) {
+                        eprintln!("Failed to save custom title: {e}");
+                    }
                     let name_opt = if name.is_empty() { None } else { Some(name) };
                     for s in &mut self.sessions {
                         if s.session_id == session_id {

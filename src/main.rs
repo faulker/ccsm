@@ -59,7 +59,9 @@ fn run_app(
             }
             // Mark checked regardless of result
             let mut config = config::Config::load();
-            config.mark_update_checked();
+            if let Err(e) = config.mark_update_checked() {
+                eprintln!("Failed to save update check timestamp: {e}");
+            }
         });
     }
 

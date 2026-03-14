@@ -1,6 +1,8 @@
 use crate::app::{App, AppMode, TreeRow};
+use crate::config::DisplayMode;
 use crate::data::PreviewMessage;
 use crate::update::UpdateStatus;
+use unicode_width::UnicodeWidthStr;
 use chrono::{Local, TimeZone};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -88,7 +90,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 let date = format_relative_date(s.last_timestamp);
                 let line = Line::from(vec![
                     Span::styled(
-                        truncate(&name, 28),
+                        if app.display_mode == DisplayMode::FullDir {
+                        truncate_left(&name, 28)
+                    } else {
+                        truncate(&name, 28)
+                    },
                         Style::default().fg(FG_TEXT),
                     ),
                     Span::raw("  "),
@@ -459,7 +465,7 @@ fn estimate_wrapped_height(text: &Text, width: usize) -> usize {
     text.lines
         .iter()
         .map(|line| {
-            let line_width: usize = line.spans.iter().map(|s| s.content.len()).sum();
+            let line_width: usize = line.spans.iter().map(|s| s.content.width()).sum();
             if line_width == 0 {
                 1
             } else {
@@ -696,5 +702,15 @@ fn truncate(s: &str, max: usize) -> String {
     } else {
         let truncated: String = s.chars().take(max - 1).collect();
         format!("{}…", truncated)
+    }
+}
+
+fn truncate_left(s: &str, max: usize) -> String {
+    let char_count = s.chars().count();
+    if char_count <= max {
+        format!("{:<width$}", s, width = max)
+    } else {
+        let truncated: String = s.chars().skip(char_count - max + 1).collect();
+        format!("…{}", truncated)
     }
 }

@@ -47,6 +47,7 @@ fn default_true() -> bool {
 
 fn config_path() -> PathBuf {
     dirs::config_dir()
+        .or_else(|| dirs::home_dir().map(|h| h.join(".config")))
         .unwrap_or_else(|| PathBuf::from("."))
         .join("ccsm")
         .join("config.json")
@@ -72,18 +73,19 @@ impl Config {
         }
     }
 
-    pub fn mark_update_checked(&mut self) {
+    pub fn mark_update_checked(&mut self) -> anyhow::Result<()> {
         self.last_update_check = Some(chrono::Utc::now().timestamp());
-        self.save();
+        self.save()
     }
 
-    pub fn save(&self) {
+    pub fn save(&self) -> anyhow::Result<()> {
         let path = config_path();
         if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            std::fs::create_dir_all(parent)?;
         }
-        let _ = serde_json::to_string_pretty(self)
-            .map(|json| std::fs::write(&path, json));
+        let json = serde_json::to_string_pretty(self)?;
+        std::fs::write(&path, json)?;
+        Ok(())
     }
 }
 

@@ -13,7 +13,7 @@ Sessions grouped by project with an expanded group showing individual sessions. 
 
 Cycle through display modes with `Tab` to change how projects are labeled in the session list.
 
-**Tree view - project:**
+**Tree view — project:**
 
 ![Tree view with project labels](screenshots/sessions-tree-project-view.png)
 
@@ -57,7 +57,7 @@ Press `N` to open a full directory browser overlay for starting a new Claude ses
 - **Flat view** — all sessions in a single sorted list with project name, date, and message count
 - **Display modes** — cycle through Name, Short Dir, and Full Dir labels for project groups in tree view
 - Shows a scrollable preview of conversation messages (last 20 turns)
-- **Session info bar** — displays working directory and git branch for the selected session
+- **Session info bar** — displays working directory and git branch for the selected session; shows the project directory even when a header row is selected with no active session
 - Resume any session directly — opens `claude --resume <id>` in the original project directory
 - **New session** — launch a new Claude session in the selected project's directory (`n`) or browse to any directory (`N`)
 - **Directory browser** — full overlay for navigating the filesystem, with path input and directory listing
@@ -139,7 +139,7 @@ Use `--check-update` to force an update check regardless of the 24h cooldown:
 | `l` / `→` | Expand group (tree view) |
 | `h` / `←` | Collapse group (tree view) |
 | `Enter` | Resume session / toggle group |
-| `Tab` | Cycle: tree [name] → tree [short dir] → tree [full dir] → flat → tree [name] |
+| `Tab` / `Shift + Tab` | Cycle: tree [name] → tree [short dir] → tree [full dir] → flat → tree [name] |
 | `Shift + J` | Scroll preview down |
 | `Shift + K` | Scroll preview up |
 | `/` | Activate search/filter mode |

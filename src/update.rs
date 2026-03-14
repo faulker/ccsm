@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::cmp::Ordering;
+use std::io::Read;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Version {
@@ -112,6 +113,8 @@ pub fn check_for_update() -> Option<UpdateInfo> {
 }
 
 pub fn perform_update(info: &UpdateInfo) -> Result<()> {
+    const MAX_DOWNLOAD_SIZE: u64 = 50 * 1024 * 1024;
+
     let resp = ureq::get(&info.download_url)
         .set("User-Agent", "ccsm-update-checker")
         .timeout(std::time::Duration::from_secs(60))
@@ -120,22 +123,29 @@ pub fn perform_update(info: &UpdateInfo) -> Result<()> {
 
     let mut bytes = Vec::new();
     resp.into_reader()
+        .take(MAX_DOWNLOAD_SIZE)
         .read_to_end(&mut bytes)
         .context("Failed to read update response")?;
+    if bytes.len() as u64 >= MAX_DOWNLOAD_SIZE {
+        anyhow::bail!("Download exceeded maximum allowed size");
+    }
 
     let decoder = flate2::read::GzDecoder::new(&bytes[..]);
     let mut archive = tar::Archive::new(decoder);
 
-    let temp_dir = std::env::temp_dir().join("ccsm-update");
-    let _ = std::fs::remove_dir_all(&temp_dir);
-    std::fs::create_dir_all(&temp_dir).context("Failed to create temp directory")?;
+    let temp_dir = tempfile::tempdir().context("Failed to create temp directory")?;
 
-    archive
-        .unpack(&temp_dir)
-        .context("Failed to extract update archive")?;
+    for entry in archive.entries().context("Failed to read archive entries")? {
+        let mut entry = entry.context("Failed to read archive entry")?;
+        let path = entry.path().context("Failed to get entry path")?;
+        if path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+            anyhow::bail!("Archive contains potentially malicious path: {:?}", path);
+        }
+        entry.unpack_in(temp_dir.path()).context("Failed to extract entry")?;
+    }
 
     // Find the binary in the extracted archive
-    let new_binary = find_binary(&temp_dir).context("Could not find ccsm binary in archive")?;
+    let new_binary = find_binary(temp_dir.path()).context("Could not find ccsm binary in archive")?;
 
     let current_exe = std::env::current_exe().context("Failed to determine current executable")?;
 
@@ -163,7 +173,7 @@ pub fn perform_update(info: &UpdateInfo) -> Result<()> {
     }
 
     let _ = std::fs::remove_file(&backup);
-    let _ = std::fs::remove_dir_all(&temp_dir);
+    // temp_dir is cleaned up automatically on drop
 
     Ok(())
 }

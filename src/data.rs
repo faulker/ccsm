@@ -137,7 +137,7 @@ pub fn load_sessions(filter_path: Option<&str>) -> Result<Vec<SessionInfo>> {
     let file = File::open(&history_path).context("Failed to open history.jsonl")?;
     let reader = BufReader::new(file);
 
-    let mut sessions: HashMap<String, SessionInfo> = HashMap::new();
+    let mut sessions: HashMap<(String, String), SessionInfo> = HashMap::new();
 
     for line in reader.lines() {
         let line = match line {
@@ -171,8 +171,9 @@ pub fn load_sessions(filter_path: Option<&str>) -> Result<Vec<SessionInfo>> {
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| project.clone());
 
+        let key = (session_id.clone(), project.clone());
         sessions
-            .entry(session_id.clone())
+            .entry(key)
             .and_modify(|s| {
                 if timestamp < s.first_timestamp {
                     s.first_timestamp = timestamp;
@@ -241,6 +242,7 @@ pub fn load_preview(project: &str, session_id: &str) -> (SessionMeta, Vec<Previe
     let reader = BufReader::new(file);
     let mut messages = Vec::new();
     let mut meta = SessionMeta::default();
+    meta.session_id = Some(session_id.to_string());
 
     for line in reader.lines() {
         let line = match line {
