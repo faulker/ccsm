@@ -63,6 +63,7 @@ impl Config {
             .unwrap_or_default()
     }
 
+    #[allow(dead_code)]
     pub fn should_check_for_update(&self) -> bool {
         match self.last_update_check {
             None => true,

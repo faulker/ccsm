@@ -40,24 +40,21 @@ fn run_app(
     sessions: Vec<data::SessionInfo>,
     filter_path: Option<String>,
     flat: bool,
-    force_update_check: bool,
-) -> Result<()> {
+) -> Result<bool> {
     let config = config::Config::load();
-    let check_update = force_update_check || config.should_check_for_update();
     let mut app = App::new(sessions, filter_path.clone(), config);
     if flat {
         app.tree_view = false;
     }
 
-    // Spawn background update check
-    if check_update {
+    // Always spawn background update check (non-blocking)
+    {
         let (tx, rx) = std::sync::mpsc::channel();
         app.update_receiver = Some(rx);
         std::thread::spawn(move || {
             if let Some(info) = update::check_for_update() {
                 let _ = tx.send(info);
             }
-            // Mark checked regardless of result
             let mut config = config::Config::load();
             if let Err(e) = config.mark_update_checked() {
                 eprintln!("Failed to save update check timestamp: {e}");
@@ -118,28 +115,28 @@ fn run_app(
             eprintln!("Downloading {}...", info.tag);
             match update::perform_update(&info) {
                 Ok(()) => {
-                    eprintln!("Updated to {} — restart to apply.", info.tag);
                     app.update_status =
                         update::UpdateStatus::Done(info.tag.clone());
+                    *terminal = setup_terminal()?;
+                    app.mode = app::AppMode::RestartPrompt;
                 }
                 Err(e) => {
                     let msg = format!("{:#}", e);
                     eprintln!("Update failed: {}", msg);
                     app.update_status = update::UpdateStatus::Failed(msg);
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    *terminal = setup_terminal()?;
                 }
             }
-            std::thread::sleep(std::time::Duration::from_secs(2));
-            *terminal = setup_terminal()?;
         }
     }
 
-    Ok(())
+    Ok(app.should_restart)
 }
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let flat = args.iter().any(|a| a == "--flat");
-    let force_update_check = args.iter().any(|a| a == "--check-update");
     let filter_path = args.iter().find(|a| !a.starts_with('-')).map(|arg| {
         std::fs::canonicalize(arg)
             .map(|p| p.to_string_lossy().to_string())
@@ -164,7 +161,16 @@ fn main() -> Result<()> {
     }));
 
     let mut terminal = setup_terminal()?;
-    let result = run_app(&mut terminal, sessions, filter_path, flat, force_update_check);
+    let should_restart = run_app(&mut terminal, sessions, filter_path, flat)?;
     restore_terminal()?;
-    result
+
+    if should_restart {
+        use std::os::unix::process::CommandExt;
+        let exe = std::env::current_exe()?;
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        let err = std::process::Command::new(&exe).args(&args).exec();
+        return Err(err.into());
+    }
+
+    Ok(())
 }

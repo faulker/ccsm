@@ -124,12 +124,6 @@ Use `--flat` to start in flat view instead of the default grouped tree view:
 ./target/release/ccsm --flat ~/projects/my-app
 ```
 
-Use `--check-update` to force an update check regardless of the 24h cooldown:
-
-```sh
-./target/release/ccsm --check-update
-```
-
 ## Key Bindings
 
 | Key | Action |

@@ -65,15 +65,19 @@ jobs:
           echo "new_tag=$NEW_TAG" >> "$GITHUB_OUTPUT"
           echo "Bumping $LATEST_TAG -> $NEW_TAG ($BUMP_TYPE)"
 
-      - name: Update Cargo.toml version
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Update Cargo.toml version and lockfile
         env:
           NEW_TAG: ${{ steps.bump.outputs.new_tag }}
         run: |
           VERSION="${NEW_TAG#v}"
           sed -i "s/^version = \".*\"/version = \"${VERSION}\"/" Cargo.toml
+          cargo generate-lockfile
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Cargo.toml
+          git add Cargo.toml Cargo.lock
           git commit -m "chore: bump version to ${VERSION}"
           git push origin HEAD:main
 

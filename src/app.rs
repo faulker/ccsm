@@ -30,6 +30,7 @@ pub enum AppMode {
     DirBrowser,
     Renaming,
     UpdatePrompt,
+    RestartPrompt,
 }
 
 #[derive(Debug, Clone)]
@@ -143,6 +144,7 @@ pub struct App {
     pub perform_update: Option<update::UpdateInfo>,
     pub update_receiver: Option<std::sync::mpsc::Receiver<update::UpdateInfo>>,
     pub names_receiver: Option<std::sync::mpsc::Receiver<HashMap<String, String>>>,
+    pub should_restart: bool,
 }
 
 /// Truncate a path to its last 2 components (e.g. "/Users/sane/Dev/ccsm" -> "Dev/ccsm").
@@ -185,6 +187,7 @@ impl App {
             perform_update: None,
             update_receiver: None,
             names_receiver: None,
+            should_restart: false,
         };
         app.spawn_load_session_names();
         app.init_tree();
@@ -543,6 +546,20 @@ impl App {
                     }
                     KeyCode::Char('n') | KeyCode::Esc => {
                         self.update_status = update::UpdateStatus::None;
+                        self.mode = AppMode::Normal;
+                    }
+                    _ => {}
+                }
+                return Ok(());
+            }
+
+            if self.mode == AppMode::RestartPrompt {
+                match key.code {
+                    KeyCode::Char('y') => {
+                        self.should_restart = true;
+                        self.should_quit = true;
+                    }
+                    KeyCode::Char('n') | KeyCode::Esc => {
                         self.mode = AppMode::Normal;
                     }
                     _ => {}

@@ -382,6 +382,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             draw_update_prompt(frame, info);
         }
     }
+
+    // Restart prompt overlay
+    if app.mode == AppMode::RestartPrompt {
+        if let UpdateStatus::Done(ref tag) = app.update_status {
+            draw_restart_prompt(frame, tag);
+        }
+    }
 }
 
 fn build_preview_text(messages: &[PreviewMessage]) -> Text<'static> {
@@ -686,6 +693,53 @@ fn draw_update_prompt(frame: &mut Frame, info: &crate::update::UpdateInfo) {
                 .border_style(Style::default().fg(ACCENT_GREEN))
                 .title(Span::styled(
                     " Update Available ",
+                    Style::default()
+                        .fg(ACCENT_GREEN)
+                        .add_modifier(Modifier::BOLD),
+                ))
+                .style(Style::default().bg(BG_SURFACE)),
+        );
+    frame.render_widget(popup, area);
+}
+
+fn draw_restart_prompt(frame: &mut Frame, tag: &str) {
+    let area = centered_rect(40, 15, frame.area());
+    let area = if area.height < 6 {
+        Rect { height: 6, ..area }
+    } else {
+        area
+    };
+    frame.render_widget(Clear, area);
+
+    let key_style = Style::default()
+        .fg(ACCENT_PEACH)
+        .add_modifier(Modifier::BOLD);
+    let text_style = Style::default().fg(FG_TEXT);
+
+    let content = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("Updated to {}", tag),
+            Style::default().fg(ACCENT_GREEN).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  y", key_style),
+            Span::styled(" restart now   ", text_style),
+            Span::styled("n/Esc", key_style),
+            Span::styled(" later", text_style),
+        ]),
+    ];
+
+    let popup = Paragraph::new(content)
+        .alignment(ratatui::layout::Alignment::Center)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(ACCENT_GREEN))
+                .title(Span::styled(
+                    " Update Installed ",
                     Style::default()
                         .fg(ACCENT_GREEN)
                         .add_modifier(Modifier::BOLD),
