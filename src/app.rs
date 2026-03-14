@@ -31,6 +31,7 @@ pub enum AppMode {
     Renaming,
     UpdatePrompt,
     RestartPrompt,
+    Help,
 }
 
 #[derive(Debug, Clone)]
@@ -133,6 +134,9 @@ pub struct App {
     pub tree_rows: Vec<TreeRow>,
     pub collapsed: HashSet<String>,
     pub hide_empty: bool,
+    pub group_chains: bool,
+    /// canonical_idx → all indices in the chain, sorted oldest→newest
+    pub chain_map: HashMap<usize, Vec<usize>>,
     pub mode: AppMode,
     pub dir_browser: Option<DirBrowser>,
     pub config: Config,
@@ -160,6 +164,7 @@ fn truncate_path(path: &str) -> String {
 impl App {
     pub fn new(sessions: Vec<SessionInfo>, filter_path: Option<String>, config: Config) -> Self {
         let filtered_indices: Vec<usize> = (0..sessions.len()).collect();
+        let group_chains = config.group_chains;
         let mut app = Self {
             sessions,
             selected: 0,
@@ -174,6 +179,8 @@ impl App {
             tree_view: config.tree_view,
             display_mode: config.display_mode,
             hide_empty: config.hide_empty,
+            group_chains,
+            chain_map: HashMap::new(),
             tree_rows: Vec::new(),
             collapsed: HashSet::new(),
             mode: AppMode::Normal,
@@ -243,6 +250,7 @@ impl App {
         self.config.tree_view = self.tree_view;
         self.config.display_mode = self.display_mode;
         self.config.hide_empty = self.hide_empty;
+        self.config.group_chains = self.group_chains;
         if let Err(e) = self.config.save() {
             eprintln!("Failed to save config: {e}");
         }
@@ -257,13 +265,12 @@ impl App {
 
     fn recompute_filter(&mut self) {
         let query = self.filter_text.to_lowercase();
-        if query.is_empty() {
-            self.filtered_indices = (0..self.sessions.len())
+        let initial_indices: Vec<usize> = if query.is_empty() {
+            (0..self.sessions.len())
                 .filter(|&i| !self.hide_empty || self.sessions[i].has_data)
-                .collect();
+                .collect()
         } else {
-            self.filtered_indices = self
-                .sessions
+            self.sessions
                 .iter()
                 .enumerate()
                 .filter(|(_, s)| {
@@ -272,13 +279,96 @@ impl App {
                             || s.project.to_lowercase().contains(&query))
                 })
                 .map(|(i, _)| i)
-                .collect();
+                .collect()
+        };
+
+        if self.group_chains {
+            // Group indices by slug
+            let mut slug_groups: HashMap<String, Vec<usize>> = HashMap::new();
+            let mut slugless: Vec<usize> = Vec::new();
+
+            for &idx in &initial_indices {
+                if let Some(slug) = self.sessions[idx].slug.clone() {
+                    slug_groups.entry(slug).or_default().push(idx);
+                } else {
+                    slugless.push(idx);
+                }
+            }
+
+            self.chain_map.clear();
+
+            let mut result_indices: Vec<usize> = slugless;
+
+            for (_slug, mut indices) in slug_groups {
+                if indices.len() == 1 {
+                    // Single session with a slug — treat as standalone
+                    result_indices.push(indices[0]);
+                } else {
+                    // Pick canonical = highest last_timestamp
+                    let canonical = *indices
+                        .iter()
+                        .max_by_key(|&&i| self.sessions[i].last_timestamp)
+                        .unwrap();
+                    // Sort chain members oldest→newest
+                    indices.sort_by_key(|&i| self.sessions[i].first_timestamp);
+                    self.chain_map.insert(canonical, indices);
+                    result_indices.push(canonical);
+                }
+            }
+
+            // Sort all results by last_timestamp descending
+            result_indices
+                .sort_by(|&a, &b| self.sessions[b].last_timestamp.cmp(&self.sessions[a].last_timestamp));
+            self.filtered_indices = result_indices;
+        } else {
+            self.chain_map.clear();
+            self.filtered_indices = initial_indices;
         }
+
         if self.tree_view {
             self.recompute_tree();
         }
         if self.selected >= self.visible_item_count() {
             self.selected = self.visible_item_count().saturating_sub(1);
+        }
+    }
+
+    /// Returns the effective display name for a session entry.
+    /// For chains, returns the name of the most recently active member that has one,
+    /// so the list matches what the details panel shows.
+    pub fn chain_name_for(&self, idx: usize) -> Option<&str> {
+        if let Some(chain) = self.chain_map.get(&idx) {
+            chain
+                .iter()
+                .filter(|&&i| self.sessions[i].name.is_some())
+                .max_by_key(|&&i| self.sessions[i].last_timestamp)
+                .and_then(|&i| self.sessions[i].name.as_deref())
+        } else {
+            self.sessions[idx].name.as_deref()
+        }
+    }
+
+    /// Returns the session_id to use when resuming, always the chain member with the
+    /// highest last_timestamp (i.e. the most recently active session).
+    pub fn resume_session_id_for(&self, idx: usize) -> &str {
+        if let Some(chain) = self.chain_map.get(&idx) {
+            let best = chain
+                .iter()
+                .max_by_key(|&&i| self.sessions[i].last_timestamp)
+                .copied()
+                .unwrap_or(idx);
+            &self.sessions[best].session_id
+        } else {
+            &self.sessions[idx].session_id
+        }
+    }
+
+    /// Returns the total entry count for a session, summing across all sessions in its chain.
+    pub fn chain_entry_count(&self, canonical_idx: usize) -> usize {
+        if let Some(indices) = self.chain_map.get(&canonical_idx) {
+            indices.iter().map(|&i| self.sessions[i].entry_count).sum()
+        } else {
+            self.sessions[canonical_idx].entry_count
         }
     }
 
@@ -357,26 +447,42 @@ impl App {
     }
 
     pub fn current_preview(&mut self) -> (&SessionMeta, &[PreviewMessage]) {
-        // Static default for the empty case
-        static EMPTY_META: SessionMeta = SessionMeta { cwd: None, git_branch: None, session_id: None, session_name: None };
+        static EMPTY_META: std::sync::OnceLock<SessionMeta> = std::sync::OnceLock::new();
 
         let idx = match self.selected_session_index() {
             Some(i) => i,
-            None => return (&EMPTY_META, &[]),
+            None => return (EMPTY_META.get_or_init(SessionMeta::default), &[]),
         };
-        let session = &self.sessions[idx];
-        let key = session.session_id.clone();
-        let project = session.project.clone();
 
-        if !self.preview_cache.contains_key(&key) {
-            let result = data::load_preview(&project, &key);
-            self.preview_cache.insert(key.clone(), result);
+        let chain_indices: Option<Vec<usize>> = self.chain_map.get(&idx).cloned();
+        let cache_key = match &chain_indices {
+            Some(_) => self.sessions[idx]
+                .slug
+                .clone()
+                .unwrap_or_else(|| self.sessions[idx].session_id.clone()),
+            None => self.sessions[idx].session_id.clone(),
+        };
+
+        if !self.preview_cache.contains_key(&cache_key) {
+            let result = if let Some(ref indices) = chain_indices {
+                let chain_sessions: Vec<&SessionInfo> =
+                    indices.iter().map(|&i| &self.sessions[i]).collect();
+                data::load_chain_preview(&chain_sessions)
+            } else {
+                let project = self.sessions[idx].project.clone();
+                let session_id = self.sessions[idx].session_id.clone();
+                data::load_preview(&project, &session_id)
+            };
+            self.preview_cache.insert(cache_key.clone(), result);
         }
 
         let session = &self.sessions[idx];
-        let (meta, messages) = self.preview_cache.get_mut(&key).unwrap();
-        meta.session_id = Some(session.session_id.clone());
-        meta.session_name = session.name.clone();
+        let (meta, messages) = self.preview_cache.get_mut(&cache_key).unwrap();
+        // For single sessions, keep meta in sync with live session data
+        if chain_indices.is_none() {
+            meta.session_id = Some(session.session_id.clone());
+            meta.session_name = session.name.clone();
+        }
         (meta, messages)
     }
 
@@ -567,6 +673,11 @@ impl App {
                 return Ok(());
             }
 
+            if self.mode == AppMode::Help {
+                self.mode = AppMode::Normal;
+                return Ok(());
+            }
+
             if self.mode == AppMode::Renaming {
                 self.handle_rename_event(key);
                 return Ok(());
@@ -626,6 +737,11 @@ impl App {
                 }
                 (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                     self.should_quit = true;
+                }
+                // '?' is Shift+/ on US keyboards; some terminals send Char('?') and
+                // others send Char('/') with SHIFT — handle both before the '/' filter.
+                (KeyCode::Char('?'), _) | (KeyCode::Char('/'), KeyModifiers::SHIFT) => {
+                    self.mode = AppMode::Help;
                 }
                 (KeyCode::Char('/'), _) => {
                     self.filter_active = true;
@@ -717,6 +833,13 @@ impl App {
                     self.preview_scroll = u16::MAX;
                     self.save_config();
                 }
+                (KeyCode::Char('c'), KeyModifiers::NONE) => {
+                    self.group_chains = !self.group_chains;
+                    self.preview_cache.clear();
+                    self.recompute_filter();
+                    self.preview_scroll = u16::MAX;
+                    self.save_config();
+                }
                 (KeyCode::Char('n'), KeyModifiers::NONE) => {
                     if let Some(cwd) = self.selected_cwd() {
                         let path = std::path::Path::new(&cwd);
@@ -730,10 +853,25 @@ impl App {
                 }
                 (KeyCode::Char('r'), KeyModifiers::NONE) => {
                     if let Some(idx) = self.selected_session_index() {
-                        let session = &self.sessions[idx];
+                        // For chains, always rename the most recent session
+                        let resume_idx = self
+                            .chain_map
+                            .get(&idx)
+                            .and_then(|chain| {
+                                chain
+                                    .iter()
+                                    .max_by_key(|&&i| self.sessions[i].last_timestamp)
+                                    .copied()
+                            })
+                            .unwrap_or(idx);
+                        let session = &self.sessions[resume_idx];
                         self.rename_session_id = Some(session.session_id.clone());
                         self.rename_project = Some(session.project.clone());
-                        self.rename_text = session.name.clone().unwrap_or_default();
+                        // Pre-fill with the chain's effective name (may come from any member)
+                        self.rename_text = self
+                            .chain_name_for(idx)
+                            .unwrap_or("")
+                            .to_string();
                         self.mode = AppMode::Renaming;
                     }
                 }
@@ -743,7 +881,13 @@ impl App {
                         .map(PathBuf::from)
                         .filter(|p| p.exists())
                         .unwrap_or_else(|| {
-                            dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"))
+                            dirs::home_dir().unwrap_or_else(|| {
+                                if cfg!(windows) {
+                                    PathBuf::from("C:\\")
+                                } else {
+                                    PathBuf::from("/")
+                                }
+                            })
                         });
                     self.dir_browser = Some(DirBrowser::new(start));
                     self.mode = AppMode::DirBrowser;
@@ -760,20 +904,16 @@ impl App {
                                 self.recompute_tree();
                             }
                             Some(TreeRow::Session { session_index }) => {
-                                let session = &self.sessions[session_index];
-                                self.launch_session = Some(LaunchRequest::Resume {
-                                    session_id: session.session_id.clone(),
-                                    cwd: session.project.clone(),
-                                });
+                                let session_id = self.resume_session_id_for(session_index).to_string();
+                                let cwd = self.sessions[session_index].project.clone();
+                                self.launch_session = Some(LaunchRequest::Resume { session_id, cwd });
                             }
                             None => {}
                         }
                     } else if let Some(idx) = self.selected_session_index() {
-                        let session = &self.sessions[idx];
-                        self.launch_session = Some(LaunchRequest::Resume {
-                            session_id: session.session_id.clone(),
-                            cwd: session.project.clone(),
-                        });
+                        let session_id = self.resume_session_id_for(idx).to_string();
+                        let cwd = self.sessions[idx].project.clone();
+                        self.launch_session = Some(LaunchRequest::Resume { session_id, cwd });
                     }
                 }
                 (KeyCode::Right, _) | (KeyCode::Char('l'), KeyModifiers::NONE)
@@ -862,31 +1002,34 @@ mod tests {
                 session_id: "s1".into(),
                 project: "/Users/sane/Dev/alpha".into(),
                 project_name: "alpha".into(),
-
                 first_timestamp: 1000,
                 last_timestamp: 2000,
                 entry_count: 5,
-                has_data: true, name: None,
+                has_data: true,
+                name: None,
+                slug: None,
             },
             SessionInfo {
                 session_id: "s2".into(),
                 project: "/Users/sane/Dev/beta".into(),
                 project_name: "beta".into(),
-
                 first_timestamp: 1500,
                 last_timestamp: 3000,
                 entry_count: 3,
-                has_data: true, name: None,
+                has_data: true,
+                name: None,
+                slug: None,
             },
             SessionInfo {
                 session_id: "s3".into(),
                 project: "/Users/sane/Dev/gamma".into(),
                 project_name: "gamma".into(),
-
                 first_timestamp: 500,
                 last_timestamp: 4000,
                 entry_count: 10,
-                has_data: true, name: None,
+                has_data: true,
+                name: None,
+                slug: None,
             },
         ]
     }
@@ -894,7 +1037,8 @@ mod tests {
     #[test]
     fn test_new_app_initializes_all_indices() {
         let app = App::new(make_sessions(), None, Config::default());
-        assert_eq!(app.filtered_indices, vec![0, 1, 2]);
+        // Sorted by last_timestamp desc: s3(4000), s2(3000), s1(2000) → [2, 1, 0]
+        assert_eq!(app.filtered_indices, vec![2, 1, 0]);
         assert_eq!(app.selected, 0);
         assert!(!app.filter_active);
         assert!(app.filter_text.is_empty());
@@ -991,7 +1135,8 @@ mod tests {
 
         app.filter_text.clear();
         app.recompute_filter();
-        assert_eq!(app.filtered_indices, vec![0, 1, 2]);
+        // Sorted by last_timestamp desc: s3(4000), s2(3000), s1(2000) → [2, 1, 0]
+        assert_eq!(app.filtered_indices, vec![2, 1, 0]);
     }
 
     #[test]
@@ -1032,7 +1177,9 @@ mod tests {
                 first_timestamp: 1000,
                 last_timestamp: 5000,
                 entry_count: 5,
-                has_data: true, name: None,
+                has_data: true,
+                name: None,
+                slug: None,
             },
             SessionInfo {
                 session_id: "s2".into(),
@@ -1041,7 +1188,9 @@ mod tests {
                 first_timestamp: 1500,
                 last_timestamp: 3000,
                 entry_count: 3,
-                has_data: true, name: None,
+                has_data: true,
+                name: None,
+                slug: None,
             },
             SessionInfo {
                 session_id: "s3".into(),
@@ -1050,7 +1199,9 @@ mod tests {
                 first_timestamp: 500,
                 last_timestamp: 4000,
                 entry_count: 10,
-                has_data: true, name: None,
+                has_data: true,
+                name: None,
+                slug: None,
             },
             SessionInfo {
                 session_id: "s4".into(),
@@ -1059,7 +1210,9 @@ mod tests {
                 first_timestamp: 2000,
                 last_timestamp: 6000,
                 entry_count: 2,
-                has_data: true, name: None,
+                has_data: true,
+                name: None,
+                slug: None,
             },
         ]
     }
@@ -1074,10 +1227,12 @@ mod tests {
         app.recompute_tree();
 
         // beta group first (s4 has last_timestamp=6000), then alpha (s1 has 5000)
+        // filtered_indices sorted desc: [3(6000), 0(5000), 2(4000), 1(3000)]
+        // tree: beta header → s4(idx=3), s2(idx=1) ; alpha header → s1(idx=0), s3(idx=2)
         assert_eq!(app.tree_rows.len(), 6); // 2 headers + 4 sessions
         assert!(matches!(&app.tree_rows[0], TreeRow::Header { project_name, session_count, .. } if project_name == "beta" && *session_count == 2));
-        assert!(matches!(&app.tree_rows[1], TreeRow::Session { session_index: 1 }));
-        assert!(matches!(&app.tree_rows[2], TreeRow::Session { session_index: 3 }));
+        assert!(matches!(&app.tree_rows[1], TreeRow::Session { session_index: 3 }));
+        assert!(matches!(&app.tree_rows[2], TreeRow::Session { session_index: 1 }));
         assert!(matches!(&app.tree_rows[3], TreeRow::Header { project_name, session_count, .. } if project_name == "alpha" && *session_count == 2));
         assert!(matches!(&app.tree_rows[4], TreeRow::Session { session_index: 0 }));
         assert!(matches!(&app.tree_rows[5], TreeRow::Session { session_index: 2 }));
@@ -1121,8 +1276,8 @@ mod tests {
         let mut app = App::new(make_sessions_with_shared_projects(), None, Config::default());
         app.collapsed.clear();
         app.recompute_tree();
-        app.selected = 1; // first session under beta
-        assert_eq!(app.selected_session_index(), Some(1));
+        app.selected = 1; // first session row under first header (beta → s4, session_index=3)
+        assert_eq!(app.selected_session_index(), Some(3));
     }
 
     #[test]
@@ -1166,7 +1321,9 @@ mod tests {
                 first_timestamp: 1000,
                 last_timestamp: 5000,
                 entry_count: 5,
-                has_data: true, name: None,
+                has_data: true,
+                name: None,
+                slug: None,
             },
             SessionInfo {
                 session_id: "s2".into(),
@@ -1175,7 +1332,9 @@ mod tests {
                 first_timestamp: 1500,
                 last_timestamp: 3000,
                 entry_count: 3,
-                has_data: true, name: None,
+                has_data: true,
+                name: None,
+                slug: None,
             },
             SessionInfo {
                 session_id: "s3".into(),
@@ -1184,7 +1343,9 @@ mod tests {
                 first_timestamp: 500,
                 last_timestamp: 4000,
                 entry_count: 10,
-                has_data: true, name: None,
+                has_data: true,
+                name: None,
+                slug: None,
             },
             SessionInfo {
                 session_id: "s4".into(),
@@ -1193,7 +1354,9 @@ mod tests {
                 first_timestamp: 2000,
                 last_timestamp: 6000,
                 entry_count: 2,
-                has_data: true, name: None,
+                has_data: true,
+                name: None,
+                slug: None,
             },
         ]
     }
@@ -1313,7 +1476,13 @@ mod tests {
 
     #[test]
     fn test_dir_browser_shows_hidden_dirs() {
-        let browser = DirBrowser::new(dirs::home_dir().unwrap_or_else(|| PathBuf::from("/")));
+        let browser = DirBrowser::new(dirs::home_dir().unwrap_or_else(|| {
+                                if cfg!(windows) {
+                                    PathBuf::from("C:\\")
+                                } else {
+                                    PathBuf::from("/")
+                                }
+                            }));
         // Should include dot directories (e.g. .config, .local)
         let has_hidden = browser.entries.iter().any(|e| e.name != ".." && e.name.starts_with('.'));
         // Home dir almost certainly has hidden dirs
@@ -1429,7 +1598,9 @@ mod tests {
             first_timestamp: 9000,
             last_timestamp: 9500,
             entry_count: 3,
-            has_data: true, name: None,
+            has_data: true,
+            name: None,
+            slug: None,
         });
 
         app.reload_sessions(updated);
@@ -1450,7 +1621,9 @@ mod tests {
                 first_timestamp: 1000,
                 last_timestamp: 2000,
                 entry_count: 5,
-                has_data: true, name: None,
+                has_data: true,
+                name: None,
+                slug: None,
             },
             SessionInfo {
                 session_id: "s2".into(),
@@ -1459,7 +1632,9 @@ mod tests {
                 first_timestamp: 1500,
                 last_timestamp: 3000,
                 entry_count: 3,
-                has_data: false, name: None,
+                has_data: false,
+                name: None,
+                slug: None,
             },
             SessionInfo {
                 session_id: "s3".into(),
@@ -1468,7 +1643,9 @@ mod tests {
                 first_timestamp: 500,
                 last_timestamp: 4000,
                 entry_count: 10,
-                has_data: true, name: None,
+                has_data: true,
+                name: None,
+                slug: None,
             },
         ]
     }
@@ -1479,13 +1656,13 @@ mod tests {
         let mut app = App::new(make_sessions_mixed_data(), None, Config::default());
         app.tree_view = false;
         app.recompute_filter();
-        // s2 (index 1) has_data=false, should be excluded
-        assert_eq!(app.filtered_indices, vec![0, 2]);
+        // s2 (index 1) has_data=false, should be excluded; sorted desc: s3(4000), s1(2000) → [2, 0]
+        assert_eq!(app.filtered_indices, vec![2, 0]);
 
-        // Disabling hide_empty shows all sessions
+        // Disabling hide_empty shows all sessions; sorted desc: s3(4000), s2(3000), s1(2000) → [2, 1, 0]
         app.hide_empty = false;
         app.recompute_filter();
-        assert_eq!(app.filtered_indices, vec![0, 1, 2]);
+        assert_eq!(app.filtered_indices, vec![2, 1, 0]);
     }
 
     #[test]
@@ -1493,9 +1670,9 @@ mod tests {
         let mut app = App::new(make_sessions_mixed_data(), None, Config::default());
         app.tree_view = false;
         app.hide_empty = true;
-        app.filter_text = "a".into(); // matches alpha and gamma
+        app.filter_text = "a".into(); // matches alpha and gamma; sorted desc: s3(4000), s1(2000) → [2, 0]
         app.recompute_filter();
-        assert_eq!(app.filtered_indices, vec![0, 2]);
+        assert_eq!(app.filtered_indices, vec![2, 0]);
 
         // beta matches text but has_data=false
         app.filter_text = "beta".into();
@@ -1705,10 +1882,118 @@ mod tests {
 
         app.hide_empty = true;
         app.recompute_filter();
-        assert_eq!(app.filtered_indices, vec![0, 2]);
+        // sorted desc: s3(4000), s1(2000) → [2, 0]
+        assert_eq!(app.filtered_indices, vec![2, 0]);
 
         app.hide_empty = false;
         app.recompute_filter();
-        assert_eq!(app.filtered_indices, vec![0, 1, 2]);
+        // sorted desc: s3(4000), s2(3000), s1(2000) → [2, 1, 0]
+        assert_eq!(app.filtered_indices, vec![2, 1, 0]);
+    }
+
+    fn make_chained_sessions() -> Vec<SessionInfo> {
+        vec![
+            // Two sessions sharing slug "cool-flying-cat" — form a chain
+            SessionInfo {
+                session_id: "chain-a".into(),
+                project: "/test/proj".into(),
+                project_name: "proj".into(),
+                first_timestamp: 1000,
+                last_timestamp: 2000,
+                entry_count: 4,
+                has_data: true,
+                name: None,
+                slug: Some("cool-flying-cat".into()),
+            },
+            SessionInfo {
+                session_id: "chain-b".into(),
+                project: "/test/proj".into(),
+                project_name: "proj".into(),
+                first_timestamp: 2500,
+                last_timestamp: 4000,
+                entry_count: 6,
+                has_data: true,
+                name: None,
+                slug: Some("cool-flying-cat".into()),
+            },
+            // Standalone session without a slug
+            SessionInfo {
+                session_id: "standalone".into(),
+                project: "/test/other".into(),
+                project_name: "other".into(),
+                first_timestamp: 500,
+                last_timestamp: 5000,
+                entry_count: 2,
+                has_data: true,
+                name: None,
+                slug: None,
+            },
+        ]
+    }
+
+    #[test]
+    fn test_recompute_filter_groups_chains() {
+        let mut app = App::new(make_chained_sessions(), None, Config::default());
+        app.tree_view = false;
+        app.group_chains = true;
+        app.recompute_filter();
+
+        // Two entries: standalone (last_ts=5000) and canonical for chain (last_ts=4000)
+        assert_eq!(app.filtered_indices.len(), 2);
+        // Standalone session (index 2, last_ts=5000) should come first
+        assert_eq!(app.filtered_indices[0], 2);
+        // Canonical chain entry = chain-b (index 1, last_ts=4000)
+        assert_eq!(app.filtered_indices[1], 1);
+        // chain_map should have canonical (1) → [0, 1] ordered oldest first
+        let chain = app.chain_map.get(&1).expect("chain_map should have entry for canonical");
+        assert_eq!(chain, &vec![0usize, 1usize]);
+    }
+
+    #[test]
+    fn test_recompute_filter_ungrouped_mode() {
+        let mut app = App::new(make_chained_sessions(), None, Config::default());
+        app.tree_view = false;
+        app.group_chains = false;
+        app.recompute_filter();
+
+        // All 3 sessions appear independently
+        assert_eq!(app.filtered_indices.len(), 3);
+        assert!(app.chain_map.is_empty());
+    }
+
+    #[test]
+    fn test_chain_entry_count_sums_chain() {
+        let mut app = App::new(make_chained_sessions(), None, Config::default());
+        app.tree_view = false;
+        app.group_chains = true;
+        app.recompute_filter();
+
+        // canonical_idx = 1 (chain-b); chain = [0, 1] with counts 4+6=10
+        assert_eq!(app.chain_entry_count(1), 10);
+        // standalone (idx=2) has no chain entry, returns its own count
+        assert_eq!(app.chain_entry_count(2), 2);
+    }
+
+    #[test]
+    fn test_single_slug_session_not_chained() {
+        // A single session with a slug but no partner should appear standalone
+        let sessions = vec![SessionInfo {
+            session_id: "solo".into(),
+            project: "/test/solo".into(),
+            project_name: "solo".into(),
+            first_timestamp: 1000,
+            last_timestamp: 2000,
+            entry_count: 3,
+            has_data: true,
+            name: None,
+            slug: Some("lone-slug".into()),
+        }];
+        let mut app = App::new(sessions, None, Config::default());
+        app.tree_view = false;
+        app.group_chains = true;
+        app.recompute_filter();
+
+        assert_eq!(app.filtered_indices, vec![0]);
+        assert!(app.chain_map.is_empty());
     }
 }

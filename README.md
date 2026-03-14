@@ -73,7 +73,7 @@ Press `N` to open a full directory browser overlay for starting a new Claude ses
 
 ## Requirements
 
-- macOS (ARM64) — additional platforms coming soon
+- **macOS** (ARM64, x86_64), **Linux** (x86_64, ARM64), or **Windows** (x86_64)
 - [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) installed and on your `PATH`
 - Existing session history in `~/.claude/`
 
@@ -81,11 +81,21 @@ Press `N` to open a full directory browser overlay for starting a new Claude ses
 
 ### Quick Install (pre-built binary)
 
+**macOS / Linux:**
+
 ```sh
 curl -fsSL https://raw.githubusercontent.com/faulker/ccsm/main/remote-install.sh | bash
 ```
 
 This downloads the latest release binary from GitHub and installs it to `~/.local/bin/ccsm`. Make sure `~/.local/bin` is in your `PATH`.
+
+**Windows (PowerShell):**
+
+```powershell
+irm https://raw.githubusercontent.com/faulker/ccsm/main/remote-install.ps1 | iex
+```
+
+This downloads the latest release and installs `ccsm.exe` to `%LOCALAPPDATA%\ccsm`, adding it to your user `PATH`.
 
 ### Build from Source
 
@@ -137,6 +147,7 @@ Use `--flat` to start in flat view instead of the default grouped tree view:
 | `Shift + J` | Scroll preview down |
 | `Shift + K` | Scroll preview up |
 | `/` | Activate search/filter mode |
+| `c` | Toggle session grouping (group/ungroup related sessions) |
 | `e` | Toggle show/hide empty sessions |
 | `n` | New Claude session in selected project's directory |
 | `Shift + N` | Open directory browser to start a new session anywhere |

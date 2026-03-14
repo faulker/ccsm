@@ -75,14 +75,16 @@ pub fn parse_version(s: &str) -> Option<Version> {
 }
 
 pub fn asset_name_for_current_platform(tag: &str) -> Option<String> {
-    let target = match (std::env::consts::ARCH, std::env::consts::OS) {
-        ("aarch64", "macos") => "aarch64-apple-darwin",
-        ("x86_64", "macos") => "x86_64-apple-darwin",
-        ("x86_64", "linux") => "x86_64-unknown-linux-gnu",
-        ("aarch64", "linux") => "aarch64-unknown-linux-gnu",
+    let (target, ext) = match (std::env::consts::ARCH, std::env::consts::OS) {
+        ("aarch64", "macos") => ("aarch64-apple-darwin", "tar.gz"),
+        ("x86_64", "macos") => ("x86_64-apple-darwin", "tar.gz"),
+        ("x86_64", "linux") => ("x86_64-unknown-linux-gnu", "tar.gz"),
+        ("aarch64", "linux") => ("aarch64-unknown-linux-gnu", "tar.gz"),
+        ("x86_64", "windows") => ("x86_64-pc-windows-msvc", "zip"),
+        ("aarch64", "windows") => ("aarch64-pc-windows-msvc", "zip"),
         _ => return None,
     };
-    Some(format!("ccsm-{}-{}.tar.gz", tag, target))
+    Some(format!("ccsm-{}-{}.{}", tag, target, ext))
 }
 
 pub fn check_for_update() -> Option<UpdateInfo> {
@@ -130,18 +132,12 @@ pub fn perform_update(info: &UpdateInfo) -> Result<()> {
         anyhow::bail!("Download exceeded maximum allowed size");
     }
 
-    let decoder = flate2::read::GzDecoder::new(&bytes[..]);
-    let mut archive = tar::Archive::new(decoder);
-
     let temp_dir = tempfile::tempdir().context("Failed to create temp directory")?;
 
-    for entry in archive.entries().context("Failed to read archive entries")? {
-        let mut entry = entry.context("Failed to read archive entry")?;
-        let path = entry.path().context("Failed to get entry path")?;
-        if path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
-            anyhow::bail!("Archive contains potentially malicious path: {:?}", path);
-        }
-        entry.unpack_in(temp_dir.path()).context("Failed to extract entry")?;
+    if info.download_url.ends_with(".zip") {
+        extract_zip(&bytes, temp_dir.path())?;
+    } else {
+        extract_tar_gz(&bytes, temp_dir.path())?;
     }
 
     // Find the binary in the extracted archive
@@ -178,9 +174,58 @@ pub fn perform_update(info: &UpdateInfo) -> Result<()> {
     Ok(())
 }
 
+fn extract_tar_gz(bytes: &[u8], dest: &std::path::Path) -> Result<()> {
+    let decoder = flate2::read::GzDecoder::new(bytes);
+    let mut archive = tar::Archive::new(decoder);
+
+    for entry in archive.entries().context("Failed to read archive entries")? {
+        let mut entry = entry.context("Failed to read archive entry")?;
+        let path = entry.path().context("Failed to get entry path")?;
+        if path.is_absolute()
+            || path.components().any(|c| {
+                matches!(
+                    c,
+                    std::path::Component::ParentDir | std::path::Component::RootDir
+                )
+            })
+        {
+            anyhow::bail!("Archive contains potentially malicious path: {:?}", path);
+        }
+        entry.unpack_in(dest).context("Failed to extract entry")?;
+    }
+    Ok(())
+}
+
+fn extract_zip(bytes: &[u8], dest: &std::path::Path) -> Result<()> {
+    let cursor = std::io::Cursor::new(bytes);
+    let mut archive = zip::ZipArchive::new(cursor).context("Failed to read zip archive")?;
+
+    for i in 0..archive.len() {
+        let mut file = archive.by_index(i).context("Failed to read zip entry")?;
+        let Some(path) = file.enclosed_name() else {
+            anyhow::bail!("Zip contains potentially malicious path");
+        };
+        let out_path = dest.join(path);
+
+        if file.is_dir() {
+            std::fs::create_dir_all(&out_path).context("Failed to create directory")?;
+        } else {
+            if let Some(parent) = out_path.parent() {
+                std::fs::create_dir_all(parent).context("Failed to create parent directory")?;
+            }
+            let mut out_file =
+                std::fs::File::create(&out_path).context("Failed to create extracted file")?;
+            std::io::copy(&mut file, &mut out_file).context("Failed to write extracted file")?;
+        }
+    }
+    Ok(())
+}
+
 fn find_binary(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let binary_name = if cfg!(windows) { "ccsm.exe" } else { "ccsm" };
+
     // Check directly in the temp dir
-    let direct = dir.join("ccsm");
+    let direct = dir.join(binary_name);
     if direct.exists() {
         return Some(direct);
     }
@@ -189,7 +234,7 @@ fn find_binary(dir: &std::path::Path) -> Option<std::path::PathBuf> {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
-                let nested = path.join("ccsm");
+                let nested = path.join(binary_name);
                 if nested.exists() {
                     return Some(nested);
                 }
@@ -275,11 +320,75 @@ mod tests {
     }
 
     #[test]
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     fn test_asset_name_for_current_platform() {
         let name = asset_name_for_current_platform("v0.2.0");
         let name = name.expect("Expected Some on supported platform");
         assert!(name.starts_with("ccsm-v0.2.0-"));
-        assert!(name.ends_with(".tar.gz"));
+        assert!(name.ends_with(".tar.gz") || name.ends_with(".zip"));
+    }
+
+    #[test]
+    fn test_find_binary_direct() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary_name = if cfg!(windows) { "ccsm.exe" } else { "ccsm" };
+        std::fs::write(dir.path().join(binary_name), b"fake").unwrap();
+        let found = find_binary(dir.path());
+        assert!(found.is_some());
+        assert!(found.unwrap().ends_with(binary_name));
+    }
+
+    #[test]
+    fn test_find_binary_nested() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary_name = if cfg!(windows) { "ccsm.exe" } else { "ccsm" };
+        let sub = dir.path().join("subdir");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join(binary_name), b"fake").unwrap();
+        let found = find_binary(dir.path());
+        assert!(found.is_some());
+        assert!(found.unwrap().ends_with(binary_name));
+    }
+
+    #[test]
+    fn test_find_binary_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(find_binary(dir.path()).is_none());
+    }
+
+    #[test]
+    fn test_extract_tar_gz() {
+        let dir = tempfile::tempdir().unwrap();
+        // Create a tar.gz with a single file
+        let mut buf = Vec::new();
+        {
+            let encoder = flate2::write::GzEncoder::new(&mut buf, flate2::Compression::default());
+            let mut tar_builder = tar::Builder::new(encoder);
+            let data = b"hello";
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o755);
+            header.set_cksum();
+            tar_builder.append_data(&mut header, "testfile", &data[..]).unwrap();
+            tar_builder.into_inner().unwrap().finish().unwrap();
+        }
+        extract_tar_gz(&buf, dir.path()).unwrap();
+        assert!(dir.path().join("testfile").exists());
+    }
+
+    #[test]
+    fn test_extract_zip() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut buf = Vec::new();
+        {
+            let cursor = std::io::Cursor::new(&mut buf);
+            let mut writer = zip::ZipWriter::new(cursor);
+            let options = zip::write::SimpleFileOptions::default();
+            writer.start_file("testfile.txt", options).unwrap();
+            std::io::Write::write_all(&mut writer, b"hello zip").unwrap();
+            writer.finish().unwrap();
+        }
+        extract_zip(&buf, dir.path()).unwrap();
+        assert!(dir.path().join("testfile.txt").exists());
     }
 }

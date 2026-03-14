@@ -14,6 +14,7 @@ use crossterm::{
 use ratatui::prelude::CrosstermBackend;
 use ratatui::Terminal;
 use std::io;
+use std::path::PathBuf;
 
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
     terminal::enable_raw_mode()?;
@@ -56,9 +57,9 @@ fn run_app(
                 let _ = tx.send(info);
             }
             let mut config = config::Config::load();
-            if let Err(e) = config.mark_update_checked() {
-                eprintln!("Failed to save update check timestamp: {e}");
-            }
+            // Silently ignore save failures — this is a non-critical background task
+            // and eprintln would corrupt the TUI in raw/alternate screen mode
+            let _ = config.mark_update_checked();
         });
     }
 
@@ -148,7 +149,13 @@ fn main() -> Result<()> {
         if filter_path.is_some() {
             eprintln!("No Claude Code sessions found for the specified path");
         } else {
-            eprintln!("No Claude Code sessions found in ~/.claude/history.jsonl");
+            let history_path = dirs::home_dir()
+                .map(|h| h.join(".claude").join("history.jsonl"))
+                .unwrap_or_else(|| PathBuf::from("~/.claude/history.jsonl"));
+            eprintln!(
+                "No Claude Code sessions found in {}",
+                history_path.display()
+            );
         }
         return Ok(());
     }
@@ -165,11 +172,21 @@ fn main() -> Result<()> {
     restore_terminal()?;
 
     if should_restart {
-        use std::os::unix::process::CommandExt;
         let exe = std::env::current_exe()?;
         let args: Vec<String> = std::env::args().skip(1).collect();
-        let err = std::process::Command::new(&exe).args(&args).exec();
-        return Err(err.into());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            let err = std::process::Command::new(&exe).args(&args).exec();
+            return Err(err.into());
+        }
+
+        #[cfg(windows)]
+        {
+            std::process::Command::new(&exe).args(&args).spawn()?;
+            std::process::exit(0);
+        }
     }
 
     Ok(())

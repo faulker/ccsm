@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use chrono::{Local, TimeZone};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs::File;
@@ -15,6 +16,7 @@ pub struct SessionInfo {
     pub entry_count: usize,
     pub has_data: bool,
     pub name: Option<String>,
+    pub slug: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -23,12 +25,18 @@ pub struct SessionMeta {
     pub git_branch: Option<String>,
     pub session_id: Option<String>,
     pub session_name: Option<String>,
+    pub all_session_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct PreviewMessage {
     pub role: String,
     pub text: String,
+}
+
+#[derive(Deserialize)]
+struct SlugLine {
+    slug: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -192,12 +200,16 @@ pub fn load_sessions(filter_path: Option<&str>) -> Result<Vec<SessionInfo>> {
                 entry_count: 1,
                 has_data: false,
                 name: None,
+                slug: None,
             });
     }
 
     let mut result: Vec<SessionInfo> = sessions.into_values().collect();
     for session in &mut result {
-        session.has_data = session_file_path(&session.project, &session.session_id).is_some();
+        if let Some(path) = session_file_path(&session.project, &session.session_id) {
+            session.has_data = true;
+            session.slug = read_slug(&path);
+        }
     }
     result.sort_by(|a, b| b.last_timestamp.cmp(&a.last_timestamp));
 
@@ -222,7 +234,42 @@ fn session_file_path(project: &str, session_id: &str) -> Option<PathBuf> {
     }
 }
 
-pub fn load_preview(project: &str, session_id: &str) -> (SessionMeta, Vec<PreviewMessage>) {
+/// Read at most the first 10 lines of a session JSONL and return the first non-empty `slug` found.
+fn read_slug(path: &Path) -> Option<String> {
+    let file = File::open(path).ok()?;
+    let reader = BufReader::new(file);
+    for (i, line) in reader.lines().enumerate() {
+        if i >= 10 {
+            break;
+        }
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+        if !line.contains("\"slug\"") {
+            continue;
+        }
+        if let Ok(entry) = serde_json::from_str::<SlugLine>(&line) {
+            if let Some(slug) = entry.slug {
+                if !slug.is_empty() {
+                    return Some(slug);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn format_session_boundary_date(timestamp_ms: i64) -> String {
+    match Local.timestamp_millis_opt(timestamp_ms) {
+        chrono::LocalResult::Single(dt) => dt.format("%b %d %H:%M").to_string(),
+        _ => "unknown".to_string(),
+    }
+}
+
+/// Load all messages from a session JSONL without any turn cap.
+/// Returns (meta, all_messages).
+fn load_session_messages(project: &str, session_id: &str) -> (SessionMeta, Vec<PreviewMessage>) {
     let path = match session_file_path(project, session_id) {
         Some(p) => p,
         None => return (SessionMeta::default(), vec![PreviewMessage {
@@ -258,7 +305,6 @@ pub fn load_preview(project: &str, session_id: &str) -> (SessionMeta, Vec<Previe
             Err(_) => continue,
         };
 
-        // Track the last seen cwd and gitBranch
         if let Some(cwd) = entry.cwd {
             if !cwd.is_empty() {
                 meta.cwd = Some(cwd);
@@ -270,7 +316,6 @@ pub fn load_preview(project: &str, session_id: &str) -> (SessionMeta, Vec<Previe
             }
         }
 
-        // Track custom title (last one wins)
         let entry_type = entry.entry_type.as_deref().unwrap_or("");
         if entry_type == "custom-title" {
             if let Some(title) = entry.custom_title {
@@ -319,6 +364,55 @@ pub fn load_preview(project: &str, session_id: &str) -> (SessionMeta, Vec<Previe
         messages.push(PreviewMessage { role, text });
     }
 
+    (meta, messages)
+}
+
+/// Load messages from multiple chained sessions, combining them in chronological order
+/// with session boundary markers between each session's messages.
+pub fn load_chain_preview(sessions: &[&SessionInfo]) -> (SessionMeta, Vec<PreviewMessage>) {
+    let mut sorted = sessions.to_vec();
+    sorted.sort_by_key(|s| s.first_timestamp);
+
+    let mut all_messages: Vec<PreviewMessage> = Vec::new();
+    let mut combined_meta = SessionMeta::default();
+
+    for session in &sorted {
+        let (meta, messages) = load_session_messages(&session.project, &session.session_id);
+
+        // Most recent session's cwd/branch wins (last wins)
+        if let Some(cwd) = meta.cwd {
+            combined_meta.cwd = Some(cwd);
+        }
+        if let Some(branch) = meta.git_branch {
+            combined_meta.git_branch = Some(branch);
+        }
+        if let Some(name) = meta.session_name {
+            combined_meta.session_name = Some(name);
+        }
+
+        // Insert boundary marker before each session (except the first)
+        if !all_messages.is_empty() {
+            let short_id: String = session.session_id.chars().take(8).collect();
+            let date = format_session_boundary_date(session.first_timestamp);
+            all_messages.push(PreviewMessage {
+                role: "system".to_string(),
+                text: format!("─── Session {} · {} ───", short_id, date),
+            });
+        }
+
+        all_messages.extend(messages);
+    }
+
+    if let Some(last) = sorted.last() {
+        combined_meta.session_id = Some(last.session_id.clone());
+        combined_meta.all_session_ids = sorted.iter().map(|s| s.session_id.clone()).collect();
+    }
+
+    (combined_meta, all_messages)
+}
+
+pub fn load_preview(project: &str, session_id: &str) -> (SessionMeta, Vec<PreviewMessage>) {
+    let (meta, messages) = load_session_messages(project, session_id);
     // Keep last 20 turns
     let start = messages.len().saturating_sub(20);
     (meta, messages[start..].to_vec())
@@ -482,5 +576,92 @@ mod tests {
         assert_eq!(msgs[0].role, "system");
         assert!(meta.cwd.is_none());
         assert!(meta.git_branch.is_none());
+    }
+
+    #[test]
+    fn test_read_slug_finds_slug() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join("ccsm_test_slug");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("test_slug.jsonl");
+
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, r#"{{"type":"system","slug":"happy-flying-penguin","content":"init"}}"#).unwrap();
+        writeln!(f, r#"{{"type":"user","message":{{"role":"user","content":"hello"}}}}"#).unwrap();
+
+        let slug = read_slug(&path);
+        assert_eq!(slug, Some("happy-flying-penguin".to_string()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_read_slug_missing_returns_none() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join("ccsm_test_slug2");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("no_slug.jsonl");
+
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, r#"{{"type":"user","message":{{"role":"user","content":"hello"}}}}"#).unwrap();
+
+        let slug = read_slug(&path);
+        assert_eq!(slug, None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_read_slug_only_checks_first_10_lines() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join("ccsm_test_slug3");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("late_slug.jsonl");
+
+        let mut f = std::fs::File::create(&path).unwrap();
+        // 10 lines without slug
+        for _ in 0..10 {
+            writeln!(f, r#"{{"type":"user","message":{{"role":"user","content":"x"}}}}"#).unwrap();
+        }
+        // slug on line 11 (index 10) — should not be found
+        writeln!(f, r#"{{"type":"system","slug":"late-slug","content":"init"}}"#).unwrap();
+
+        let slug = read_slug(&path);
+        assert_eq!(slug, None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn make_session_info(id: &str, first_ts: i64, last_ts: i64, slug: Option<&str>) -> SessionInfo {
+        SessionInfo {
+            session_id: id.to_string(),
+            project: "/test/project".to_string(),
+            project_name: "project".to_string(),
+            first_timestamp: first_ts,
+            last_timestamp: last_ts,
+            entry_count: 2,
+            has_data: false,
+            name: None,
+            slug: slug.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn test_load_chain_preview_orders_by_first_timestamp() {
+        // Sessions without actual files will return "No session data available" messages
+        let s1 = make_session_info("session-aaa", 1000, 2000, Some("test-slug"));
+        let s2 = make_session_info("session-bbb", 500, 1500, Some("test-slug"));
+        let s3 = make_session_info("session-ccc", 2000, 3000, Some("test-slug"));
+
+        let sessions = vec![&s1, &s2, &s3];
+        let (meta, _msgs) = load_chain_preview(&sessions);
+
+        // all_session_ids should be sorted by first_timestamp: s2 (500), s1 (1000), s3 (2000)
+        assert_eq!(
+            meta.all_session_ids,
+            vec!["session-bbb", "session-aaa", "session-ccc"]
+        );
+        // session_id should be the most recent (s3)
+        assert_eq!(meta.session_id.as_deref(), Some("session-ccc"));
     }
 }

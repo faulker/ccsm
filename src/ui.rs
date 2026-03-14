@@ -2,7 +2,7 @@ use crate::app::{App, AppMode, TreeRow};
 use crate::config::DisplayMode;
 use crate::data::PreviewMessage;
 use crate::update::UpdateStatus;
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use chrono::{Local, TimeZone};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -35,6 +35,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
         .split(chunks[0]);
 
+    let session_panel_inner_width = main_chunks[0].width.saturating_sub(2) as usize;
+
     // Session list (filtered or tree)
     let items: Vec<ListItem> = if app.tree_view {
         app.tree_rows
@@ -50,8 +52,16 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                     } else {
                         "▾"
                     };
+                    let count_str = session_count.to_string();
+                    let overhead = 5 + count_str.len();
+                    let available = session_panel_inner_width.saturating_sub(overhead);
+                    let display = if app.display_mode == DisplayMode::FullDir && project_name.width() > available {
+                        truncate_left_plain(project_name, available)
+                    } else {
+                        project_name.clone()
+                    };
                     let line = Line::from(vec![Span::styled(
-                        format!("{} {} ({})", arrow, project_name, session_count),
+                        format!("{} {} ({})", arrow, display, session_count),
                         Style::default()
                             .fg(ACCENT_TEAL)
                             .add_modifier(Modifier::BOLD),
@@ -61,17 +71,29 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 TreeRow::Session { session_index } => {
                     let s = &app.sessions[*session_index];
                     let date = format_relative_date(s.last_timestamp);
+                    let entry_count = app.chain_entry_count(*session_index);
+                    let chain_len = app.chain_map.get(session_index).map(|v| v.len()).unwrap_or(1);
                     let mut spans = vec![
                         Span::raw("  "),
-                        Span::styled(date, Style::default().fg(FG_SUBTEXT)),
+                        Span::styled(format!("{:<8}", date), Style::default().fg(FG_SUBTEXT)),
                         Span::styled(
-                            format!("  {} msg", s.entry_count),
+                            format!("  {:>4} msg", entry_count),
                             Style::default()
                                 .fg(FG_OVERLAY)
                                 .add_modifier(Modifier::DIM),
                         ),
                     ];
-                    if let Some(name) = &s.name {
+                    if app.group_chains {
+                        if chain_len > 1 {
+                            spans.push(Span::styled(
+                                format!("  ×{:<2}", chain_len),
+                                Style::default().fg(FG_OVERLAY),
+                            ));
+                        } else {
+                            spans.push(Span::raw("     "));
+                        }
+                    }
+                    if let Some(name) = app.chain_name_for(*session_index) {
                         spans.push(Span::styled(
                             format!("  {}", name),
                             Style::default().fg(ACCENT_PEACH),
@@ -84,29 +106,41 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     } else {
         app.filtered_indices
             .iter()
-            .map(|&i| &app.sessions[i])
-            .map(|s| {
+            .map(|&i| {
+                let s = &app.sessions[i];
                 let name = app.display_name(s);
                 let date = format_relative_date(s.last_timestamp);
-                let line = Line::from(vec![
+                let entry_count = app.chain_entry_count(i);
+                let chain_len = app.chain_map.get(&i).map(|v| v.len()).unwrap_or(1);
+                let mut spans = vec![
                     Span::styled(
                         if app.display_mode == DisplayMode::FullDir {
-                        truncate_left(&name, 28)
-                    } else {
-                        truncate(&name, 28)
-                    },
+                            truncate_left(&name, 28)
+                        } else {
+                            truncate(&name, 28)
+                        },
                         Style::default().fg(FG_TEXT),
                     ),
                     Span::raw("  "),
-                    Span::styled(date, Style::default().fg(FG_SUBTEXT)),
+                    Span::styled(format!("{:<8}", date), Style::default().fg(FG_SUBTEXT)),
                     Span::styled(
-                        format!("  {} msg", s.entry_count),
+                        format!("  {:>4} msg", entry_count),
                         Style::default()
                             .fg(FG_OVERLAY)
                             .add_modifier(Modifier::DIM),
                     ),
-                ]);
-                ListItem::new(line)
+                ];
+                if app.group_chains {
+                    if chain_len > 1 {
+                        spans.push(Span::styled(
+                            format!("  ×{:<2}", chain_len),
+                            Style::default().fg(FG_OVERLAY),
+                        ));
+                    } else {
+                        spans.push(Span::raw("     "));
+                    }
+                }
+                ListItem::new(Line::from(spans))
             })
             .collect()
     };
@@ -123,6 +157,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     title_spans.push(Span::styled(app.display_mode.label(), mode_style));
     if !app.hide_empty {
         title_spans.push(Span::styled(" [showing empty]", title_style));
+    }
+    if !app.group_chains {
+        title_spans.push(Span::styled(" [ungrouped]", title_style));
     }
     if let Some(p) = &app.filter_path {
         title_spans.push(Span::styled(format!(" ({})", p), title_style));
@@ -165,7 +202,20 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     // Session info bar (always visible)
     let mut spans: Vec<Span> = Vec::new();
-    if let Some(id) = &meta.session_id {
+    if meta.all_session_ids.len() > 1 {
+        let last_id: String = meta.all_session_ids.last()
+            .map(|id| id.chars().take(8).collect())
+            .unwrap_or_default();
+        let extra = meta.all_session_ids.len() - 1;
+        spans.push(Span::styled(
+            format!(" # {}", last_id),
+            Style::default().fg(ACCENT_BLUE),
+        ));
+        spans.push(Span::styled(
+            format!(" +{}", extra),
+            Style::default().fg(FG_SUBTEXT),
+        ));
+    } else if let Some(id) = &meta.session_id {
         let short_id: String = id.chars().take(8).collect();
         spans.push(Span::styled(
             format!(" # {}", short_id),
@@ -329,6 +379,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             Span::styled(" view  ", shift_hint_style),
             Span::styled("e", key_style),
             Span::styled(" show empty  ", hint_style),
+            Span::styled("c", key_style),
+            Span::styled(if app.group_chains { " ungroup  " } else { " group  " }, hint_style),
             Span::styled("r", key_style),
             Span::styled(" rename  ", hint_style),
             Span::styled("n", key_style),
@@ -336,7 +388,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             Span::styled("N", shift_key_style),
             Span::styled(" browse  ", shift_hint_style),
             Span::styled("q", key_style),
-            Span::styled(" quit", hint_style),
+            Span::styled(" quit  ", hint_style),
+            Span::styled("?", shift_key_style),
+            Span::styled(" help", shift_hint_style),
         ]);
 
         Paragraph::new(Line::from(spans))
@@ -388,6 +442,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         if let UpdateStatus::Done(ref tag) = app.update_status {
             draw_restart_prompt(frame, tag);
         }
+    }
+
+    // Help overlay
+    if app.mode == AppMode::Help {
+        render_help_popup(frame, frame.area());
     }
 }
 
@@ -480,6 +539,134 @@ fn estimate_wrapped_height(text: &Text, width: usize) -> usize {
             }
         })
         .sum()
+}
+
+fn render_help_popup(frame: &mut Frame, area: Rect) {
+    let popup_area = centered_rect(70, 80, area);
+    frame.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .title(" Claude Code Session Manager (ccsm) ")
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(ACCENT_MAUVE))
+        .style(Style::default().bg(BG_SURFACE));
+
+    let inner = block.inner(popup_area);
+    frame.render_widget(block, popup_area);
+
+    let header = Style::default().fg(ACCENT_MAUVE).add_modifier(Modifier::BOLD);
+    let key = Style::default().fg(ACCENT_PEACH).add_modifier(Modifier::BOLD);
+    let desc = Style::default().fg(FG_TEXT);
+    let sub = Style::default().fg(FG_SUBTEXT);
+
+    let lines: Vec<Line> = vec![
+        Line::from(vec![
+            Span::styled("  https://github.com/faulker/ccsm", sub),
+        ]),
+        Line::from(""),
+        Line::from(vec![Span::styled("  Navigation", header)]),
+        Line::from(vec![
+            Span::styled("  j/k  ↑/↓    ", key),
+            Span::styled("Move selection up/down", desc),
+        ]),
+        Line::from(vec![
+            Span::styled("  h/l  ←/→    ", key),
+            Span::styled("Scroll preview left/right", desc),
+        ]),
+        Line::from(vec![
+            Span::styled("  Enter       ", key),
+            Span::styled("Open selected session", desc),
+        ]),
+        Line::from(vec![
+            Span::styled("  Tab/Shift+Tab  ", key),
+            Span::styled("Cycle view mode (tree/flat × name/dir)", desc),
+        ]),
+        Line::from(vec![
+            Span::styled("  Shift+J/K   ", key),
+            Span::styled("Scroll preview pane up/down", desc),
+        ]),
+        Line::from(""),
+        Line::from(vec![Span::styled("  Actions", header)]),
+        Line::from(vec![
+            Span::styled("  /           ", key),
+            Span::styled("Enter filter/search mode", desc),
+        ]),
+        Line::from(vec![
+            Span::styled("  e           ", key),
+            Span::styled("Toggle show empty projects (projects with no active sessions)", desc),
+        ]),
+        Line::from(vec![
+            Span::styled("  c           ", key),
+            Span::styled("Toggle session grouping — groups are sequences of sessions where", desc),
+        ]),
+        Line::from(vec![
+            Span::styled("                ", key),
+            Span::styled("each was started from the previous one (parent → child)", desc),
+        ]),
+        Line::from(vec![
+            Span::styled("  n           ", key),
+            Span::styled("New session in current project dir", desc),
+        ]),
+        Line::from(vec![
+            Span::styled("  N           ", key),
+            Span::styled("New session — browse for directory", desc),
+        ]),
+        Line::from(vec![
+            Span::styled("  r           ", key),
+            Span::styled("Rename selected session", desc),
+        ]),
+        Line::from(vec![
+            Span::styled("  q / Esc     ", key),
+            Span::styled("Quit", desc),
+        ]),
+        Line::from(""),
+        Line::from(vec![Span::styled("  Filter Mode", header)]),
+        Line::from(vec![
+            Span::styled("  Enter       ", key),
+            Span::styled("Confirm filter and return to Normal mode", desc),
+        ]),
+        Line::from(vec![
+            Span::styled("  Esc         ", key),
+            Span::styled("Clear filter and return to Normal mode", desc),
+        ]),
+        Line::from(vec![
+            Span::styled("  Backspace   ", key),
+            Span::styled("Delete last character", desc),
+        ]),
+        Line::from(""),
+        Line::from(vec![Span::styled("  Directory Browser", header)]),
+        Line::from(vec![
+            Span::styled("  Space       ", key),
+            Span::styled("Select current directory", desc),
+        ]),
+        Line::from(vec![
+            Span::styled("  /           ", key),
+            Span::styled("Type a path manually", desc),
+        ]),
+        Line::from(vec![
+            Span::styled("  Esc         ", key),
+            Span::styled("Cancel and close browser", desc),
+        ]),
+        Line::from(""),
+        Line::from(vec![Span::styled("  Rename Mode", header)]),
+        Line::from(vec![
+            Span::styled("  Enter       ", key),
+            Span::styled("Save new name", desc),
+        ]),
+        Line::from(vec![
+            Span::styled("  Esc         ", key),
+            Span::styled("Cancel rename", desc),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  ? or Esc to close", sub),
+        ]),
+    ];
+
+    let paragraph = Paragraph::new(Text::from(lines))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, inner);
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
@@ -750,21 +937,66 @@ fn draw_restart_prompt(frame: &mut Frame, tag: &str) {
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    let char_count = s.chars().count();
-    if char_count <= max {
-        format!("{:<width$}", s, width = max)
+    let width = s.width();
+    if width <= max {
+        let pad = max - width;
+        format!("{}{}", s, " ".repeat(pad))
     } else {
-        let truncated: String = s.chars().take(max - 1).collect();
-        format!("{}…", truncated)
+        let mut truncated = String::new();
+        let mut w = 0;
+        for c in s.chars() {
+            let cw = c.width().unwrap_or(0);
+            if w + cw > max - 1 {
+                break;
+            }
+            truncated.push(c);
+            w += cw;
+        }
+        let pad = max - w - 1;
+        format!("{}…{}", truncated, " ".repeat(pad))
     }
 }
 
 fn truncate_left(s: &str, max: usize) -> String {
-    let char_count = s.chars().count();
-    if char_count <= max {
-        format!("{:<width$}", s, width = max)
+    let width = s.width();
+    if width <= max {
+        let pad = max - width;
+        format!("{}{}", s, " ".repeat(pad))
     } else {
-        let truncated: String = s.chars().skip(char_count - max + 1).collect();
-        format!("…{}", truncated)
+        // Walk from the end to collect characters that fit in (max - 1) columns
+        let chars: Vec<char> = s.chars().collect();
+        let mut w = 0;
+        let mut start = chars.len();
+        for i in (0..chars.len()).rev() {
+            let cw = chars[i].width().unwrap_or(0);
+            if w + cw > max - 1 {
+                break;
+            }
+            w += cw;
+            start = i;
+        }
+        let truncated: String = chars[start..].iter().collect();
+        let pad = max - w - 1;
+        format!("…{}{}", truncated, " ".repeat(pad))
+    }
+}
+
+fn truncate_left_plain(s: &str, max: usize) -> String {
+    let width = s.width();
+    if width <= max {
+        s.to_string()
+    } else {
+        let chars: Vec<char> = s.chars().collect();
+        let mut w = 0;
+        let mut start = chars.len();
+        for i in (0..chars.len()).rev() {
+            let cw = chars[i].width().unwrap_or(0);
+            if w + cw > max - 1 {
+                break;
+            }
+            w += cw;
+            start = i;
+        }
+        format!("…{}", chars[start..].iter().collect::<String>())
     }
 }

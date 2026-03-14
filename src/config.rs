@@ -26,6 +26,8 @@ pub struct Config {
     pub display_mode: DisplayMode,
     #[serde(default = "default_true")]
     pub hide_empty: bool,
+    #[serde(default = "default_true")]
+    pub group_chains: bool,
     #[serde(default)]
     pub last_update_check: Option<i64>,
 }
@@ -36,6 +38,7 @@ impl Default for Config {
             tree_view: true,
             display_mode: DisplayMode::Name,
             hide_empty: true,
+            group_chains: true,
             last_update_check: None,
         }
     }
@@ -45,20 +48,15 @@ fn default_true() -> bool {
     true
 }
 
-fn config_path() -> PathBuf {
-    dirs::config_dir()
-        .or_else(|| dirs::home_dir().map(|h| h.join(".config")))
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("ccsm")
-        .join("config.json")
+fn config_path() -> Option<PathBuf> {
+    let base = dirs::config_dir().or_else(|| dirs::home_dir().map(|h| h.join(".config")))?;
+    Some(base.join("ccsm").join("config.json"))
 }
-
 
 impl Config {
     pub fn load() -> Self {
-        let path = config_path();
-        std::fs::read_to_string(&path)
-            .ok()
+        config_path()
+            .and_then(|path| std::fs::read_to_string(path).ok())
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default()
     }
@@ -80,7 +78,7 @@ impl Config {
     }
 
     pub fn save(&self) -> anyhow::Result<()> {
-        let path = config_path();
+        let path = config_path().ok_or_else(|| anyhow::anyhow!("Could not determine config directory"))?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -101,6 +99,7 @@ mod tests {
         assert!(config.tree_view);
         assert_eq!(config.display_mode, DisplayMode::Name);
         assert!(config.hide_empty);
+        assert!(config.group_chains);
     }
 
     #[test]
@@ -116,6 +115,7 @@ mod tests {
             tree_view: false,
             display_mode: DisplayMode::FullDir,
             hide_empty: true,
+            group_chains: false,
             last_update_check: None,
         };
         let json = serde_json::to_string_pretty(&config).unwrap();
@@ -123,17 +123,24 @@ mod tests {
         assert_eq!(loaded.tree_view, false);
         assert_eq!(loaded.display_mode, DisplayMode::FullDir);
         assert_eq!(loaded.hide_empty, true);
+        assert_eq!(loaded.group_chains, false);
     }
 
     #[test]
-    fn test_config_load_missing_file_returns_default() {
+    fn test_config_load_returns_valid_config() {
+        // Config::load() returns defaults when no file exists,
+        // or the user's saved config if present — either way it should be valid
         let config = Config::load();
+        // Verify fields are accessible and display_mode is a known variant
         let _ = config.tree_view;
-        let _ = config.display_mode;
+        assert!(matches!(
+            config.display_mode,
+            DisplayMode::Name | DisplayMode::ShortDir | DisplayMode::FullDir
+        ));
     }
 
     #[test]
-    fn test_config_save_and_load() {
+    fn test_config_serialization_to_file() {
         let dir = std::env::temp_dir().join("ccsm_test_config");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("config.json");
@@ -142,6 +149,7 @@ mod tests {
             tree_view: false,
             display_mode: DisplayMode::ShortDir,
             hide_empty: false,
+            group_chains: true,
             last_update_check: None,
         };
         let json = serde_json::to_string_pretty(&config).unwrap();
@@ -152,18 +160,19 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(loaded.tree_view, false);
         assert_eq!(loaded.display_mode, DisplayMode::ShortDir);
+        assert_eq!(loaded.hide_empty, false);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn test_config_path_is_valid() {
-        let path = config_path();
+        let path = config_path().expect("config_path should return Some on supported platforms");
         assert!(path.ends_with("ccsm/config.json"));
     }
 
     #[test]
-    fn test_config_deserialize_partial_uses_defaults() {
+    fn test_config_deserialize_missing_required_field_fails() {
         let json = r#"{"tree_view": false}"#;
         let result: Result<Config, _> = serde_json::from_str(json);
         assert!(result.is_err());
@@ -174,7 +183,15 @@ mod tests {
         let json = r#"{"tree_view": true, "display_mode": "name"}"#;
         let config: Config = serde_json::from_str(json).unwrap();
         assert_eq!(config.hide_empty, true);
+        assert_eq!(config.group_chains, true);
         assert_eq!(config.last_update_check, None);
+    }
+
+    #[test]
+    fn test_config_backward_compat_without_group_chains() {
+        let json = r#"{"tree_view": true, "display_mode": "name", "hide_empty": true}"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(config.group_chains, true);
     }
 
     #[test]
@@ -190,6 +207,7 @@ mod tests {
             tree_view: true,
             display_mode: DisplayMode::ShortDir,
             hide_empty: false,
+            group_chains: true,
             last_update_check: None,
         };
         let json = serde_json::to_string(&config).unwrap();
