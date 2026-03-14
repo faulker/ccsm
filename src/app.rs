@@ -376,7 +376,7 @@ impl App {
     }
 
     /// Get the CWD for the currently selected session (or header group).
-    fn selected_cwd(&self) -> Option<String> {
+    pub fn selected_cwd(&self) -> Option<String> {
         if self.tree_view {
             match self.tree_rows.get(self.selected) {
                 Some(TreeRow::Session { session_index }) => {
@@ -635,6 +635,37 @@ impl App {
                             self.tree_view = true;
                             self.display_mode = DisplayMode::Name;
                             self.recompute_tree();
+                        }
+                    }
+                    self.selected = 0;
+                    self.preview_scroll = u16::MAX;
+                    self.save_config();
+                }
+                (KeyCode::BackTab, _) => {
+                    // Reverse cycle: opposite of Tab
+                    match (self.tree_view, self.display_mode) {
+                        (true, DisplayMode::Name) => {
+                            self.tree_view = false;
+                            self.display_mode = DisplayMode::FullDir;
+                        }
+                        (true, DisplayMode::ShortDir) => {
+                            self.display_mode = DisplayMode::Name;
+                            self.recompute_tree();
+                        }
+                        (true, DisplayMode::FullDir) => {
+                            self.display_mode = DisplayMode::ShortDir;
+                            self.recompute_tree();
+                        }
+                        (false, DisplayMode::Name) => {
+                            self.tree_view = true;
+                            self.display_mode = DisplayMode::FullDir;
+                            self.recompute_tree();
+                        }
+                        (false, DisplayMode::ShortDir) => {
+                            self.display_mode = DisplayMode::Name;
+                        }
+                        (false, DisplayMode::FullDir) => {
+                            self.display_mode = DisplayMode::ShortDir;
                         }
                     }
                     self.selected = 0;
@@ -1550,6 +1581,68 @@ mod tests {
 
         // Full cycle back to tree + Name
         simulate_tab(&mut app);
+        assert!(app.tree_view);
+        assert_eq!(app.display_mode, DisplayMode::Name);
+    }
+
+    #[test]
+    fn test_backtab_cycles_reverse() {
+        let mut app = App::new(make_sessions(), None, Config::default());
+
+        fn simulate_backtab(app: &mut App) {
+            match (app.tree_view, app.display_mode) {
+                (true, DisplayMode::Name) => {
+                    app.tree_view = false;
+                    app.display_mode = DisplayMode::FullDir;
+                }
+                (true, DisplayMode::ShortDir) => {
+                    app.display_mode = DisplayMode::Name;
+                    app.recompute_tree();
+                }
+                (true, DisplayMode::FullDir) => {
+                    app.display_mode = DisplayMode::ShortDir;
+                    app.recompute_tree();
+                }
+                (false, DisplayMode::Name) => {
+                    app.tree_view = true;
+                    app.display_mode = DisplayMode::FullDir;
+                    app.recompute_tree();
+                }
+                (false, DisplayMode::ShortDir) => {
+                    app.display_mode = DisplayMode::Name;
+                }
+                (false, DisplayMode::FullDir) => {
+                    app.display_mode = DisplayMode::ShortDir;
+                }
+            }
+        }
+
+        // Start: tree + Name
+        assert!(app.tree_view);
+        assert_eq!(app.display_mode, DisplayMode::Name);
+
+        // Reverse: tree+Name → flat+FullDir
+        simulate_backtab(&mut app);
+        assert!(!app.tree_view);
+        assert_eq!(app.display_mode, DisplayMode::FullDir);
+
+        simulate_backtab(&mut app);
+        assert!(!app.tree_view);
+        assert_eq!(app.display_mode, DisplayMode::ShortDir);
+
+        simulate_backtab(&mut app);
+        assert!(!app.tree_view);
+        assert_eq!(app.display_mode, DisplayMode::Name);
+
+        simulate_backtab(&mut app);
+        assert!(app.tree_view);
+        assert_eq!(app.display_mode, DisplayMode::FullDir);
+
+        simulate_backtab(&mut app);
+        assert!(app.tree_view);
+        assert_eq!(app.display_mode, DisplayMode::ShortDir);
+
+        simulate_backtab(&mut app);
         assert!(app.tree_view);
         assert_eq!(app.display_mode, DisplayMode::Name);
     }

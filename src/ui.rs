@@ -150,66 +150,62 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let preview = preview_slice.to_vec();
     let preview_text = build_preview_text(&preview);
 
-    let has_meta = meta.session_id.is_some()
-        || meta.cwd.is_some()
-        || meta.git_branch.is_some();
     let right_area = main_chunks[1];
 
     let right_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints(if has_meta {
-            vec![Constraint::Length(3), Constraint::Min(3)]
-        } else {
-            vec![Constraint::Length(0), Constraint::Min(3)]
-        })
+        .constraints(vec![Constraint::Length(3), Constraint::Min(3)])
         .split(right_area);
 
-    // Session info bar
-    if has_meta {
-        let mut spans: Vec<Span> = Vec::new();
-        if let Some(id) = &meta.session_id {
-            let short_id: String = id.chars().take(8).collect();
-            spans.push(Span::styled(
-                format!(" # {}", short_id),
-                Style::default().fg(ACCENT_BLUE),
-            ));
-        }
-        if let Some(name) = &meta.session_name {
-            if !spans.is_empty() {
-                spans.push(Span::raw("  "));
-            }
-            spans.push(Span::styled(
-                name.clone(),
-                Style::default().fg(ACCENT_PEACH).add_modifier(Modifier::BOLD),
-            ));
-        }
-        if let Some(cwd) = &meta.cwd {
-            if !spans.is_empty() {
-                spans.push(Span::raw("  "));
-            }
-            spans.push(Span::styled(" ", Style::default().fg(FG_OVERLAY)));
-            spans.push(Span::styled(cwd.clone(), Style::default().fg(FG_SUBTEXT)));
-        }
-        if let Some(branch) = &meta.git_branch {
-            if !spans.is_empty() {
-                spans.push(Span::raw("  "));
-            }
-            spans.push(Span::styled(" ⎇ ", Style::default().fg(ACCENT_MAUVE)));
-            spans.push(Span::styled(
-                branch.clone(),
-                Style::default().fg(ACCENT_MAUVE),
-            ));
-        }
-
-        let info_bar = Paragraph::new(Line::from(spans)).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(FG_OVERLAY))
-                .style(Style::default().bg(BG_SURFACE)),
-        );
-        frame.render_widget(info_bar, right_chunks[0]);
+    // Session info bar (always visible)
+    let mut spans: Vec<Span> = Vec::new();
+    if let Some(id) = &meta.session_id {
+        let short_id: String = id.chars().take(8).collect();
+        spans.push(Span::styled(
+            format!(" # {}", short_id),
+            Style::default().fg(ACCENT_BLUE),
+        ));
     }
+    if let Some(name) = &meta.session_name {
+        if !spans.is_empty() {
+            spans.push(Span::raw("  "));
+        }
+        spans.push(Span::styled(
+            name.clone(),
+            Style::default().fg(ACCENT_PEACH).add_modifier(Modifier::BOLD),
+        ));
+    }
+    let fallback_cwd = if meta.cwd.is_some() {
+        meta.cwd.clone()
+    } else {
+        app.selected_cwd()
+    };
+    if let Some(cwd) = &fallback_cwd {
+        if !spans.is_empty() {
+            spans.push(Span::raw("  "));
+        }
+        spans.push(Span::styled(" ", Style::default().fg(FG_OVERLAY)));
+        spans.push(Span::styled(cwd.clone(), Style::default().fg(FG_SUBTEXT)));
+    }
+    if let Some(branch) = &meta.git_branch {
+        if !spans.is_empty() {
+            spans.push(Span::raw("  "));
+        }
+        spans.push(Span::styled(" ⎇ ", Style::default().fg(ACCENT_MAUVE)));
+        spans.push(Span::styled(
+            branch.clone(),
+            Style::default().fg(ACCENT_MAUVE),
+        ));
+    }
+
+    let info_bar = Paragraph::new(Line::from(spans)).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(FG_OVERLAY))
+            .style(Style::default().bg(BG_SURFACE)),
+    );
+    frame.render_widget(info_bar, right_chunks[0]);
 
     // Preview pane
     let preview_area = right_chunks[1];
@@ -323,8 +319,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             Span::styled(" scroll  ", shift_hint_style),
             Span::styled("/", key_style),
             Span::styled(" search  ", hint_style),
-            Span::styled("Tab", key_style),
-            Span::styled(" view  ", hint_style),
+            Span::styled("Tab", shift_key_style),
+            Span::styled(" view  ", shift_hint_style),
             Span::styled("e", key_style),
             Span::styled(" show empty  ", hint_style),
             Span::styled("r", key_style),
