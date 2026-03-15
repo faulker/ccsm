@@ -7,7 +7,7 @@ A terminal UI for browsing your Claude Code session history, previewing conversa
 ### Tree View with Session Preview
 Sessions grouped by project with an expanded group showing individual sessions. The right pane displays a scrollable conversation preview with the session's working directory and git branch in the info bar.
 
-![Tree view with session preview](screenshots/session-bug-fixes-tree-view.png)
+![Tree view with session preview](screenshots/session-tree-view.png)
 
 ### Display Modes
 
