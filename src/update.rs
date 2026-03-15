@@ -81,7 +81,6 @@ pub fn asset_name_for_current_platform(tag: &str) -> Option<String> {
         ("x86_64", "linux") => ("x86_64-unknown-linux-gnu", "tar.gz"),
         ("aarch64", "linux") => ("aarch64-unknown-linux-gnu", "tar.gz"),
         ("x86_64", "windows") => ("x86_64-pc-windows-msvc", "zip"),
-        ("aarch64", "windows") => ("aarch64-pc-windows-msvc", "zip"),
         _ => return None,
     };
     Some(format!("ccsm-{}-{}.{}", tag, target, ext))
