@@ -1,4 +1,4 @@
-use crate::app::{App, AppMode, TreeRow};
+use crate::app::{App, AppMode, FlatRow, TreeRow};
 use crate::config::DisplayMode;
 use crate::data::PreviewMessage;
 use crate::update::UpdateStatus;
@@ -47,6 +47,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                     session_count,
                     project,
                 } => {
+                    let running = app.project_running_count(project);
                     let arrow = if app.collapsed.contains(project) {
                         "▸"
                     } else {
@@ -60,13 +61,19 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                     } else {
                         project_name.clone()
                     };
-                    let line = Line::from(vec![Span::styled(
+                    let mut header_spans = vec![Span::styled(
                         format!("{} {} ({})", arrow, display, session_count),
                         Style::default()
                             .fg(ACCENT_TEAL)
                             .add_modifier(Modifier::BOLD),
-                    )]);
-                    ListItem::new(line)
+                    )];
+                    if running > 0 {
+                        header_spans.push(Span::styled(
+                            format!(" ● {}", running),
+                            Style::default().fg(ACCENT_GREEN).add_modifier(Modifier::BOLD),
+                        ));
+                    }
+                    ListItem::new(Line::from(header_spans))
                 }
                 TreeRow::Session { session_index } => {
                     let s = &app.sessions[*session_index];
@@ -101,46 +108,106 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                     }
                     ListItem::new(Line::from(spans))
                 }
+                TreeRow::RunningHeader { project, count } => {
+                    let key = format!("running:{}", project);
+                    let arrow = if app.collapsed.contains(&key) { "▸" } else { "▾" };
+                    ListItem::new(Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled(
+                            format!("{} ● Running ({})", arrow, count),
+                            Style::default().fg(ACCENT_GREEN).add_modifier(Modifier::BOLD),
+                        ),
+                    ]))
+                }
+                TreeRow::HistoryHeader { project, count } => {
+                    let key = format!("history:{}", project);
+                    let arrow = if app.collapsed.contains(&key) { "▸" } else { "▾" };
+                    ListItem::new(Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled(
+                            format!("{} History ({})", arrow, count),
+                            Style::default().fg(FG_SUBTEXT),
+                        ),
+                    ]))
+                }
+                TreeRow::LiveItem { live_index } => {
+                    let ls = &app.live_sessions[*live_index];
+                    ListItem::new(Line::from(vec![
+                        Span::raw("    "),
+                        Span::styled("● ", Style::default().fg(ACCENT_GREEN)),
+                        Span::styled(
+                            ls.display_name.clone(),
+                            Style::default().fg(FG_TEXT).add_modifier(Modifier::BOLD),
+                        ),
+                    ]))
+                }
             })
             .collect()
     } else {
-        app.filtered_indices
+        app.flat_rows
             .iter()
-            .map(|&i| {
-                let s = &app.sessions[i];
-                let name = app.display_name(s);
-                let date = format_relative_date(s.last_timestamp);
-                let entry_count = app.chain_entry_count(i);
-                let chain_len = app.chain_map.get(&i).map(|v| v.len()).unwrap_or(1);
-                let mut spans = vec![
-                    Span::styled(
-                        if app.display_mode == DisplayMode::FullDir {
-                            truncate_left(&name, 28)
-                        } else {
-                            truncate(&name, 28)
-                        },
-                        Style::default().fg(FG_TEXT),
-                    ),
-                    Span::raw("  "),
-                    Span::styled(format!("{:<8}", date), Style::default().fg(FG_SUBTEXT)),
-                    Span::styled(
-                        format!("  {:>4} msg", entry_count),
-                        Style::default()
-                            .fg(FG_OVERLAY)
-                            .add_modifier(Modifier::DIM),
-                    ),
-                ];
-                if app.group_chains {
-                    if chain_len > 1 {
-                        spans.push(Span::styled(
-                            format!("  ×{:<2}", chain_len),
-                            Style::default().fg(FG_OVERLAY),
-                        ));
-                    } else {
-                        spans.push(Span::raw("     "));
-                    }
+            .map(|row| match row {
+                FlatRow::RunningHeader { count } => {
+                    ListItem::new(Line::from(vec![
+                        Span::styled(
+                            format!("▾ ● Running ({})", count),
+                            Style::default().fg(ACCENT_GREEN).add_modifier(Modifier::BOLD),
+                        ),
+                    ]))
                 }
-                ListItem::new(Line::from(spans))
+                FlatRow::LiveItem { live_index } => {
+                    let ls = &app.live_sessions[*live_index];
+                    ListItem::new(Line::from(vec![
+                        Span::styled("● ", Style::default().fg(ACCENT_GREEN).add_modifier(Modifier::BOLD)),
+                        Span::styled(ls.display_name.clone(), Style::default().fg(FG_TEXT).add_modifier(Modifier::BOLD)),
+                        Span::raw("  "),
+                        Span::styled(ls.project_name.clone(), Style::default().fg(FG_SUBTEXT)),
+                    ]))
+                }
+                FlatRow::Separator => {
+                    ListItem::new(Line::from(vec![
+                        Span::styled(
+                            "─────────────────────────────────── history ───",
+                            Style::default().fg(FG_OVERLAY),
+                        ),
+                    ]))
+                }
+                FlatRow::HistoryItem { session_index } => {
+                    let s = &app.sessions[*session_index];
+                    let name = app.display_name(s);
+                    let date = format_relative_date(s.last_timestamp);
+                    let entry_count = app.chain_entry_count(*session_index);
+                    let chain_len = app.chain_map.get(session_index).map(|v| v.len()).unwrap_or(1);
+                    let mut spans = vec![
+                        Span::styled(
+                            if app.display_mode == DisplayMode::FullDir {
+                                truncate_left(&name, 28)
+                            } else {
+                                truncate(&name, 28)
+                            },
+                            Style::default().fg(FG_TEXT),
+                        ),
+                        Span::raw("  "),
+                        Span::styled(format!("{:<8}", date), Style::default().fg(FG_SUBTEXT)),
+                        Span::styled(
+                            format!("  {:>4} msg", entry_count),
+                            Style::default()
+                                .fg(FG_OVERLAY)
+                                .add_modifier(Modifier::DIM),
+                        ),
+                    ];
+                    if app.group_chains {
+                        if chain_len > 1 {
+                            spans.push(Span::styled(
+                                format!("  ×{:<2}", chain_len),
+                                Style::default().fg(FG_OVERLAY),
+                            ));
+                        } else {
+                            spans.push(Span::raw("     "));
+                        }
+                    }
+                    ListItem::new(Line::from(spans))
+                }
             })
             .collect()
     };
@@ -163,6 +230,16 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
     if let Some(p) = &app.filter_path {
         title_spans.push(Span::styled(format!(" ({})", p), title_style));
+    }
+    let running_count = app.total_running_count();
+    if running_count > 0 {
+        title_spans.push(Span::styled(
+            format!(" ● {} running", running_count),
+            Style::default().fg(ACCENT_GREEN).add_modifier(Modifier::BOLD),
+        ));
+    }
+    if app.live_filter {
+        title_spans.push(Span::styled(" [live only]", Style::default().fg(ACCENT_GREEN)));
     }
     title_spans.push(Span::styled(" ", title_style));
 
@@ -188,10 +265,21 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     frame.render_stateful_widget(list, main_chunks[0], &mut state);
 
     // Preview
+    let is_live_selected = app.selected_live_index().is_some();
+    let live_preview_lines = if is_live_selected {
+        app.current_live_preview()
+    } else {
+        vec![]
+    };
+
     let (meta, preview_slice) = app.current_preview();
     let meta = meta.clone();
     let preview = preview_slice.to_vec();
-    let preview_text = build_preview_text(&preview);
+    let preview_text = if is_live_selected {
+        build_live_preview_text(&live_preview_lines)
+    } else {
+        build_preview_text(&preview)
+    };
 
     let right_area = main_chunks[1];
 
@@ -202,56 +290,67 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     // Session info bar (always visible)
     let mut spans: Vec<Span> = Vec::new();
-    if meta.all_session_ids.len() > 1 {
-        let last_id: String = meta.all_session_ids.last()
-            .map(|id| id.chars().take(8).collect())
-            .unwrap_or_default();
-        let extra = meta.all_session_ids.len() - 1;
-        spans.push(Span::styled(
-            format!(" # {}", last_id),
-            Style::default().fg(ACCENT_BLUE),
-        ));
-        spans.push(Span::styled(
-            format!(" +{}", extra),
-            Style::default().fg(FG_SUBTEXT),
-        ));
-    } else if let Some(id) = &meta.session_id {
-        let short_id: String = id.chars().take(8).collect();
-        spans.push(Span::styled(
-            format!(" # {}", short_id),
-            Style::default().fg(ACCENT_BLUE),
-        ));
-    }
-    if let Some(name) = &meta.session_name {
-        if !spans.is_empty() {
+    if is_live_selected {
+        if let Some(idx) = app.selected_live_index() {
+            let ls = &app.live_sessions[idx];
+            spans.push(Span::styled("● ", Style::default().fg(ACCENT_GREEN).add_modifier(Modifier::BOLD)));
+            spans.push(Span::styled(ls.display_name.clone(), Style::default().fg(ACCENT_PEACH).add_modifier(Modifier::BOLD)));
             spans.push(Span::raw("  "));
+            spans.push(Span::styled(" ", Style::default().fg(FG_OVERLAY)));
+            spans.push(Span::styled(ls.cwd.clone(), Style::default().fg(FG_SUBTEXT)));
         }
-        spans.push(Span::styled(
-            name.clone(),
-            Style::default().fg(ACCENT_PEACH).add_modifier(Modifier::BOLD),
-        ));
-    }
-    let fallback_cwd = if meta.cwd.is_some() {
-        meta.cwd.clone()
     } else {
-        app.selected_cwd()
-    };
-    if let Some(cwd) = &fallback_cwd {
-        if !spans.is_empty() {
-            spans.push(Span::raw("  "));
+        if meta.all_session_ids.len() > 1 {
+            let last_id: String = meta.all_session_ids.last()
+                .map(|id| id.chars().take(8).collect())
+                .unwrap_or_default();
+            let extra = meta.all_session_ids.len() - 1;
+            spans.push(Span::styled(
+                format!(" # {}", last_id),
+                Style::default().fg(ACCENT_BLUE),
+            ));
+            spans.push(Span::styled(
+                format!(" +{}", extra),
+                Style::default().fg(FG_SUBTEXT),
+            ));
+        } else if let Some(id) = &meta.session_id {
+            let short_id: String = id.chars().take(8).collect();
+            spans.push(Span::styled(
+                format!(" # {}", short_id),
+                Style::default().fg(ACCENT_BLUE),
+            ));
         }
-        spans.push(Span::styled(" ", Style::default().fg(FG_OVERLAY)));
-        spans.push(Span::styled(cwd.clone(), Style::default().fg(FG_SUBTEXT)));
-    }
-    if let Some(branch) = &meta.git_branch {
-        if !spans.is_empty() {
-            spans.push(Span::raw("  "));
+        if let Some(name) = &meta.session_name {
+            if !spans.is_empty() {
+                spans.push(Span::raw("  "));
+            }
+            spans.push(Span::styled(
+                name.clone(),
+                Style::default().fg(ACCENT_PEACH).add_modifier(Modifier::BOLD),
+            ));
         }
-        spans.push(Span::styled(" ⎇ ", Style::default().fg(ACCENT_MAUVE)));
-        spans.push(Span::styled(
-            branch.clone(),
-            Style::default().fg(ACCENT_MAUVE),
-        ));
+        let fallback_cwd = if meta.cwd.is_some() {
+            meta.cwd.clone()
+        } else {
+            app.selected_cwd()
+        };
+        if let Some(cwd) = &fallback_cwd {
+            if !spans.is_empty() {
+                spans.push(Span::raw("  "));
+            }
+            spans.push(Span::styled(" ", Style::default().fg(FG_OVERLAY)));
+            spans.push(Span::styled(cwd.clone(), Style::default().fg(FG_SUBTEXT)));
+        }
+        if let Some(branch) = &meta.git_branch {
+            if !spans.is_empty() {
+                spans.push(Span::raw("  "));
+            }
+            spans.push(Span::styled(" ⎇ ", Style::default().fg(ACCENT_MAUVE)));
+            spans.push(Span::styled(
+                branch.clone(),
+                Style::default().fg(ACCENT_MAUVE),
+            ));
+        }
     }
 
     let info_bar = Paragraph::new(Line::from(spans)).block(
@@ -366,6 +465,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             _ => {}
         }
 
+        let is_live = app.selected_live_index().is_some();
         spans.extend_from_slice(&[
             Span::styled(" ↑↓/jk", key_style),
             Span::styled(" navigate  ", hint_style),
@@ -384,9 +484,17 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             Span::styled("r", key_style),
             Span::styled(" rename  ", hint_style),
             Span::styled("n", key_style),
-            Span::styled(" new  ", hint_style),
+            Span::styled(" new live  ", hint_style),
             Span::styled("N", shift_key_style),
             Span::styled(" browse  ", shift_hint_style),
+            Span::styled("L", shift_key_style),
+            Span::styled(" live filter  ", shift_hint_style),
+        ]);
+        if is_live {
+            spans.push(Span::styled("x", key_style));
+            spans.push(Span::styled(" stop session  ", hint_style));
+        }
+        spans.extend_from_slice(&[
             Span::styled("q", key_style),
             Span::styled(" quit  ", hint_style),
             Span::styled("?", shift_key_style),
@@ -448,6 +556,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if app.mode == AppMode::Help {
         render_help_popup(frame, frame.area());
     }
+
+    // NamingSession overlay (centered popup)
+    if app.mode == AppMode::NamingSession {
+        draw_naming_popup(frame, &app.naming_text, &app.naming_placeholder);
+    }
 }
 
 fn build_preview_text(messages: &[PreviewMessage]) -> Text<'static> {
@@ -498,6 +611,54 @@ fn build_preview_text(messages: &[PreviewMessage]) -> Text<'static> {
     }
 
     Text::from(lines)
+}
+
+fn build_live_preview_text(lines: &[String]) -> Text<'static> {
+    let text_lines: Vec<Line<'static>> = lines.iter().map(|l| {
+        Line::from(Span::styled(l.clone(), Style::default().fg(FG_TEXT)))
+    }).collect();
+    Text::from(text_lines)
+}
+
+fn draw_naming_popup(frame: &mut Frame, text: &str, placeholder: &str) {
+    let area = centered_rect(40, 15, frame.area());
+    let area = if area.height < 3 {
+        Rect { height: 3, ..area }
+    } else {
+        area
+    };
+    frame.render_widget(Clear, area);
+
+    let display_text = if text.is_empty() { placeholder } else { text };
+    let is_placeholder = text.is_empty();
+
+    let content = Line::from(vec![
+        Span::styled(
+            display_text.to_string(),
+            if is_placeholder {
+                Style::default().fg(FG_OVERLAY)
+            } else {
+                Style::default().fg(FG_TEXT)
+            },
+        ),
+        Span::styled("\u{2588}", Style::default().fg(ACCENT_BLUE)),
+        Span::styled("  Enter to confirm  Esc to cancel", Style::default().fg(FG_SUBTEXT)),
+    ]);
+
+    let popup = Paragraph::new(content).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(ACCENT_PEACH))
+            .title(Span::styled(
+                " New Session ",
+                Style::default()
+                    .fg(ACCENT_PEACH)
+                    .add_modifier(Modifier::BOLD),
+            ))
+            .style(Style::default().bg(BG_SURFACE)),
+    );
+    frame.render_widget(popup, area);
 }
 
 fn format_relative_date(timestamp_ms: i64) -> String {
@@ -606,15 +767,23 @@ fn render_help_popup(frame: &mut Frame, area: Rect) {
         ]),
         Line::from(vec![
             Span::styled("  n           ", key),
-            Span::styled("New session in current project dir", desc),
+            Span::styled("Start new live session in current project dir (prompts for name)", desc),
         ]),
         Line::from(vec![
             Span::styled("  N           ", key),
-            Span::styled("New session — browse for directory", desc),
+            Span::styled("New live session — browse for directory", desc),
+        ]),
+        Line::from(vec![
+            Span::styled("  x           ", key),
+            Span::styled("Stop selected live session gracefully", desc),
+        ]),
+        Line::from(vec![
+            Span::styled("  L           ", key),
+            Span::styled("Toggle live-only filter", desc),
         ]),
         Line::from(vec![
             Span::styled("  r           ", key),
-            Span::styled("Rename selected session", desc),
+            Span::styled("Rename selected session or live session", desc),
         ]),
         Line::from(vec![
             Span::styled("  q / Esc     ", key),

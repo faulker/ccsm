@@ -30,6 +30,8 @@ pub struct Config {
     pub group_chains: bool,
     #[serde(default)]
     pub last_update_check: Option<i64>,
+    #[serde(default)]
+    pub live_filter: bool,
 }
 
 impl Default for Config {
@@ -40,6 +42,7 @@ impl Default for Config {
             hide_empty: true,
             group_chains: true,
             last_update_check: None,
+            live_filter: false,
         }
     }
 }
@@ -117,6 +120,7 @@ mod tests {
             hide_empty: true,
             group_chains: false,
             last_update_check: None,
+            live_filter: false,
         };
         let json = serde_json::to_string_pretty(&config).unwrap();
         let loaded: Config = serde_json::from_str(&json).unwrap();
@@ -151,6 +155,7 @@ mod tests {
             hide_empty: false,
             group_chains: true,
             last_update_check: None,
+            live_filter: false,
         };
         let json = serde_json::to_string_pretty(&config).unwrap();
         let mut file = std::fs::File::create(&path).unwrap();
@@ -209,6 +214,7 @@ mod tests {
             hide_empty: false,
             group_chains: true,
             last_update_check: None,
+            live_filter: false,
         };
         let json = serde_json::to_string(&config).unwrap();
         assert!(json.contains("\"short_dir\""));

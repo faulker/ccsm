@@ -1,6 +1,7 @@
 mod app;
 mod config;
 mod data;
+mod live;
 mod ui;
 mod update;
 
@@ -41,11 +42,16 @@ fn run_app(
     sessions: Vec<data::SessionInfo>,
     filter_path: Option<String>,
     flat: bool,
+    live_start: bool,
 ) -> Result<bool> {
     let config = config::Config::load();
     let mut app = App::new(sessions, filter_path.clone(), config);
     if flat {
         app.tree_view = false;
+    }
+    if live_start {
+        app.live_filter = true;
+        app.recompute_flat_rows();
     }
 
     // Always spawn background update check (non-blocking)
@@ -98,16 +104,25 @@ fn run_app(
             restore_terminal()?;
             match req {
                 app::LaunchRequest::Resume { session_id, cwd } => {
-                    App::launch_claude(&session_id, &cwd)?;
+                    let dir = if std::path::Path::new(&cwd).exists() { &cwd } else { "." };
+                    let live_sessions = live::discover_live_sessions();
+                    let tmux_name = live::generate_auto_name(dir, &live_sessions);
+                    live::start_live_session(&tmux_name, dir, &["--resume", &session_id])?;
+                    live::attach_to_session(&tmux_name)?;
                 }
-                app::LaunchRequest::New { cwd } => {
-                    App::launch_claude_new(&cwd)?;
+                app::LaunchRequest::AttachLive { tmux_name } => {
+                    live::attach_to_session(&tmux_name)?;
+                }
+                app::LaunchRequest::NewLive { name, cwd } => {
+                    live::start_live_session(&name, &cwd, &["--name", &name])?;
+                    live::attach_to_session(&name)?;
                 }
             }
-            // Reload sessions so the just-finished session appears in the list
+            // Reload sessions after returning from any launch
             if let Ok(sessions) = data::load_sessions(filter_path.as_deref()) {
                 app.reload_sessions(sessions);
             }
+            app.reload_live_sessions();
             *terminal = setup_terminal()?;
         }
 
@@ -137,7 +152,8 @@ fn run_app(
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let flat = args.iter().any(|a| a == "--flat");
+    let live_start = args.iter().any(|a| a == "--live");
+    let flat = args.iter().any(|a| a == "--flat") || live_start;
     let filter_path = args.iter().find(|a| !a.starts_with('-')).map(|arg| {
         std::fs::canonicalize(arg)
             .map(|p| p.to_string_lossy().to_string())
@@ -145,7 +161,7 @@ fn main() -> Result<()> {
     });
 
     let sessions = data::load_sessions(filter_path.as_deref())?;
-    if sessions.is_empty() {
+    if sessions.is_empty() && !live::is_server_running() {
         if filter_path.is_some() {
             eprintln!("No Claude Code sessions found for the specified path");
         } else {
@@ -168,7 +184,7 @@ fn main() -> Result<()> {
     }));
 
     let mut terminal = setup_terminal()?;
-    let should_restart = run_app(&mut terminal, sessions, filter_path, flat)?;
+    let should_restart = run_app(&mut terminal, sessions, filter_path, flat, live_start)?;
     restore_terminal()?;
 
     if should_restart {
