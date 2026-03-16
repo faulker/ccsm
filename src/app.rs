@@ -1,10 +1,11 @@
 use crate::config::{Config, DisplayMode};
 use crate::data::{self, PreviewMessage, SessionInfo, SessionMeta};
+use crate::live::{self, LiveSession};
 use crate::update;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, ModifierKeyCode};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::process::Command;
+use std::time::Instant;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TreeRow {
@@ -16,12 +17,32 @@ pub enum TreeRow {
     Session {
         session_index: usize,
     },
+    RunningHeader {
+        project: String,
+        count: usize,
+    },
+    HistoryHeader {
+        project: String,
+        count: usize,
+    },
+    LiveItem {
+        live_index: usize,
+    },
 }
 
 #[derive(Debug, Clone)]
 pub enum LaunchRequest {
     Resume { session_id: String, cwd: String },
-    New { cwd: String },
+    AttachLive { tmux_name: String },
+    NewLive { name: String, cwd: String },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum FlatRow {
+    RunningHeader { count: usize },
+    LiveItem { live_index: usize },
+    Separator,
+    HistoryItem { session_index: usize },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -32,6 +53,7 @@ pub enum AppMode {
     UpdatePrompt,
     RestartPrompt,
     Help,
+    NamingSession,
 }
 
 #[derive(Debug, Clone)]
@@ -149,6 +171,14 @@ pub struct App {
     pub update_receiver: Option<std::sync::mpsc::Receiver<update::UpdateInfo>>,
     pub names_receiver: Option<std::sync::mpsc::Receiver<HashMap<String, String>>>,
     pub should_restart: bool,
+    pub live_sessions: Vec<LiveSession>,
+    pub live_filter: bool,
+    pub naming_text: String,
+    pub naming_placeholder: String,
+    pub naming_cwd: Option<String>,
+    pub live_preview_cache: HashMap<String, Vec<String>>,
+    pub live_preview_tick: Instant,
+    pub flat_rows: Vec<FlatRow>,
 }
 
 /// Truncate a path to its last 2 components (e.g. "/Users/sane/Dev/ccsm" -> "Dev/ccsm").
@@ -165,6 +195,7 @@ impl App {
     pub fn new(sessions: Vec<SessionInfo>, filter_path: Option<String>, config: Config) -> Self {
         let filtered_indices: Vec<usize> = (0..sessions.len()).collect();
         let group_chains = config.group_chains;
+        let live_filter = config.live_filter;
         let mut app = Self {
             sessions,
             selected: 0,
@@ -195,6 +226,14 @@ impl App {
             update_receiver: None,
             names_receiver: None,
             should_restart: false,
+            live_sessions: live::discover_live_sessions(),
+            live_filter,
+            naming_text: String::new(),
+            naming_placeholder: String::new(),
+            naming_cwd: None,
+            live_preview_cache: HashMap::new(),
+            live_preview_tick: Instant::now(),
+            flat_rows: Vec::new(),
         };
         app.spawn_load_session_names();
         app.init_tree();
@@ -241,8 +280,9 @@ impl App {
         self.preview_scroll = u16::MAX;
         self.recompute_filter();
         self.recompute_tree();
-        if self.selected >= self.filtered_indices.len() {
-            self.selected = self.filtered_indices.len().saturating_sub(1);
+        self.recompute_flat_rows();
+        if self.selected >= self.visible_item_count() {
+            self.selected = self.visible_item_count().saturating_sub(1);
         }
     }
 
@@ -251,6 +291,7 @@ impl App {
         self.config.display_mode = self.display_mode;
         self.config.hide_empty = self.hide_empty;
         self.config.group_chains = self.group_chains;
+        self.config.live_filter = self.live_filter;
         if let Err(e) = self.config.save() {
             eprintln!("Failed to save config: {e}");
         }
@@ -328,6 +369,7 @@ impl App {
         if self.tree_view {
             self.recompute_tree();
         }
+        self.recompute_flat_rows();
         if self.selected >= self.visible_item_count() {
             self.selected = self.visible_item_count().saturating_sub(1);
         }
@@ -402,6 +444,17 @@ impl App {
             }
         }
 
+        // Collect projects that have live sessions (but may not have history)
+        let mut live_only_projects: Vec<String> = self
+            .live_sessions
+            .iter()
+            .map(|ls| ls.cwd.clone())
+            .filter(|cwd| !group_map.contains_key(cwd.as_str()))
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        live_only_projects.sort();
+
         // Sort groups by most-recent session (highest last_timestamp)
         groups.sort_by(|a, b| {
             let max_a = a.2.iter().map(|&i| self.sessions[i].last_timestamp).max().unwrap_or(0);
@@ -410,18 +463,118 @@ impl App {
         });
 
         self.tree_rows.clear();
-        for (project, project_name, indices) in groups {
+
+        // Add live-only projects first (no history sessions)
+        for project in live_only_projects {
+            let project_name = std::path::Path::new(&project)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| project.clone());
+            let live_indices: Vec<usize> = self
+                .live_sessions
+                .iter()
+                .enumerate()
+                .filter(|(_, ls)| ls.cwd == project)
+                .map(|(i, _)| i)
+                .collect();
             let is_collapsed = self.collapsed.contains(&project);
             self.tree_rows.push(TreeRow::Header {
                 project: project.clone(),
                 project_name,
-                session_count: indices.len(),
+                session_count: live_indices.len(),
             });
             if !is_collapsed {
-                for idx in indices {
-                    self.tree_rows.push(TreeRow::Session { session_index: idx });
+                let running_key = format!("running:{}", project);
+                let running_collapsed = self.collapsed.contains(&running_key);
+                self.tree_rows.push(TreeRow::RunningHeader {
+                    project: project.clone(),
+                    count: live_indices.len(),
+                });
+                if !running_collapsed {
+                    for live_index in live_indices {
+                        self.tree_rows.push(TreeRow::LiveItem { live_index });
+                    }
                 }
             }
+        }
+
+        for (project, project_name, indices) in groups {
+            let live_indices: Vec<usize> = self
+                .live_sessions
+                .iter()
+                .enumerate()
+                .filter(|(_, ls)| ls.cwd == project)
+                .map(|(i, _)| i)
+                .collect();
+            let has_running = !live_indices.is_empty();
+            let has_history = !indices.is_empty();
+
+            // When live_filter is active, skip projects with no live sessions
+            if self.live_filter && !has_running {
+                continue;
+            }
+
+            let is_collapsed = self.collapsed.contains(&project);
+            self.tree_rows.push(TreeRow::Header {
+                project: project.clone(),
+                project_name,
+                session_count: indices.len() + live_indices.len(),
+            });
+
+            if !is_collapsed {
+                if has_running {
+                    let running_key = format!("running:{}", project);
+                    let running_collapsed = self.collapsed.contains(&running_key);
+                    self.tree_rows.push(TreeRow::RunningHeader {
+                        project: project.clone(),
+                        count: live_indices.len(),
+                    });
+                    if !running_collapsed {
+                        for live_index in live_indices {
+                            self.tree_rows.push(TreeRow::LiveItem { live_index });
+                        }
+                    }
+                }
+                if has_history && !self.live_filter {
+                    let history_key = format!("history:{}", project);
+                    let history_collapsed = self.collapsed.contains(&history_key);
+                    self.tree_rows.push(TreeRow::HistoryHeader {
+                        project: project.clone(),
+                        count: indices.len(),
+                    });
+                    if !history_collapsed {
+                        for idx in indices {
+                            self.tree_rows.push(TreeRow::Session { session_index: idx });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn recompute_flat_rows(&mut self) {
+        self.flat_rows.clear();
+        let live_count = self.live_sessions.len();
+        if self.live_filter {
+            if live_count > 0 {
+                self.flat_rows.push(FlatRow::RunningHeader { count: live_count });
+                for i in 0..live_count {
+                    self.flat_rows.push(FlatRow::LiveItem { live_index: i });
+                }
+            }
+            return;
+        }
+        if live_count > 0 {
+            self.flat_rows.push(FlatRow::RunningHeader { count: live_count });
+            for i in 0..live_count {
+                self.flat_rows.push(FlatRow::LiveItem { live_index: i });
+            }
+        }
+        if live_count > 0 && !self.filtered_indices.is_empty() {
+            self.flat_rows.push(FlatRow::Separator);
+        }
+        for &si in &self.filtered_indices {
+            self.flat_rows.push(FlatRow::HistoryItem { session_index: si });
         }
     }
 
@@ -429,12 +582,12 @@ impl App {
         if self.tree_view {
             self.tree_rows.len()
         } else {
-            self.filtered_indices.len()
+            self.flat_rows.len()
         }
     }
 
     /// Get the raw session index for the currently selected item.
-    /// Returns None for headers in tree mode or when no item is selected.
+    /// Returns None for headers in tree mode, live items, separators, or when no item is selected.
     pub fn selected_session_index(&self) -> Option<usize> {
         if self.tree_view {
             match self.tree_rows.get(self.selected) {
@@ -442,8 +595,35 @@ impl App {
                 _ => None,
             }
         } else {
-            self.filtered_indices.get(self.selected).copied()
+            match self.flat_rows.get(self.selected) {
+                Some(FlatRow::HistoryItem { session_index }) => Some(*session_index),
+                _ => None,
+            }
         }
+    }
+
+    /// Get the live session index for the currently selected item.
+    /// Returns None if the selection is not a live session.
+    pub fn selected_live_index(&self) -> Option<usize> {
+        if self.tree_view {
+            match self.tree_rows.get(self.selected) {
+                Some(TreeRow::LiveItem { live_index }) => Some(*live_index),
+                _ => None,
+            }
+        } else {
+            match self.flat_rows.get(self.selected) {
+                Some(FlatRow::LiveItem { live_index }) => Some(*live_index),
+                _ => None,
+            }
+        }
+    }
+
+    pub fn total_running_count(&self) -> usize {
+        self.live_sessions.len()
+    }
+
+    pub fn project_running_count(&self, project: &str) -> usize {
+        self.live_sessions.iter().filter(|ls| ls.cwd == project).count()
     }
 
     pub fn current_preview(&mut self) -> (&SessionMeta, &[PreviewMessage]) {
@@ -494,12 +674,48 @@ impl App {
                     Some(self.sessions[*session_index].project.clone())
                 }
                 Some(TreeRow::Header { project, .. }) => Some(project.clone()),
+                Some(TreeRow::LiveItem { live_index }) => {
+                    Some(self.live_sessions[*live_index].cwd.clone())
+                }
+                Some(TreeRow::RunningHeader { project, .. }) => Some(project.clone()),
+                Some(TreeRow::HistoryHeader { project, .. }) => Some(project.clone()),
                 None => None,
             }
         } else {
-            self.selected_session_index()
-                .map(|idx| self.sessions[idx].project.clone())
+            match self.flat_rows.get(self.selected) {
+                Some(FlatRow::HistoryItem { session_index }) => {
+                    Some(self.sessions[*session_index].project.clone())
+                }
+                Some(FlatRow::LiveItem { live_index }) => {
+                    Some(self.live_sessions[*live_index].cwd.clone())
+                }
+                _ => None,
+            }
         }
+    }
+
+    pub fn current_live_preview(&mut self) -> Vec<String> {
+        let idx = match self.selected_live_index() {
+            Some(i) => i,
+            None => return vec![],
+        };
+        let name = self.live_sessions[idx].tmux_name.clone();
+        let now = Instant::now();
+        let should_refresh = !self.live_preview_cache.contains_key(&name)
+            || now.duration_since(self.live_preview_tick).as_secs() >= 5;
+        if should_refresh {
+            let lines = live::poll_pane_buffer(&name, 100);
+            self.live_preview_cache.insert(name.clone(), lines);
+            self.live_preview_tick = now;
+        }
+        self.live_preview_cache.get(&name).cloned().unwrap_or_default()
+    }
+
+    pub fn reload_live_sessions(&mut self) {
+        self.live_sessions = live::discover_live_sessions();
+        self.live_preview_cache.clear();
+        self.recompute_flat_rows();
+        self.recompute_tree();
     }
 
     fn handle_dir_browser_event(&mut self, key: crossterm::event::KeyEvent) {
@@ -567,8 +783,11 @@ impl App {
                     browser.current_dir.clone()
                 };
                 let cwd = cwd.to_string_lossy().to_string();
-                self.launch_session = Some(LaunchRequest::New { cwd });
-                self.mode = AppMode::Normal;
+                let placeholder = live::generate_auto_name(&cwd, &self.live_sessions);
+                self.naming_placeholder = placeholder;
+                self.naming_cwd = Some(cwd);
+                self.naming_text.clear();
+                self.mode = AppMode::NamingSession;
                 self.dir_browser = None;
             }
             _ => {}
@@ -576,6 +795,59 @@ impl App {
     }
 
     fn handle_rename_event(&mut self, key: crossterm::event::KeyEvent) {
+        // If rename_project is None, it's a live session rename
+        if self.rename_project.is_none() {
+            if key.code == KeyCode::Esc {
+                self.mode = AppMode::Normal;
+                self.rename_text.clear();
+                self.rename_session_id = None;
+                return;
+            }
+            if key.code == KeyCode::Enter {
+                if let Some(tmux_name) = self.rename_session_id.take() {
+                    let new_name = self.rename_text.trim().to_string();
+                    if !new_name.is_empty() {
+                        // Update claude session titles that match the old tmux name
+                        let cwd = self.live_sessions.iter()
+                            .find(|ls| ls.tmux_name == tmux_name)
+                            .map(|ls| ls.cwd.clone());
+                        if let Some(cwd) = cwd {
+                            for session in &mut self.sessions {
+                                if session.project == cwd && session.name.as_deref() == Some(&tmux_name) {
+                                    let _ = data::save_custom_title(&session.project, &session.session_id, &new_name);
+                                    session.name = Some(new_name.clone());
+                                }
+                            }
+                            self.preview_cache.clear();
+                        }
+                        let _ = std::process::Command::new("tmux")
+                            .args(["-L", live::TMUX_SOCKET, "rename-session", "-t", &tmux_name, &new_name])
+                            .output();
+                        self.live_sessions = live::discover_live_sessions();
+                        self.live_preview_cache.clear();
+                        self.recompute_flat_rows();
+                        self.recompute_tree();
+                    }
+                }
+                self.rename_text.clear();
+                self.mode = AppMode::Normal;
+                return;
+            }
+            if key.code == KeyCode::Backspace {
+                self.rename_text.pop();
+                return;
+            }
+            if let KeyCode::Char(c) = key.code {
+                let c = if key.modifiers.contains(KeyModifiers::SHIFT) {
+                    c.to_ascii_uppercase()
+                } else {
+                    c
+                };
+                self.rename_text.push(c);
+            }
+            return;
+        }
+
         match key.code {
             KeyCode::Esc => {
                 self.mode = AppMode::Normal;
@@ -612,6 +884,45 @@ impl App {
                     c
                 };
                 self.rename_text.push(c);
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_naming_event(&mut self, key: crossterm::event::KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.mode = AppMode::Normal;
+                self.naming_text.clear();
+                self.naming_cwd = None;
+            }
+            KeyCode::Enter => {
+                let raw = if self.naming_text.is_empty() {
+                    self.naming_placeholder.clone()
+                } else {
+                    self.naming_text.clone()
+                };
+                // Sanitize: tmux disallows '.' ':' and whitespace in session names
+                let name: String = raw
+                    .chars()
+                    .map(|c| if c == '.' || c == ':' || c.is_whitespace() { '-' } else { c })
+                    .collect();
+                let name = if name.is_empty() { self.naming_placeholder.clone() } else { name };
+                let cwd = self.naming_cwd.take().unwrap_or_else(|| ".".to_string());
+                self.mode = AppMode::Normal;
+                self.naming_text.clear();
+                self.launch_session = Some(LaunchRequest::NewLive { name, cwd });
+            }
+            KeyCode::Backspace => {
+                self.naming_text.pop();
+            }
+            KeyCode::Char(c) => {
+                let c = if key.modifiers.contains(KeyModifiers::SHIFT) {
+                    c.to_ascii_uppercase()
+                } else {
+                    c
+                };
+                self.naming_text.push(c);
             }
             _ => {}
         }
@@ -675,6 +986,11 @@ impl App {
 
             if self.mode == AppMode::Help {
                 self.mode = AppMode::Normal;
+                return Ok(());
+            }
+
+            if self.mode == AppMode::NamingSession {
+                self.handle_naming_event(key);
                 return Ok(());
             }
 
@@ -848,10 +1164,41 @@ impl App {
                         } else {
                             ".".to_string()
                         };
-                        self.launch_session = Some(LaunchRequest::New { cwd: dir });
+                        let placeholder = live::generate_auto_name(&dir, &self.live_sessions);
+                        self.naming_placeholder = placeholder;
+                        self.naming_cwd = Some(dir);
+                        self.naming_text.clear();
+                        self.mode = AppMode::NamingSession;
+                    }
+                }
+                (KeyCode::Char('L' | 'l'), KeyModifiers::SHIFT) => {
+                    self.live_filter = !self.live_filter;
+                    self.recompute_flat_rows();
+                    self.recompute_tree();
+                    self.save_config();
+                }
+                (KeyCode::Char('x'), KeyModifiers::NONE) => {
+                    if let Some(idx) = self.selected_live_index() {
+                        let name = self.live_sessions[idx].tmux_name.clone();
+                        if let Err(e) = live::stop_live_session(&name) {
+                            eprintln!("Failed to stop session: {e}");
+                        }
+                        self.live_sessions = live::discover_live_sessions();
+                        self.live_preview_cache.remove(&name);
+                        self.recompute_flat_rows();
+                        self.recompute_tree();
                     }
                 }
                 (KeyCode::Char('r'), KeyModifiers::NONE) => {
+                    // Check if a live session is selected first
+                    if let Some(idx) = self.selected_live_index() {
+                        let session = &self.live_sessions[idx];
+                        self.rename_text = session.display_name.clone();
+                        self.rename_session_id = Some(session.tmux_name.clone());
+                        self.rename_project = None;
+                        self.mode = AppMode::Renaming;
+                        return Ok(());
+                    }
                     if let Some(idx) = self.selected_session_index() {
                         // For chains, always rename the most recent session
                         let resume_idx = self
@@ -908,24 +1255,70 @@ impl App {
                                 let cwd = self.sessions[session_index].project.clone();
                                 self.launch_session = Some(LaunchRequest::Resume { session_id, cwd });
                             }
+                            Some(TreeRow::LiveItem { live_index }) => {
+                                let name = self.live_sessions[live_index].tmux_name.clone();
+                                self.launch_session = Some(LaunchRequest::AttachLive { tmux_name: name });
+                            }
+                            Some(TreeRow::RunningHeader { project, .. }) => {
+                                let key = format!("running:{}", project);
+                                if self.collapsed.contains(&key) {
+                                    self.collapsed.remove(&key);
+                                } else {
+                                    self.collapsed.insert(key);
+                                }
+                                self.recompute_tree();
+                            }
+                            Some(TreeRow::HistoryHeader { project, .. }) => {
+                                let key = format!("history:{}", project);
+                                if self.collapsed.contains(&key) {
+                                    self.collapsed.remove(&key);
+                                } else {
+                                    self.collapsed.insert(key);
+                                }
+                                self.recompute_tree();
+                            }
                             None => {}
                         }
-                    } else if let Some(idx) = self.selected_session_index() {
-                        let session_id = self.resume_session_id_for(idx).to_string();
-                        let cwd = self.sessions[idx].project.clone();
-                        self.launch_session = Some(LaunchRequest::Resume { session_id, cwd });
+                    } else {
+                        match self.flat_rows.get(self.selected).cloned() {
+                            Some(FlatRow::LiveItem { live_index }) => {
+                                let name = self.live_sessions[live_index].tmux_name.clone();
+                                self.launch_session = Some(LaunchRequest::AttachLive { tmux_name: name });
+                            }
+                            Some(FlatRow::HistoryItem { session_index }) => {
+                                let session_id = self.resume_session_id_for(session_index).to_string();
+                                let cwd = self.sessions[session_index].project.clone();
+                                self.launch_session = Some(LaunchRequest::Resume { session_id, cwd });
+                            }
+                            _ => {}
+                        }
                     }
                 }
                 (KeyCode::Right, _) | (KeyCode::Char('l'), KeyModifiers::NONE)
                     if self.tree_view =>
                 {
-                    if let Some(TreeRow::Header { project, .. }) =
-                        self.tree_rows.get(self.selected).cloned()
-                    {
-                        if self.collapsed.contains(&project) {
-                            self.collapsed.remove(&project);
-                            self.recompute_tree();
+                    match self.tree_rows.get(self.selected).cloned() {
+                        Some(TreeRow::Header { project, .. }) => {
+                            if self.collapsed.contains(&project) {
+                                self.collapsed.remove(&project);
+                                self.recompute_tree();
+                            }
                         }
+                        Some(TreeRow::RunningHeader { project, .. }) => {
+                            let key = format!("running:{}", project);
+                            if self.collapsed.contains(&key) {
+                                self.collapsed.remove(&key);
+                                self.recompute_tree();
+                            }
+                        }
+                        Some(TreeRow::HistoryHeader { project, .. }) => {
+                            let key = format!("history:{}", project);
+                            if self.collapsed.contains(&key) {
+                                self.collapsed.remove(&key);
+                                self.recompute_tree();
+                            }
+                        }
+                        _ => {}
                     }
                 }
                 (KeyCode::Left, _) | (KeyCode::Char('h'), KeyModifiers::NONE)
@@ -938,14 +1331,34 @@ impl App {
                                 self.recompute_tree();
                             }
                         }
+                        Some(TreeRow::RunningHeader { project, .. }) => {
+                            let key = format!("running:{}", project);
+                            if !self.collapsed.contains(&key) {
+                                self.collapsed.insert(key);
+                                self.recompute_tree();
+                            }
+                        }
+                        Some(TreeRow::HistoryHeader { project, .. }) => {
+                            let key = format!("history:{}", project);
+                            if !self.collapsed.contains(&key) {
+                                self.collapsed.insert(key);
+                                self.recompute_tree();
+                            }
+                        }
                         Some(TreeRow::Session { .. }) => {
-                            // Find parent header and collapse it
+                            // Move cursor to nearest HistoryHeader above
                             for i in (0..self.selected).rev() {
-                                if let Some(TreeRow::Header { project, .. }) =
-                                    self.tree_rows.get(i).cloned()
-                                {
-                                    self.collapsed.insert(project);
-                                    self.recompute_tree();
+                                if matches!(self.tree_rows.get(i), Some(TreeRow::HistoryHeader { .. })) {
+                                    self.selected = i;
+                                    self.preview_scroll = u16::MAX;
+                                    break;
+                                }
+                            }
+                        }
+                        Some(TreeRow::LiveItem { .. }) => {
+                            // Move cursor to nearest RunningHeader above
+                            for i in (0..self.selected).rev() {
+                                if matches!(self.tree_rows.get(i), Some(TreeRow::RunningHeader { .. })) {
                                     self.selected = i;
                                     self.preview_scroll = u16::MAX;
                                     break;
@@ -961,40 +1374,21 @@ impl App {
         Ok(())
     }
 
-    pub fn launch_claude(session_id: &str, cwd: &str) -> anyhow::Result<()> {
-        let cwd_path = std::path::Path::new(cwd);
-        let dir = if cwd_path.exists() { cwd } else { "." };
-
-        let status = Command::new("claude")
-            .arg("--resume")
-            .arg(session_id)
-            .current_dir(dir)
-            .status()?;
-
-        if !status.success() {
-            anyhow::bail!("claude exited with status: {}", status);
-        }
-
-        Ok(())
-    }
-
-    pub fn launch_claude_new(cwd: &str) -> anyhow::Result<()> {
-        let cwd_path = std::path::Path::new(cwd);
-        let dir = if cwd_path.exists() { cwd } else { "." };
-
-        let status = Command::new("claude").current_dir(dir).status()?;
-
-        if !status.success() {
-            anyhow::bail!("claude exited with status: {}", status);
-        }
-
-        Ok(())
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Creates an App with live sessions cleared so tests are not affected by
+    /// any tmux sessions running on the host machine.
+    fn make_app(sessions: Vec<SessionInfo>, filter_path: Option<String>, config: Config) -> App {
+        let mut app = App::new(sessions, filter_path, config);
+        app.live_sessions = vec![];
+        app.recompute_flat_rows();
+        app.recompute_tree();
+        app
+    }
 
     fn make_sessions() -> Vec<SessionInfo> {
         vec![
@@ -1036,7 +1430,7 @@ mod tests {
 
     #[test]
     fn test_new_app_initializes_all_indices() {
-        let app = App::new(make_sessions(), None, Config::default());
+        let app = make_app(make_sessions(), None, Config::default());
         // Sorted by last_timestamp desc: s3(4000), s2(3000), s1(2000) → [2, 1, 0]
         assert_eq!(app.filtered_indices, vec![2, 1, 0]);
         assert_eq!(app.selected, 0);
@@ -1048,7 +1442,7 @@ mod tests {
 
     #[test]
     fn test_new_app_starts_all_collapsed() {
-        let app = App::new(make_sessions_with_shared_projects(), None, Config::default());
+        let app = make_app(make_sessions_with_shared_projects(), None, Config::default());
         // All groups collapsed: only headers visible
         assert!(app.tree_rows.iter().all(|r| matches!(r, TreeRow::Header { .. })));
         assert_eq!(app.tree_rows.len(), 2); // beta header + alpha header
@@ -1056,7 +1450,7 @@ mod tests {
 
     #[test]
     fn test_right_arrow_expands_collapsed_header() {
-        let mut app = App::new(make_sessions_with_shared_projects(), None, Config::default());
+        let mut app = make_app(make_sessions_with_shared_projects(), None, Config::default());
         // All collapsed, selected=0 is first header (beta)
         app.selected = 0;
         let project = match &app.tree_rows[0] {
@@ -1069,14 +1463,15 @@ mod tests {
         app.collapsed.remove(&project);
         app.recompute_tree();
 
-        // beta now expanded: header + 2 sessions
+        // beta now expanded: header + history-header + 2 sessions
         assert!(!app.collapsed.contains(&project));
-        assert!(matches!(&app.tree_rows[1], TreeRow::Session { .. }));
+        assert!(matches!(&app.tree_rows[1], TreeRow::HistoryHeader { .. }));
+        assert!(matches!(&app.tree_rows[2], TreeRow::Session { .. }));
     }
 
     #[test]
     fn test_left_arrow_collapses_expanded_header() {
-        let mut app = App::new(make_sessions_with_shared_projects(), None, Config::default());
+        let mut app = make_app(make_sessions_with_shared_projects(), None, Config::default());
         // Expand beta first
         let project = match &app.tree_rows[0] {
             TreeRow::Header { project, .. } => project.clone(),
@@ -1095,7 +1490,7 @@ mod tests {
 
     #[test]
     fn test_filter_narrows_indices() {
-        let mut app = App::new(make_sessions(), None, Config::default());
+        let mut app = make_app(make_sessions(), None, Config::default());
         app.filter_text = "beta".into();
         app.recompute_filter();
         assert_eq!(app.filtered_indices, vec![1]);
@@ -1103,7 +1498,7 @@ mod tests {
 
     #[test]
     fn test_filter_case_insensitive() {
-        let mut app = App::new(make_sessions(), None, Config::default());
+        let mut app = make_app(make_sessions(), None, Config::default());
         app.filter_text = "ALPHA".into();
         app.recompute_filter();
         assert_eq!(app.filtered_indices, vec![0]);
@@ -1111,7 +1506,7 @@ mod tests {
 
     #[test]
     fn test_filter_matches_path() {
-        let mut app = App::new(make_sessions(), None, Config::default());
+        let mut app = make_app(make_sessions(), None, Config::default());
         app.filter_text = "/Dev/gamma".into();
         app.recompute_filter();
         assert_eq!(app.filtered_indices, vec![2]);
@@ -1119,7 +1514,7 @@ mod tests {
 
     #[test]
     fn test_filter_no_match() {
-        let mut app = App::new(make_sessions(), None, Config::default());
+        let mut app = make_app(make_sessions(), None, Config::default());
         app.filter_text = "nonexistent".into();
         app.recompute_filter();
         assert!(app.filtered_indices.is_empty());
@@ -1128,7 +1523,7 @@ mod tests {
 
     #[test]
     fn test_clear_filter_restores_all() {
-        let mut app = App::new(make_sessions(), None, Config::default());
+        let mut app = make_app(make_sessions(), None, Config::default());
         app.filter_text = "beta".into();
         app.recompute_filter();
         assert_eq!(app.filtered_indices.len(), 1);
@@ -1141,7 +1536,7 @@ mod tests {
 
     #[test]
     fn test_selected_clamps_on_filter() {
-        let mut app = App::new(make_sessions(), None, Config::default());
+        let mut app = make_app(make_sessions(), None, Config::default());
         app.tree_view = false;
         app.selected = 2;
         app.filter_text = "alpha".into();
@@ -1153,7 +1548,7 @@ mod tests {
 
     #[test]
     fn test_selected_session_index() {
-        let mut app = App::new(make_sessions(), None, Config::default());
+        let mut app = make_app(make_sessions(), None, Config::default());
         app.tree_view = false;
         app.filter_text = "amma".into(); // matches only gamma
         app.recompute_filter();
@@ -1164,7 +1559,7 @@ mod tests {
 
     #[test]
     fn test_filter_path_stored() {
-        let app = App::new(make_sessions(), Some("/Users/sane/Dev".into()), Config::default());
+        let app = make_app(make_sessions(), Some("/Users/sane/Dev".into()), Config::default());
         assert_eq!(app.filter_path.as_deref(), Some("/Users/sane/Dev"));
     }
 
@@ -1219,7 +1614,7 @@ mod tests {
 
     #[test]
     fn test_tree_grouping() {
-        let mut app = App::new(make_sessions_with_shared_projects(), None, Config::default());
+        let mut app = make_app(make_sessions_with_shared_projects(), None, Config::default());
         app.display_mode = DisplayMode::Name;
         app.recompute_tree();
         // Expand all groups to test full tree structure
@@ -1228,19 +1623,21 @@ mod tests {
 
         // beta group first (s4 has last_timestamp=6000), then alpha (s1 has 5000)
         // filtered_indices sorted desc: [3(6000), 0(5000), 2(4000), 1(3000)]
-        // tree: beta header → s4(idx=3), s2(idx=1) ; alpha header → s1(idx=0), s3(idx=2)
-        assert_eq!(app.tree_rows.len(), 6); // 2 headers + 4 sessions
+        // tree: beta header → HistoryHeader → s4(idx=3), s2(idx=1) ; alpha header → HistoryHeader → s1(idx=0), s3(idx=2)
+        assert_eq!(app.tree_rows.len(), 8); // 2 headers + 2 history-headers + 4 sessions
         assert!(matches!(&app.tree_rows[0], TreeRow::Header { project_name, session_count, .. } if project_name == "beta" && *session_count == 2));
-        assert!(matches!(&app.tree_rows[1], TreeRow::Session { session_index: 3 }));
-        assert!(matches!(&app.tree_rows[2], TreeRow::Session { session_index: 1 }));
-        assert!(matches!(&app.tree_rows[3], TreeRow::Header { project_name, session_count, .. } if project_name == "alpha" && *session_count == 2));
-        assert!(matches!(&app.tree_rows[4], TreeRow::Session { session_index: 0 }));
-        assert!(matches!(&app.tree_rows[5], TreeRow::Session { session_index: 2 }));
+        assert!(matches!(&app.tree_rows[1], TreeRow::HistoryHeader { count: 2, .. }));
+        assert!(matches!(&app.tree_rows[2], TreeRow::Session { session_index: 3 }));
+        assert!(matches!(&app.tree_rows[3], TreeRow::Session { session_index: 1 }));
+        assert!(matches!(&app.tree_rows[4], TreeRow::Header { project_name, session_count, .. } if project_name == "alpha" && *session_count == 2));
+        assert!(matches!(&app.tree_rows[5], TreeRow::HistoryHeader { count: 2, .. }));
+        assert!(matches!(&app.tree_rows[6], TreeRow::Session { session_index: 0 }));
+        assert!(matches!(&app.tree_rows[7], TreeRow::Session { session_index: 2 }));
     }
 
     #[test]
     fn test_tree_collapse_expand() {
-        let mut app = App::new(make_sessions_with_shared_projects(), None, Config::default());
+        let mut app = make_app(make_sessions_with_shared_projects(), None, Config::default());
         app.display_mode = DisplayMode::Name;
         app.recompute_tree();
         // Start: all collapsed, only headers
@@ -1249,47 +1646,47 @@ mod tests {
         // Expand all
         app.collapsed.clear();
         app.recompute_tree();
-        assert_eq!(app.tree_rows.len(), 6);
+        assert_eq!(app.tree_rows.len(), 8); // 2 headers + 2 history-headers + 4 sessions
 
         // Collapse beta
         app.collapsed.insert("/Users/sane/Dev/beta".into());
         app.recompute_tree();
-        assert_eq!(app.tree_rows.len(), 4); // beta header + alpha header + 2 alpha sessions
+        assert_eq!(app.tree_rows.len(), 5); // beta header + alpha header + alpha history-header + 2 alpha sessions
         assert!(matches!(&app.tree_rows[0], TreeRow::Header { project_name, .. } if project_name == "beta"));
         assert!(matches!(&app.tree_rows[1], TreeRow::Header { project_name, .. } if project_name == "alpha"));
 
         // Expand beta
         app.collapsed.remove("/Users/sane/Dev/beta");
         app.recompute_tree();
-        assert_eq!(app.tree_rows.len(), 6);
+        assert_eq!(app.tree_rows.len(), 8);
     }
 
     #[test]
     fn test_selected_session_index_returns_none_for_header() {
-        let mut app = App::new(make_sessions_with_shared_projects(), None, Config::default());
+        let mut app = make_app(make_sessions_with_shared_projects(), None, Config::default());
         app.selected = 0; // header row (all collapsed)
         assert_eq!(app.selected_session_index(), None);
     }
 
     #[test]
     fn test_selected_session_index_returns_some_for_session_in_tree() {
-        let mut app = App::new(make_sessions_with_shared_projects(), None, Config::default());
+        let mut app = make_app(make_sessions_with_shared_projects(), None, Config::default());
         app.collapsed.clear();
         app.recompute_tree();
-        app.selected = 1; // first session row under first header (beta → s4, session_index=3)
+        app.selected = 2; // first session row under first header (beta → HistoryHeader → s4, session_index=3)
         assert_eq!(app.selected_session_index(), Some(3));
     }
 
     #[test]
     fn test_visible_item_count_flat_vs_tree() {
-        let mut app = App::new(make_sessions_with_shared_projects(), None, Config::default());
+        let mut app = make_app(make_sessions_with_shared_projects(), None, Config::default());
         // Default is tree view, all collapsed: 2 headers
         assert_eq!(app.visible_item_count(), 2);
 
         // Expand all
         app.collapsed.clear();
         app.recompute_tree();
-        assert_eq!(app.visible_item_count(), 6); // 2 headers + 4 sessions
+        assert_eq!(app.visible_item_count(), 8); // 2 headers + 2 history-headers + 4 sessions
 
         // Switch to flat
         app.tree_view = false;
@@ -1298,7 +1695,7 @@ mod tests {
 
     #[test]
     fn test_tree_with_filter() {
-        let mut app = App::new(make_sessions_with_shared_projects(), None, Config::default());
+        let mut app = make_app(make_sessions_with_shared_projects(), None, Config::default());
         app.display_mode = DisplayMode::Name;
         app.filter_text = "alpha".into();
         app.recompute_filter();
@@ -1309,7 +1706,7 @@ mod tests {
         // Expand to see sessions
         app.collapsed.remove("/Users/sane/Dev/alpha");
         app.recompute_filter();
-        assert_eq!(app.tree_rows.len(), 3); // 1 header + 2 sessions
+        assert_eq!(app.tree_rows.len(), 4); // 1 header + 1 history-header + 2 sessions
     }
 
     fn make_sessions_with_projects() -> Vec<SessionInfo> {
@@ -1363,7 +1760,7 @@ mod tests {
 
     #[test]
     fn test_short_dir_groups_by_project() {
-        let mut app = App::new(make_sessions_with_projects(), None, Config::default());
+        let mut app = make_app(make_sessions_with_projects(), None, Config::default());
         app.display_mode = DisplayMode::ShortDir;
         app.collapsed.clear();
         app.recompute_tree();
@@ -1376,14 +1773,14 @@ mod tests {
         assert!(matches!(&app.tree_rows[0], TreeRow::Header { project_name, session_count, .. }
             if project_name == "Dev/beta" && *session_count == 1));
 
-        // Second group: alpha (3 sessions, truncated)
-        assert!(matches!(&app.tree_rows[2], TreeRow::Header { project_name, session_count, .. }
+        // Second group: alpha (3 sessions, truncated) — after beta's HistoryHeader + 1 Session
+        assert!(matches!(&app.tree_rows[3], TreeRow::Header { project_name, session_count, .. }
             if project_name == "Dev/alpha" && *session_count == 3));
     }
 
     #[test]
     fn test_display_mode_toggle_changes_display_name() {
-        let mut app = App::new(make_sessions_with_projects(), None, Config::default());
+        let mut app = make_app(make_sessions_with_projects(), None, Config::default());
         app.display_mode = DisplayMode::ShortDir;
         app.recompute_tree();
         let headers: Vec<_> = app.tree_rows.iter().filter(|r| matches!(r, TreeRow::Header { .. })).collect();
@@ -1397,7 +1794,7 @@ mod tests {
 
     #[test]
     fn test_display_name_short_dir() {
-        let app = App::new(make_sessions_with_projects(), None, Config {
+        let app = make_app(make_sessions_with_projects(), None, Config {
             display_mode: DisplayMode::ShortDir,
             ..Config::default()
         });
@@ -1407,14 +1804,14 @@ mod tests {
 
     #[test]
     fn test_display_name_project_name() {
-        let app = App::new(make_sessions_with_projects(), None, Config::default());
+        let app = make_app(make_sessions_with_projects(), None, Config::default());
         assert_eq!(app.display_name(&app.sessions[0]), "alpha");
         assert_eq!(app.display_name(&app.sessions[3]), "beta");
     }
 
     #[test]
     fn test_display_name_full_dir() {
-        let app = App::new(make_sessions_with_projects(), None, Config {
+        let app = make_app(make_sessions_with_projects(), None, Config {
             display_mode: DisplayMode::FullDir,
             ..Config::default()
         });
@@ -1424,7 +1821,7 @@ mod tests {
 
     #[test]
     fn test_app_default_mode_is_normal() {
-        let app = App::new(make_sessions(), None, Config::default());
+        let app = make_app(make_sessions(), None, Config::default());
         assert_eq!(app.mode, AppMode::Normal);
         assert!(app.dir_browser.is_none());
     }
@@ -1533,7 +1930,7 @@ mod tests {
 
     #[test]
     fn test_selected_cwd_from_session() {
-        let mut app = App::new(make_sessions_with_projects(), None, Config::default());
+        let mut app = make_app(make_sessions_with_projects(), None, Config::default());
         app.collapsed.clear();
         app.recompute_tree();
         // Select first session (under first header)
@@ -1546,7 +1943,7 @@ mod tests {
 
     #[test]
     fn test_selected_cwd_from_header() {
-        let app = App::new(make_sessions_with_projects(), None, Config::default());
+        let app = make_app(make_sessions_with_projects(), None, Config::default());
         // selected=0 is a header
         let cwd = app.selected_cwd();
         assert!(cwd.is_some());
@@ -1554,7 +1951,7 @@ mod tests {
 
     #[test]
     fn test_launch_request_resume_variant() {
-        let mut app = App::new(make_sessions(), None, Config::default());
+        let mut app = make_app(make_sessions(), None, Config::default());
         app.collapsed.clear();
         app.recompute_tree();
         // Find a session row
@@ -1575,18 +1972,8 @@ mod tests {
     }
 
     #[test]
-    fn test_launch_request_new_variant() {
-        let app_cwd = "/tmp".to_string();
-        let req = LaunchRequest::New { cwd: app_cwd.clone() };
-        match req {
-            LaunchRequest::New { cwd } => assert_eq!(cwd, "/tmp"),
-            _ => panic!("expected New variant"),
-        }
-    }
-
-    #[test]
     fn test_reload_sessions_updates_list() {
-        let mut app = App::new(make_sessions(), None, Config::default());
+        let mut app = make_app(make_sessions(), None, Config::default());
         let original_count = app.sessions.len();
 
         // Simulate a new session appearing after a Claude session ends
@@ -1653,7 +2040,7 @@ mod tests {
     #[test]
     fn test_hide_empty_filters_sessions() {
         // Default config has hide_empty=true, so empty sessions are filtered at construction
-        let mut app = App::new(make_sessions_mixed_data(), None, Config::default());
+        let mut app = make_app(make_sessions_mixed_data(), None, Config::default());
         app.tree_view = false;
         app.recompute_filter();
         // s2 (index 1) has_data=false, should be excluded; sorted desc: s3(4000), s1(2000) → [2, 0]
@@ -1667,7 +2054,7 @@ mod tests {
 
     #[test]
     fn test_hide_empty_with_text_filter() {
-        let mut app = App::new(make_sessions_mixed_data(), None, Config::default());
+        let mut app = make_app(make_sessions_mixed_data(), None, Config::default());
         app.tree_view = false;
         app.hide_empty = true;
         app.filter_text = "a".into(); // matches alpha and gamma; sorted desc: s3(4000), s1(2000) → [2, 0]
@@ -1682,7 +2069,7 @@ mod tests {
 
     #[test]
     fn test_tab_cycles_through_view_modes() {
-        let mut app = App::new(make_sessions(), None, Config::default());
+        let mut app = make_app(make_sessions(), None, Config::default());
         // Default: tree_view=true, display_mode=Name
         assert!(app.tree_view);
         assert_eq!(app.display_mode, DisplayMode::Name);
@@ -1716,13 +2103,13 @@ mod tests {
 
     #[test]
     fn test_shift_active_default_false() {
-        let app = App::new(make_sessions(), None, Config::default());
+        let app = make_app(make_sessions(), None, Config::default());
         assert!(!app.shift_active);
     }
 
     #[test]
     fn test_tab_cycles_all_six_modes() {
-        let mut app = App::new(make_sessions(), None, Config::default());
+        let mut app = make_app(make_sessions(), None, Config::default());
 
         // Helper to simulate tab press logic
         fn simulate_tab(app: &mut App) {
@@ -1785,7 +2172,7 @@ mod tests {
 
     #[test]
     fn test_backtab_cycles_reverse() {
-        let mut app = App::new(make_sessions(), None, Config::default());
+        let mut app = make_app(make_sessions(), None, Config::default());
 
         fn simulate_backtab(app: &mut App) {
             match (app.tree_view, app.display_mode) {
@@ -1847,7 +2234,7 @@ mod tests {
 
     #[test]
     fn test_session_name_set_directly() {
-        let mut app = App::new(make_sessions(), None, Config::default());
+        let mut app = make_app(make_sessions(), None, Config::default());
         // Initially no names
         assert!(app.sessions[0].name.is_none());
 
@@ -1858,7 +2245,7 @@ mod tests {
 
     #[test]
     fn test_rename_mode_transitions() {
-        let mut app = App::new(make_sessions(), None, Config::default());
+        let mut app = make_app(make_sessions(), None, Config::default());
         // Select a session (expand first header, then move to session)
         app.tree_view = false;
         app.recompute_filter();
@@ -1877,7 +2264,7 @@ mod tests {
 
     #[test]
     fn test_hide_empty_toggle_restores() {
-        let mut app = App::new(make_sessions_mixed_data(), None, Config::default());
+        let mut app = make_app(make_sessions_mixed_data(), None, Config::default());
         app.tree_view = false;
 
         app.hide_empty = true;
@@ -1933,7 +2320,7 @@ mod tests {
 
     #[test]
     fn test_recompute_filter_groups_chains() {
-        let mut app = App::new(make_chained_sessions(), None, Config::default());
+        let mut app = make_app(make_chained_sessions(), None, Config::default());
         app.tree_view = false;
         app.group_chains = true;
         app.recompute_filter();
@@ -1951,7 +2338,7 @@ mod tests {
 
     #[test]
     fn test_recompute_filter_ungrouped_mode() {
-        let mut app = App::new(make_chained_sessions(), None, Config::default());
+        let mut app = make_app(make_chained_sessions(), None, Config::default());
         app.tree_view = false;
         app.group_chains = false;
         app.recompute_filter();
@@ -1963,7 +2350,7 @@ mod tests {
 
     #[test]
     fn test_chain_entry_count_sums_chain() {
-        let mut app = App::new(make_chained_sessions(), None, Config::default());
+        let mut app = make_app(make_chained_sessions(), None, Config::default());
         app.tree_view = false;
         app.group_chains = true;
         app.recompute_filter();
@@ -1988,7 +2375,7 @@ mod tests {
             name: None,
             slug: Some("lone-slug".into()),
         }];
-        let mut app = App::new(sessions, None, Config::default());
+        let mut app = make_app(sessions, None, Config::default());
         app.tree_view = false;
         app.group_chains = true;
         app.recompute_filter();
