@@ -63,12 +63,19 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                     } else {
                         project_name.clone()
                     };
+                    let is_favorite = app.favorites.contains(project);
                     let mut header_spans = vec![Span::styled(
                         format!("{} {} ({})", arrow, display, session_count),
                         Style::default()
                             .fg(ACCENT_TEAL)
                             .add_modifier(Modifier::BOLD),
                     )];
+                    if is_favorite {
+                        header_spans.push(Span::styled(
+                            " ★",
+                            Style::default().fg(ACCENT_PEACH).add_modifier(Modifier::BOLD),
+                        ));
+                    }
                     if running > 0 {
                         header_spans.push(Span::styled(
                             format!(" ● {}", running),
@@ -143,6 +150,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                         ),
                     ]))
                 }
+                TreeRow::FavoritesSeparator => {
+                    ListItem::new(Line::from(Span::styled(
+                        "───────────────────────────────────────────────",
+                        Style::default().fg(FG_OVERLAY),
+                    )))
+                }
             })
             .collect()
     } else {
@@ -174,13 +187,24 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                         ),
                     ]))
                 }
+                FlatRow::FavoritesSeparator => {
+                    ListItem::new(Line::from(Span::styled(
+                        "───────────────────────────────────────────────",
+                        Style::default().fg(FG_OVERLAY),
+                    )))
+                }
                 FlatRow::HistoryItem { session_index } => {
                     let s = &app.sessions[*session_index];
+                    let is_favorite = app.favorites.contains(&s.project);
                     let name = app.display_name(s);
                     let date = format_relative_date(s.last_timestamp);
                     let entry_count = app.chain_entry_count(*session_index);
                     let chain_len = app.chain_map.get(session_index).map(|v| v.len()).unwrap_or(1);
                     let mut spans = vec![
+                        Span::styled(
+                            if is_favorite { "★ " } else { "  " },
+                            Style::default().fg(ACCENT_PEACH),
+                        ),
                         Span::styled(
                             if app.display_mode == DisplayMode::FullDir {
                                 truncate_left(&name, 28)
@@ -268,17 +292,17 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     // Preview
     let is_live_selected = app.selected_live_index().is_some();
-    let live_preview_lines = if is_live_selected {
+    let live_preview_raw = if is_live_selected {
         app.current_live_preview()
     } else {
-        vec![]
+        String::new()
     };
 
     let (meta, preview_slice) = app.current_preview();
     let meta = meta.clone();
     let preview = preview_slice.to_vec();
     let preview_text = if is_live_selected {
-        build_live_preview_text(&live_preview_lines)
+        build_live_preview_text(&live_preview_raw)
     } else {
         build_preview_text(&preview)
     };
@@ -368,13 +392,17 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let preview_area = right_chunks[1];
     let inner_width = preview_area.width.saturating_sub(2) as usize; // borders
     let inner_height = preview_area.height.saturating_sub(2); // borders
-    let content_height = estimate_wrapped_height(&preview_text, inner_width);
+    let content_height = if is_live_selected {
+        preview_text.lines.len()
+    } else {
+        estimate_wrapped_height(&preview_text, inner_width)
+    };
     let max_scroll = (content_height as u16).saturating_sub(inner_height);
     if app.preview_scroll > max_scroll {
         app.preview_scroll = max_scroll;
     }
 
-    let preview_widget = Paragraph::new(preview_text)
+    let mut preview_widget = Paragraph::new(preview_text)
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -386,8 +414,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 ))
                 .style(Style::default().bg(BG_SURFACE)),
         )
-        .wrap(Wrap { trim: false })
         .scroll((app.preview_scroll, 0));
+    if !is_live_selected {
+        preview_widget = preview_widget.wrap(Wrap { trim: false });
+    }
 
     frame.render_widget(preview_widget, preview_area);
 
@@ -448,12 +478,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             .add_modifier(Modifier::BOLD);
         let hint_style = Style::default().fg(FG_SUBTEXT);
         let shift_key_style = if app.shift_active {
-            Style::default().fg(FG_TEXT).add_modifier(Modifier::BOLD)
+            Style::default().fg(Color::Rgb(255, 210, 170)).add_modifier(Modifier::BOLD)
         } else {
             key_style
         };
         let shift_hint_style = if app.shift_active {
-            Style::default().fg(FG_TEXT).add_modifier(Modifier::BOLD)
+            Style::default().fg(Color::Rgb(190, 195, 220)).add_modifier(Modifier::BOLD)
         } else {
             hint_style
         };
@@ -595,6 +625,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 Span::styled(" live filter", shift_hint_style),
             ]),
             15,
+        ));
+        // "f favorite" = 10 → width 12
+        hints.push((
+            Line::from(vec![
+                Span::styled("f", key_style),
+                Span::styled(" favorite", hint_style),
+            ]),
+            12,
         ));
         if is_live {
             // "x stop session" = 14 → width 16
@@ -749,17 +787,147 @@ fn build_preview_text(messages: &[PreviewMessage]) -> Text<'static> {
     Text::from(lines)
 }
 
-/// Convert raw tmux pane lines into a styled ratatui `Text` for the live preview pane.
-fn build_live_preview_text(lines: &[String]) -> Text<'static> {
-    let text_lines: Vec<Line<'static>> = lines.iter().map(|l| {
-        Line::from(Span::styled(l.clone(), Style::default().fg(FG_TEXT)))
-    }).collect();
-    Text::from(text_lines)
+/// Convert raw tmux pane output (with ANSI escape sequences) into a styled ratatui `Text`.
+fn build_live_preview_text(raw: &str) -> Text<'static> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for raw_line in raw.lines() {
+        lines.push(parse_ansi_line(raw_line));
+    }
+    Text::from(lines)
+}
+
+/// Parse a single line containing ANSI SGR escape sequences into a ratatui `Line`.
+fn parse_ansi_line(line: &str) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut style = Style::default();
+    let mut text = String::new();
+    let mut chars = line.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c == '\x1b' && chars.peek() == Some(&'[') {
+            chars.next(); // consume '['
+            let mut seq = String::new();
+            // Collect parameter bytes until a final byte (@ through ~)
+            while let Some(&next) = chars.peek() {
+                if next.is_ascii_alphabetic() || next == '@' {
+                    chars.next();
+                    if next == 'm' {
+                        // SGR sequence — flush current text then apply style change
+                        if !text.is_empty() {
+                            spans.push(Span::styled(text.clone(), style));
+                            text.clear();
+                        }
+                        style = apply_sgr(&seq, style);
+                    }
+                    // Non-'m' sequences (cursor movement etc.) are silently skipped
+                    break;
+                }
+                seq.push(next);
+                chars.next();
+            }
+        } else {
+            text.push(c);
+        }
+    }
+    if !text.is_empty() {
+        spans.push(Span::styled(text, style));
+    }
+    Line::from(spans)
+}
+
+/// Apply an ANSI SGR parameter string to a base `Style`, returning the updated style.
+fn apply_sgr(params: &str, mut style: Style) -> Style {
+    if params.is_empty() {
+        return Style::default();
+    }
+    let codes: Vec<u32> = params.split(';').filter_map(|s| s.parse().ok()).collect();
+    let mut i = 0;
+    while i < codes.len() {
+        match codes[i] {
+            0 => style = Style::default(),
+            1 => style = style.add_modifier(Modifier::BOLD),
+            2 => style = style.add_modifier(Modifier::DIM),
+            3 => style = style.add_modifier(Modifier::ITALIC),
+            4 => style = style.add_modifier(Modifier::UNDERLINED),
+            7 => style = style.add_modifier(Modifier::REVERSED),
+            // Standard foreground
+            30 => style = style.fg(Color::Black),
+            31 => style = style.fg(Color::Red),
+            32 => style = style.fg(Color::Green),
+            33 => style = style.fg(Color::Yellow),
+            34 => style = style.fg(Color::Blue),
+            35 => style = style.fg(Color::Magenta),
+            36 => style = style.fg(Color::Cyan),
+            37 => style = style.fg(Color::White),
+            39 => style = style.fg(Color::Reset),
+            // Bright foreground
+            90 => style = style.fg(Color::DarkGray),
+            91 => style = style.fg(Color::LightRed),
+            92 => style = style.fg(Color::LightGreen),
+            93 => style = style.fg(Color::LightYellow),
+            94 => style = style.fg(Color::LightBlue),
+            95 => style = style.fg(Color::LightMagenta),
+            96 => style = style.fg(Color::LightCyan),
+            97 => style = style.fg(Color::Gray),
+            // Standard background
+            40 => style = style.bg(Color::Black),
+            41 => style = style.bg(Color::Red),
+            42 => style = style.bg(Color::Green),
+            43 => style = style.bg(Color::Yellow),
+            44 => style = style.bg(Color::Blue),
+            45 => style = style.bg(Color::Magenta),
+            46 => style = style.bg(Color::Cyan),
+            47 => style = style.bg(Color::White),
+            49 => style = style.bg(Color::Reset),
+            // Bright background
+            100 => style = style.bg(Color::DarkGray),
+            101 => style = style.bg(Color::LightRed),
+            102 => style = style.bg(Color::LightGreen),
+            103 => style = style.bg(Color::LightYellow),
+            104 => style = style.bg(Color::LightBlue),
+            105 => style = style.bg(Color::LightMagenta),
+            106 => style = style.bg(Color::LightCyan),
+            107 => style = style.bg(Color::Gray),
+            // 256-color / true-color foreground
+            38 if codes.get(i + 1) == Some(&5) => {
+                if let Some(&n) = codes.get(i + 2) {
+                    style = style.fg(Color::Indexed(n as u8));
+                    i += 2;
+                }
+            }
+            38 if codes.get(i + 1) == Some(&2) => {
+                if let (Some(&r), Some(&g), Some(&b)) =
+                    (codes.get(i + 2), codes.get(i + 3), codes.get(i + 4))
+                {
+                    style = style.fg(Color::Rgb(r as u8, g as u8, b as u8));
+                    i += 4;
+                }
+            }
+            // 256-color / true-color background
+            48 if codes.get(i + 1) == Some(&5) => {
+                if let Some(&n) = codes.get(i + 2) {
+                    style = style.bg(Color::Indexed(n as u8));
+                    i += 2;
+                }
+            }
+            48 if codes.get(i + 1) == Some(&2) => {
+                if let (Some(&r), Some(&g), Some(&b)) =
+                    (codes.get(i + 2), codes.get(i + 3), codes.get(i + 4))
+                {
+                    style = style.bg(Color::Rgb(r as u8, g as u8, b as u8));
+                    i += 4;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    style
 }
 
 /// Render the centered popup for naming a new live session, showing a placeholder when the buffer is empty.
 fn draw_naming_popup(frame: &mut Frame, text: &str, placeholder: &str) {
-    let area = centered_rect(40, 15, frame.area());
+    let area = centered_rect(40, 3, frame.area());
     let area = if area.height < 3 {
         Rect { height: 3, ..area }
     } else {
@@ -780,7 +948,6 @@ fn draw_naming_popup(frame: &mut Frame, text: &str, placeholder: &str) {
             },
         ),
         Span::styled("\u{2588}", Style::default().fg(ACCENT_BLUE)),
-        Span::styled("  Enter to confirm  Esc to cancel", Style::default().fg(FG_SUBTEXT)),
     ]);
 
     let popup = Paragraph::new(content).block(
@@ -789,7 +956,7 @@ fn draw_naming_popup(frame: &mut Frame, text: &str, placeholder: &str) {
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(ACCENT_PEACH))
             .title(Span::styled(
-                " New Session ",
+                " New Session (Esc to cancel) ",
                 Style::default()
                     .fg(ACCENT_PEACH)
                     .add_modifier(Modifier::BOLD),
@@ -875,8 +1042,8 @@ fn render_help_popup(frame: &mut Frame, area: Rect) {
             Span::styled("Move selection up/down (Shift to scroll preview)", desc),
         ]),
         Line::from(vec![
-            Span::styled("  h/l  ←/→        ", key),
-            Span::styled("Scroll preview left/right", desc),
+            Span::styled("  ←/→             ", key),
+            Span::styled("Collapse/expand group (tree view) or jump to parent header", desc),
         ]),
         Line::from(vec![
             Span::styled("  Enter           ", key),
@@ -921,12 +1088,16 @@ fn render_help_popup(frame: &mut Frame, area: Rect) {
             Span::styled("Stop selected live session gracefully", desc),
         ]),
         Line::from(vec![
-            Span::styled("  L               ", key),
+            Span::styled("  l               ", key),
             Span::styled("Toggle live-only filter", desc),
         ]),
         Line::from(vec![
             Span::styled("  r               ", key),
             Span::styled("Rename selected session or live session", desc),
+        ]),
+        Line::from(vec![
+            Span::styled("  f               ", key),
+            Span::styled("Toggle favorite — pins project to top of list (shown with ★)", desc),
         ]),
         Line::from(vec![
             Span::styled("  q / Esc         ", key),
@@ -1120,6 +1291,9 @@ fn draw_restart_prompt(frame: &mut Frame, tag: &str) {
 
 /// Truncate `s` to at most `max` display columns, appending `…` if truncated, and right-padding with spaces to exactly `max` columns.
 fn truncate(s: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
     let width = s.width();
     if width <= max {
         let pad = max - width;
@@ -1143,6 +1317,9 @@ fn truncate(s: &str, max: usize) -> String {
 /// Like `truncate` but truncates from the left, prepending `…` when the string exceeds `max` columns.
 /// Useful for long directory paths where the end (project name) is most relevant.
 fn truncate_left(s: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
     let width = s.width();
     if width <= max {
         let pad = max - width;
@@ -1169,6 +1346,9 @@ fn truncate_left(s: &str, max: usize) -> String {
 /// Like `truncate_left` but returns the raw string without trailing space padding,
 /// used for header labels in the tree view where padding is not needed.
 fn truncate_left_plain(s: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
     let width = s.width();
     if width <= max {
         s.to_string()

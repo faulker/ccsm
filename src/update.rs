@@ -171,30 +171,66 @@ pub fn perform_update(info: &UpdateInfo) -> Result<()> {
 
     let current_exe = std::env::current_exe().context("Failed to determine current executable")?;
 
-    // Replace the current binary: rename old, copy new, remove old
-    let backup = current_exe.with_extension("old");
-    std::fs::rename(&current_exe, &backup).context("Failed to back up current binary")?;
-
-    if let Err(e) = std::fs::copy(&new_binary, &current_exe) {
-        // Restore backup on failure
-        if let Err(restore_err) = std::fs::rename(&backup, &current_exe) {
-            return Err(e).context(format!(
-                "Failed to install new binary AND failed to restore backup: {}",
-                restore_err
-            ));
-        }
-        return Err(e).context("Failed to install new binary (backup restored)");
-    }
-
-    // Set executable permissions
-    #[cfg(unix)]
+    // On Windows the running executable is locked by the OS, so we can't rename it in-place.
+    // Instead, write the new binary alongside the current one and spawn a batch script that
+    // waits for this process to exit before performing the swap.
+    #[cfg(windows)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&current_exe, std::fs::Permissions::from_mode(0o755))
-            .context("Failed to set executable permissions")?;
+        let new_path = current_exe.with_extension("new");
+        std::fs::copy(&new_binary, &new_path)
+            .context("Failed to write new binary for Windows update")?;
+        let bat_path = current_exe.with_extension("bat");
+        let current_name = current_exe
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "ccsm.exe".to_string());
+        let script = format!(
+            "@echo off\r\n\
+             :wait\r\n\
+             tasklist /fi \"imagename eq {name}\" 2>nul | find /i \"{name}\" >nul\r\n\
+             if %errorlevel% == 0 (timeout /t 1 /nobreak >nul & goto wait)\r\n\
+             timeout /t 1 /nobreak >nul\r\n\
+             move /y \"{new}\" \"{cur}\" >nul\r\n\
+             del \"%~f0\"\r\n",
+            name = current_name,
+            new = new_path.display(),
+            cur = current_exe.display(),
+        );
+        std::fs::write(&bat_path, &script)
+            .context("Failed to write Windows update helper script")?;
+        std::process::Command::new("cmd")
+            .args(["/c", "start", "/min", "", &bat_path.to_string_lossy()])
+            .spawn()
+            .context("Failed to launch Windows update helper")?;
+        return Ok(());
     }
 
-    let _ = std::fs::remove_file(&backup);
+    // Replace the current binary: rename old, copy new, remove old
+    #[cfg(not(windows))]
+    {
+        let backup = current_exe.with_extension("old");
+        std::fs::rename(&current_exe, &backup).context("Failed to back up current binary")?;
+
+        if let Err(e) = std::fs::copy(&new_binary, &current_exe) {
+            // Restore backup on failure
+            if let Err(restore_err) = std::fs::rename(&backup, &current_exe) {
+                return Err(e).context(format!(
+                    "Failed to install new binary AND failed to restore backup: {}",
+                    restore_err
+                ));
+            }
+            return Err(e).context("Failed to install new binary (backup restored)");
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&current_exe, std::fs::Permissions::from_mode(0o755))
+                .context("Failed to set executable permissions")?;
+        }
+
+        let _ = std::fs::remove_file(&backup);
+    }
     // temp_dir is cleaned up automatically on drop
 
     Ok(())
@@ -209,6 +245,9 @@ fn extract_tar_gz(bytes: &[u8], dest: &std::path::Path) -> Result<()> {
     for entry in archive.entries().context("Failed to read archive entries")? {
         let mut entry = entry.context("Failed to read archive entry")?;
         let path = entry.path().context("Failed to get entry path")?;
+        if entry.header().entry_type().is_symlink() || entry.header().entry_type().is_hard_link() {
+            anyhow::bail!("Archive contains a symlink/hard link, which is not allowed: {:?}", path);
+        }
         if path.is_absolute()
             || path.components().any(|c| {
                 matches!(

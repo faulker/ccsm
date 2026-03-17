@@ -18,9 +18,8 @@ Sessions grouped by project with an expanded group showing individual sessions. 
 - **Session info bar** — displays working directory and git branch for the selected session; shows the project directory even when a header row is selected with no active session
 - Resume any session via tmux (`Enter`) or directly in the foreground without tmux (`Shift+Enter`)
 - **Live sessions** — start and manage tmux-backed Claude sessions; running sessions appear at the top of the list with a live indicator
-- **New session** — start a new live session in the selected project's directory (`n`, prompts for a name) or browse to any directory (`N`); or bypass the TUI entirely with `ccsm --new` to start a session in the current directory
-- **Directory browser** — full overlay for navigating the filesystem, with path input and directory listing
-- **Live-only filter** — toggle with `Shift+L` to show only running sessions; persisted in config
+- **New session** — start a new live tmux session in the selected project's directory (`n`, prompts for a name); or start a foreground claude session directly in the selected directory (`Shift+N`, no tmux); or bypass the TUI entirely with `ccsm --new` to start a session in the current directory
+- **Live-only filter** — toggle with `l` to show only running sessions; persisted in config
 - **Stop live session** — kill the selected running session with `x`
 - Search and filter sessions by project name or path
 - Toggle visibility of empty sessions (no data file) with `e`
@@ -30,7 +29,8 @@ Sessions grouped by project with an expanded group showing individual sessions. 
 - **Auto-update** — checks GitHub Releases in the background on startup (every 24h), shows a centered prompt with current vs new version, and self-updates the binary on confirm
 - **Session names** — custom titles loaded in the background for fast startup
 - **Help overlay** — press `?` for a full in-app keybinding reference
-- **Persistent config** — view mode, display mode, hide-empty, session grouping, live filter preference, and update check timestamp saved to `~/.config/ccsm/config.json`
+- **Favorites** — pin projects to the top of the list with `f`; shown with a ★ indicator; persisted in config
+- **Persistent config** — view mode, display mode, hide-empty, session grouping, live filter preference, favorites, and update check timestamp saved to `~/.config/ccsm/config.json`
 - Optional path argument to scope sessions to a specific directory
 - Version label displayed in the bottom-right of the help bar
 - Catppuccin Mocha-inspired color theme
@@ -121,8 +121,8 @@ ccsm --new
 |---|---|
 | `j` / `↓` | Next session |
 | `k` / `↑` | Previous session |
-| `l` / `→` | Expand group (tree view) |
-| `h` / `←` | Collapse group (tree view) |
+| `→` | Expand group (tree view) |
+| `←` | Collapse group or jump to parent header (tree view) |
 | `Enter` | Resume session in tmux / attach to live session / toggle group |
 | `Shift+Enter` | Resume historical session directly in the foreground (no tmux) |
 | `Tab` / `Shift+Tab` | Cycle: tree [name] → tree [short dir] → tree [full dir] → flat → tree [name] |
@@ -131,9 +131,10 @@ ccsm --new
 | `/` | Activate search/filter mode |
 | `c` | Toggle session grouping (group/ungroup related sessions) |
 | `e` | Toggle show/hide empty sessions |
+| `f` | Toggle favorite — pins project to top of list (shown with ★) |
 | `n` | Start new live session in selected project's directory (prompts for name) |
-| `Shift+N` | Open directory browser to start a new session anywhere |
-| `Shift+L` | Toggle live-only filter (show only running sessions) |
+| `Shift+N` | Start new foreground claude session in selected project's directory (no tmux) |
+| `l` | Toggle live-only filter (show only running sessions) |
 | `r` | Rename selected session or live session |
 | `x` | Stop (kill) selected live session |
 | `?` | Open help overlay |
@@ -160,19 +161,6 @@ When filter mode is active (triggered by `/`):
 | `Backspace` | Delete last character |
 | `Esc` | Clear filter text and exit filter mode |
 
-### Directory Browser
-
-When the directory browser is open (triggered by `Shift+N`):
-
-| Key | Action |
-|---|---|
-| `j` / `↓` / `k` / `↑` | Navigate directory listing |
-| `Enter` / `l` / `→` | Enter selected directory |
-| `h` / `←` / `Backspace` | Go up to parent directory |
-| `Space` | Select current directory and start a new live session |
-| `/` | Type a path directly |
-| `Esc` | Cancel and close browser |
-
 ### Session Naming
 
 When naming a new live session (after selecting a directory):
@@ -197,13 +185,13 @@ While attached to a live session in tmux:
 
 Live sessions are tmux-backed Claude Code sessions managed through a dedicated tmux server (`ccsm` socket). They appear at the top of the session list with a green `●` indicator.
 
-- **Start**: press `n` (current project dir) or `Shift+N` (browse) — you'll be prompted to name the session
+- **Start**: press `n` (starts a named live tmux session in the current project dir) or `Shift+N` (starts claude directly in the foreground, no tmux)
 - **Attach**: press `Enter` on any live session to attach
 - **Detach**: press `Ctrl+\` inside a live session to return to ccsm
 - **Navigate**: use `Ctrl+n` / `Ctrl+p` to cycle between live sessions without detaching
 - **Stop**: press `x` to gracefully kill the selected live session
 - **Rename**: press `r` on a live session to rename the tmux window
-- **Filter**: press `Shift+L` to hide history and show only running sessions
+- **Filter**: press `l` to hide history and show only running sessions
 
 The tmux server uses a custom config at `~/.config/ccsm/tmux.conf` with a status bar showing the available keybindings. Requires `tmux` to be installed.
 
@@ -218,6 +206,7 @@ Settings are persisted to `~/.config/ccsm/config.json` and automatically saved w
   "hide_empty": true,
   "group_chains": true,
   "live_filter": false,
+  "favorites": [],
   "last_update_check": 1710200000
 }
 ```
@@ -229,6 +218,7 @@ Settings are persisted to `~/.config/ccsm/config.json` and automatically saved w
 | `hide_empty` | `true` / `false` | Whether to hide sessions with no data file |
 | `group_chains` | `true` / `false` | Whether to group chained (parent → child) sessions |
 | `live_filter` | `true` / `false` | Whether to show only running live sessions |
+| `favorites` | Array of paths | Project directories pinned to the top of the list |
 | `last_update_check` | Unix timestamp | When the last update check was performed (auto-managed) |
 
 ## How It Works

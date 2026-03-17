@@ -1,5 +1,7 @@
 // Manages the dedicated ccsm tmux server and live sessions
 
+use anyhow::Context;
+
 pub const TMUX_SOCKET: &str = "ccsm";
 
 /// A running tmux session managed by ccsm on the dedicated `ccsm` tmux socket.
@@ -70,9 +72,12 @@ pub fn conf_path() -> std::path::PathBuf {
 }
 
 /// Write the ccsm tmux config file and, if the server is already running, source it to apply changes.
-pub fn ensure_server_configured() {
+pub fn ensure_server_configured() -> anyhow::Result<()> {
     let conf_path = conf_path();
-    let _ = std::fs::create_dir_all(conf_path.parent().unwrap());
+    if let Some(parent) = conf_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create config directory: {}", parent.display()))?;
+    }
     // Within tmux double-quoted strings, \\ is a literal backslash.
     // For bind-key in config files, single-quote the key spec to avoid backslash escape issues.
     let conf_content = concat!(
@@ -89,13 +94,16 @@ pub fn ensure_server_configured() {
         "bind-key -n C-n switch-client -n\n",
         "bind-key -n C-p switch-client -p\n",
     );
-    let _ = std::fs::write(&conf_path, conf_content);
+    std::fs::write(&conf_path, conf_content)
+        .with_context(|| format!("Failed to write tmux config: {}", conf_path.display()))?;
     // If the server is already running, source the config to update bindings.
     // If not running, start-server is unreliable on tmux 3.x — the server is started
     // implicitly when new-session runs (see start_live_session which passes -f).
+    // Sourcing failure is non-fatal.
     let _ = std::process::Command::new("tmux")
         .args(["-L", TMUX_SOCKET, "source-file", &conf_path.to_string_lossy()])
         .output();
+    Ok(())
 }
 
 /// Returns true if `tmux` is installed and reachable on the system PATH.
@@ -113,7 +121,7 @@ pub fn start_live_session(name: &str, cwd: &str, cmd: &[&str]) -> anyhow::Result
     if !is_tmux_available() {
         anyhow::bail!("tmux is not installed — live sessions require tmux");
     }
-    ensure_server_configured();
+    ensure_server_configured()?;
     let conf_path_str = conf_path().to_string_lossy().into_owned();
     // Pass -f so that if the server isn't running yet, it starts with our config.
     // If the server is already running, -f is ignored by tmux.
@@ -140,7 +148,7 @@ pub fn attach_to_session(name: &str) -> anyhow::Result<()> {
     if !is_tmux_available() {
         anyhow::bail!("tmux is not installed — live sessions require tmux");
     }
-    ensure_server_configured();
+    ensure_server_configured()?;
     let status = std::process::Command::new("tmux")
         .args(["-L", TMUX_SOCKET, "attach-session", "-t", name])
         .status()?;
@@ -166,25 +174,21 @@ pub fn stop_live_session(name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Capture the last `lines` lines from the pane of the named tmux session.
-/// Returns an empty vec if the session does not exist or the command fails.
-pub fn poll_pane_buffer(name: &str, lines: usize) -> Vec<String> {
+/// Capture the last `lines` lines from the pane of the named tmux session,
+/// preserving ANSI escape sequences. Returns an empty string if the session
+/// does not exist or the command fails.
+pub fn poll_pane_buffer(name: &str, lines: usize) -> String {
     let lines_str = format!("-{}", lines);
     let output = std::process::Command::new("tmux")
         .args([
             "-L", TMUX_SOCKET,
             "capture-pane", "-t", name,
-            "-p", "-S", &lines_str,
+            "-p", "-e", "-S", &lines_str,
         ])
         .output();
     match output {
-        Ok(o) if o.status.success() => {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .map(|l| l.to_string())
-                .collect()
-        }
-        _ => vec![],
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+        _ => String::new(),
     }
 }
 

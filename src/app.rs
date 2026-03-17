@@ -32,6 +32,8 @@ pub enum TreeRow {
     LiveItem {
         live_index: usize,
     },
+    /// Visual divider between favorited and non-favorited project groups.
+    FavoritesSeparator,
 }
 
 /// Describes how to launch or attach to a Claude session after the TUI exits.
@@ -60,6 +62,8 @@ pub enum FlatRow {
     Separator,
     /// A historical (non-live) Claude session row.
     HistoryItem { session_index: usize },
+    /// Visual divider between favorited and non-favorited history items.
+    FavoritesSeparator,
 }
 
 /// The current interaction mode of the application, controlling how key events are dispatched.
@@ -148,12 +152,13 @@ pub struct App {
     pub naming_placeholder: String,
     /// Working directory to use for the new session being named.
     pub naming_cwd: Option<String>,
-    /// Cache of recently captured tmux pane lines keyed by tmux session name.
-    pub live_preview_cache: HashMap<String, Vec<String>>,
-    /// Timestamp of the last live preview refresh, used to throttle polling.
-    pub live_preview_tick: Instant,
+    /// Cache of recently captured tmux pane output (with ANSI codes) keyed by tmux session name,
+    /// with the per-session timestamp of the last refresh.
+    pub live_preview_cache: HashMap<String, (String, Instant)>,
     /// Flattened sequence of rows for the flat view, recomputed on state changes.
     pub flat_rows: Vec<FlatRow>,
+    /// Set of project paths pinned to the top of the list.
+    pub favorites: HashSet<String>,
 }
 
 /// Truncate a path to its last 2 components (e.g. "/Users/sane/Dev/ccsm" -> "Dev/ccsm").
@@ -173,6 +178,7 @@ impl App {
         let filtered_indices: Vec<usize> = (0..sessions.len()).collect();
         let group_chains = config.group_chains;
         let live_filter = config.live_filter;
+        let favorites = config.favorites.clone();
         let mut app = Self {
             sessions,
             selected: 0,
@@ -208,8 +214,8 @@ impl App {
             naming_placeholder: String::new(),
             naming_cwd: None,
             live_preview_cache: HashMap::new(),
-            live_preview_tick: Instant::now(),
             flat_rows: Vec::new(),
+            favorites,
         };
         app.spawn_load_session_names();
         app.init_tree();
@@ -273,6 +279,7 @@ impl App {
         self.config.hide_empty = self.hide_empty;
         self.config.group_chains = self.group_chains;
         self.config.live_filter = self.live_filter;
+        self.config.favorites = self.favorites.clone();
         if let Err(e) = self.config.save() {
             eprintln!("Failed to save config: {e}");
         }
@@ -442,8 +449,13 @@ impl App {
             .collect();
         live_only_projects.sort();
 
-        // Sort groups by most-recent session (highest last_timestamp)
+        // Sort groups: favorites first, then by most-recent session (highest last_timestamp)
         groups.sort_by(|a, b| {
+            let fav_a = self.favorites.contains(&a.0);
+            let fav_b = self.favorites.contains(&b.0);
+            if fav_a != fav_b {
+                return fav_b.cmp(&fav_a);
+            }
             let max_a = a.2.iter().map(|&i| self.sessions[i].last_timestamp).max().unwrap_or(0);
             let max_b = b.2.iter().map(|&i| self.sessions[i].last_timestamp).max().unwrap_or(0);
             max_b.cmp(&max_a)
@@ -485,6 +497,9 @@ impl App {
             }
         }
 
+        let has_any_favorites = groups.iter().any(|(p, _, _)| self.favorites.contains(p));
+        let mut separator_inserted = !has_any_favorites;
+
         for (project, project_name, indices) in groups {
             let live_indices: Vec<usize> = self
                 .live_sessions
@@ -499,6 +514,12 @@ impl App {
             // When live_filter is active, skip projects with no live sessions
             if self.live_filter && !has_running {
                 continue;
+            }
+
+            // Insert separator between favorites and non-favorites
+            if !separator_inserted && !self.favorites.contains(&project) {
+                self.tree_rows.push(TreeRow::FavoritesSeparator);
+                separator_inserted = true;
             }
 
             let is_collapsed = self.collapsed.contains(&project);
@@ -561,7 +582,23 @@ impl App {
         if live_count > 0 && !self.filtered_indices.is_empty() {
             self.flat_rows.push(FlatRow::Separator);
         }
-        for &si in &self.filtered_indices {
+        // Sort history items: favorites first (by project), then by recency
+        let mut sorted_indices = self.filtered_indices.clone();
+        sorted_indices.sort_by(|&a, &b| {
+            let fav_a = self.favorites.contains(&self.sessions[a].project);
+            let fav_b = self.favorites.contains(&self.sessions[b].project);
+            if fav_a != fav_b {
+                return fav_b.cmp(&fav_a);
+            }
+            self.sessions[b].last_timestamp.cmp(&self.sessions[a].last_timestamp)
+        });
+        let has_any_favorites = sorted_indices.iter().any(|&i| self.favorites.contains(&self.sessions[i].project));
+        let mut separator_inserted = !has_any_favorites;
+        for si in sorted_indices {
+            if !separator_inserted && !self.favorites.contains(&self.sessions[si].project) {
+                self.flat_rows.push(FlatRow::FavoritesSeparator);
+                separator_inserted = true;
+            }
             self.flat_rows.push(FlatRow::HistoryItem { session_index: si });
         }
     }
@@ -681,7 +718,7 @@ impl App {
                 }
                 Some(TreeRow::RunningHeader { project, .. }) => Some(project.clone()),
                 Some(TreeRow::HistoryHeader { project, .. }) => Some(project.clone()),
-                None => None,
+                Some(TreeRow::FavoritesSeparator) | None => None,
             }
         } else {
             match self.flat_rows.get(self.selected) {
@@ -696,23 +733,35 @@ impl App {
         }
     }
 
-    /// Return the most recently captured pane lines for the selected live session,
-    /// refreshing from tmux at most once every 5 seconds.
-    pub fn current_live_preview(&mut self) -> Vec<String> {
+    /// Toggle the favorite status of the currently selected project path and save config.
+    pub fn toggle_favorite(&mut self) {
+        if let Some(project) = self.selected_cwd() {
+            if self.favorites.contains(&project) {
+                self.favorites.remove(&project);
+            } else {
+                self.favorites.insert(project);
+            }
+            self.save_config();
+        }
+    }
+
+    /// Return the most recently captured pane output (with ANSI codes) for the selected live session,
+    /// refreshing from tmux at most once every second.
+    pub fn current_live_preview(&mut self) -> String {
         let idx = match self.selected_live_index() {
             Some(i) => i,
-            None => return vec![],
+            None => return String::new(),
         };
         let name = self.live_sessions[idx].tmux_name.clone();
         let now = Instant::now();
-        let should_refresh = !self.live_preview_cache.contains_key(&name)
-            || now.duration_since(self.live_preview_tick).as_secs() >= 5;
+        let should_refresh = self.live_preview_cache.get(&name)
+            .map(|(_, last)| now.duration_since(*last).as_secs() >= 1)
+            .unwrap_or(true);
         if should_refresh {
-            let lines = live::poll_pane_buffer(&name, 100);
-            self.live_preview_cache.insert(name.clone(), lines);
-            self.live_preview_tick = now;
+            let output = live::poll_pane_buffer(&name, 100);
+            self.live_preview_cache.insert(name.clone(), (output, now));
         }
-        self.live_preview_cache.get(&name).cloned().unwrap_or_default()
+        self.live_preview_cache.get(&name).map(|(s, _)| s.clone()).unwrap_or_default()
     }
 
     /// Re-query the ccsm tmux server for live sessions, clear the live preview cache,
