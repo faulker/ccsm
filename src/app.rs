@@ -2,182 +2,157 @@ use crate::config::{Config, DisplayMode};
 use crate::data::{self, PreviewMessage, SessionInfo, SessionMeta};
 use crate::live::{self, LiveSession};
 use crate::update;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, ModifierKeyCode};
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 use std::time::Instant;
 
+/// One visible row in the tree-view session list.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TreeRow {
+    /// Top-level collapsible header for a project directory.
     Header {
         project: String,
         project_name: String,
         session_count: usize,
     },
+    /// A historical (non-live) Claude session row.
     Session {
         session_index: usize,
     },
+    /// Collapsible sub-header grouping the live sessions for a project.
     RunningHeader {
         project: String,
         count: usize,
     },
+    /// Collapsible sub-header grouping the historical sessions for a project.
     HistoryHeader {
         project: String,
         count: usize,
     },
+    /// A running live tmux session row.
     LiveItem {
         live_index: usize,
     },
 }
 
+/// Describes how to launch or attach to a Claude session after the TUI exits.
 #[derive(Debug, Clone)]
 pub enum LaunchRequest {
+    /// Resume a historical session inside a new tmux live session.
     Resume { session_id: String, cwd: String },
+    /// Resume a historical session directly in the foreground (no tmux).
+    Direct { session_id: String, cwd: String },
+    /// Attach the terminal to an already-running live tmux session.
     AttachLive { tmux_name: String },
+    /// Create and attach to a new live tmux session running claude.
     NewLive { name: String, cwd: String },
+    /// Start a new claude session directly in the foreground (no tmux).
+    NewDirect { cwd: String },
 }
 
+/// One visible row in the flat-view session list.
 #[derive(Debug, Clone, PartialEq)]
 pub enum FlatRow {
+    /// Header row showing the total count of running live sessions.
     RunningHeader { count: usize },
+    /// A running live tmux session row.
     LiveItem { live_index: usize },
+    /// Visual divider between the live section and the history section.
     Separator,
+    /// A historical (non-live) Claude session row.
     HistoryItem { session_index: usize },
 }
 
+/// The current interaction mode of the application, controlling how key events are dispatched.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AppMode {
+    /// Default navigation mode.
     Normal,
-    DirBrowser,
+    /// The rename input popup is open.
     Renaming,
+    /// The update-available confirmation prompt is shown.
     UpdatePrompt,
+    /// The post-update restart confirmation prompt is shown.
     RestartPrompt,
+    /// The help overlay is displayed.
     Help,
+    /// The new-session naming popup is open.
     NamingSession,
 }
 
-#[derive(Debug, Clone)]
-pub struct DirEntry {
-    pub name: String,
-    pub is_dir: bool,
-}
 
-#[derive(Debug, Clone)]
-pub struct DirBrowser {
-    pub current_dir: PathBuf,
-    pub entries: Vec<DirEntry>,
-    pub selected: usize,
-    pub input_text: String,
-    pub input_active: bool,
-}
-
-impl DirBrowser {
-    pub fn new(start_dir: PathBuf) -> Self {
-        let mut browser = Self {
-            current_dir: start_dir,
-            entries: Vec::new(),
-            selected: 0,
-            input_text: String::new(),
-            input_active: false,
-        };
-        browser.refresh();
-        browser
-    }
-
-    pub fn refresh(&mut self) {
-        self.entries.clear();
-        self.entries.push(DirEntry {
-            name: "..".to_string(),
-            is_dir: true,
-        });
-
-        if let Ok(read_dir) = std::fs::read_dir(&self.current_dir) {
-            let mut dirs: Vec<String> = read_dir
-                .filter_map(|e| e.ok())
-                .filter(|e| e.file_type().map(|ft| ft.is_dir()).unwrap_or(false))
-                .map(|e| e.file_name().to_string_lossy().to_string())
-                .collect();
-            dirs.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
-            for name in dirs {
-                self.entries.push(DirEntry { name, is_dir: true });
-            }
-        }
-
-        if self.selected >= self.entries.len() {
-            self.selected = self.entries.len().saturating_sub(1);
-        }
-    }
-
-    pub fn enter_selected(&mut self) {
-        if let Some(entry) = self.entries.get(self.selected) {
-            if entry.name == ".." {
-                self.go_up();
-            } else if entry.is_dir {
-                self.current_dir = self.current_dir.join(&entry.name);
-                self.selected = 0;
-                self.refresh();
-            }
-        }
-    }
-
-    pub fn go_up(&mut self) {
-        if let Some(parent) = self.current_dir.parent() {
-            self.current_dir = parent.to_path_buf();
-            self.selected = 0;
-            self.refresh();
-        }
-    }
-
-    pub fn apply_input(&mut self) {
-        let path = PathBuf::from(&self.input_text);
-        if path.is_dir() {
-            self.current_dir = path;
-            self.selected = 0;
-            self.refresh();
-        }
-        self.input_text.clear();
-        self.input_active = false;
-    }
-}
-
+/// Central application state shared by the event handler, update loop, and rendering code.
 pub struct App {
+    /// All sessions loaded from history (unfiltered).
     pub sessions: Vec<SessionInfo>,
+    /// Zero-based index of the currently highlighted row.
     pub selected: usize,
+    /// Cache mapping session/chain cache keys to their loaded preview data.
     pub preview_cache: HashMap<String, (SessionMeta, Vec<PreviewMessage>)>,
+    /// Current vertical scroll offset in the preview pane (`u16::MAX` = scroll to bottom).
     pub preview_scroll: u16,
+    /// Set to true when the user requests to exit the application.
     pub should_quit: bool,
+    /// Populated when a session launch has been requested; consumed by the main loop.
     pub launch_session: Option<LaunchRequest>,
+    /// Text currently typed into the filter input.
     pub filter_text: String,
+    /// True while the filter input is in focus (editing mode).
     pub filter_active: bool,
+    /// Indices into `sessions` that match the current filter, sorted by recency.
     pub filtered_indices: Vec<usize>,
+    /// Optional path prefix used to restrict sessions to a specific project directory.
     pub filter_path: Option<String>,
+    /// When true, sessions are displayed in a collapsible tree grouped by project.
     pub tree_view: bool,
+    /// Controls how session labels are rendered.
     pub display_mode: DisplayMode,
+    /// Flattened sequence of rows for the tree view, recomputed on state changes.
     pub tree_rows: Vec<TreeRow>,
+    /// Set of project keys (and sub-keys like `"running:<project>"`) that are collapsed in tree view.
     pub collapsed: HashSet<String>,
+    /// When true, sessions with no JSONL data file are hidden.
     pub hide_empty: bool,
+    /// When true, sessions sharing a slug are grouped into a single chain entry.
     pub group_chains: bool,
     /// canonical_idx → all indices in the chain, sorted oldest→newest
     pub chain_map: HashMap<usize, Vec<usize>>,
+    /// Current interaction mode controlling key dispatch.
     pub mode: AppMode,
-    pub dir_browser: Option<DirBrowser>,
+    /// Persisted configuration; updated and saved when settings change.
     pub config: Config,
+    /// True while a Shift key is held down, used to highlight shift-key hints in the status bar.
     pub shift_active: bool,
+    /// Buffer holding the text typed in the rename input popup.
     pub rename_text: String,
+    /// Session ID being renamed, or tmux name if renaming a live session.
     pub rename_session_id: Option<String>,
+    /// Project path for the session being renamed (`None` when renaming a live session).
     pub rename_project: Option<String>,
+    /// Current state of the update check / download lifecycle.
     pub update_status: update::UpdateStatus,
+    /// Populated when the user confirms an update; consumed by the main loop to run the download.
     pub perform_update: Option<update::UpdateInfo>,
+    /// Receiver end of the background update-check thread channel.
     pub update_receiver: Option<std::sync::mpsc::Receiver<update::UpdateInfo>>,
+    /// Receiver end of the background session-name loading thread channel.
     pub names_receiver: Option<std::sync::mpsc::Receiver<HashMap<String, String>>>,
+    /// Set to true when the process should exec-restart itself after an update.
     pub should_restart: bool,
+    /// All currently running live tmux sessions on the ccsm socket.
     pub live_sessions: Vec<LiveSession>,
+    /// When true, only projects with active live sessions are shown.
     pub live_filter: bool,
+    /// Text typed into the new-session naming popup.
     pub naming_text: String,
+    /// Auto-generated placeholder shown when `naming_text` is empty.
     pub naming_placeholder: String,
+    /// Working directory to use for the new session being named.
     pub naming_cwd: Option<String>,
+    /// Cache of recently captured tmux pane lines keyed by tmux session name.
     pub live_preview_cache: HashMap<String, Vec<String>>,
+    /// Timestamp of the last live preview refresh, used to throttle polling.
     pub live_preview_tick: Instant,
+    /// Flattened sequence of rows for the flat view, recomputed on state changes.
     pub flat_rows: Vec<FlatRow>,
 }
 
@@ -192,6 +167,8 @@ fn truncate_path(path: &str) -> String {
 }
 
 impl App {
+    /// Construct a new `App`, applying configuration defaults, discovering live sessions,
+    /// spawning the background session-name loader, and building initial filter/tree state.
     pub fn new(sessions: Vec<SessionInfo>, filter_path: Option<String>, config: Config) -> Self {
         let filtered_indices: Vec<usize> = (0..sessions.len()).collect();
         let group_chains = config.group_chains;
@@ -215,7 +192,6 @@ impl App {
             tree_rows: Vec::new(),
             collapsed: HashSet::new(),
             mode: AppMode::Normal,
-            dir_browser: None,
             config,
             shift_active: false,
             rename_text: String::new(),
@@ -241,6 +217,8 @@ impl App {
         app
     }
 
+    /// Spawn a background thread that loads custom titles for all sessions with data
+    /// and sends the result map to `self.names_receiver`.
     fn spawn_load_session_names(&mut self) {
         let sessions: Vec<(String, String)> = self
             .sessions
@@ -263,6 +241,7 @@ impl App {
         });
     }
 
+    /// Apply custom titles received from the background loader, then refresh the tree view.
     pub fn apply_session_names(&mut self, names: HashMap<String, String>) {
         for session in &mut self.sessions {
             if let Some(title) = names.get(&session.session_id) {
@@ -273,6 +252,7 @@ impl App {
         self.recompute_tree();
     }
 
+    /// Replace the session list with a freshly loaded set, reset caches, and rebuild all views.
     pub fn reload_sessions(&mut self, sessions: Vec<SessionInfo>) {
         self.sessions = sessions;
         self.spawn_load_session_names();
@@ -286,7 +266,8 @@ impl App {
         }
     }
 
-    fn save_config(&mut self) {
+    /// Sync current view settings back into `self.config` and persist it to disk.
+    pub(crate) fn save_config(&mut self) {
         self.config.tree_view = self.tree_view;
         self.config.display_mode = self.display_mode;
         self.config.hide_empty = self.hide_empty;
@@ -297,14 +278,18 @@ impl App {
         }
     }
 
+    /// Collapse all project groups and build the initial tree row list.
     fn init_tree(&mut self) {
         for session in &self.sessions {
             self.collapsed.insert(session.project.clone());
+            self.collapsed.insert(format!("history:{}", session.project));
         }
         self.recompute_tree();
     }
 
-    fn recompute_filter(&mut self) {
+    /// Recompute `filtered_indices` from the current filter text, hide-empty flag, and chain
+    /// grouping setting, then rebuild both tree and flat views and clamp the selection.
+    pub(crate) fn recompute_filter(&mut self) {
         let query = self.filter_text.to_lowercase();
         let initial_indices: Vec<usize> = if query.is_empty() {
             (0..self.sessions.len())
@@ -423,7 +408,9 @@ impl App {
         }
     }
 
-    fn recompute_tree(&mut self) {
+    /// Rebuild `self.tree_rows` from the current `filtered_indices`, `live_sessions`,
+    /// `collapsed` set, and `live_filter` flag.
+    pub(crate) fn recompute_tree(&mut self) {
         // Group filtered sessions by project
         let mut groups: Vec<(String, String, Vec<usize>)> = Vec::new(); // (group_key, display_name, indices)
         let mut group_map: HashMap<String, usize> = HashMap::new(); // group_key -> index in groups
@@ -552,6 +539,7 @@ impl App {
         }
     }
 
+    /// Rebuild `self.flat_rows` from the current live sessions and filtered history indices.
     pub fn recompute_flat_rows(&mut self) {
         self.flat_rows.clear();
         let live_count = self.live_sessions.len();
@@ -578,6 +566,7 @@ impl App {
         }
     }
 
+    /// Returns the number of rows in the currently active view (tree or flat).
     pub fn visible_item_count(&self) -> usize {
         if self.tree_view {
             self.tree_rows.len()
@@ -602,6 +591,15 @@ impl App {
         }
     }
 
+    /// Returns true if the currently selected item is a historical (non-live) session.
+    pub fn is_historical_selected(&self) -> bool {
+        if self.tree_view {
+            matches!(self.tree_rows.get(self.selected), Some(TreeRow::Session { .. }))
+        } else {
+            matches!(self.flat_rows.get(self.selected), Some(FlatRow::HistoryItem { .. }))
+        }
+    }
+
     /// Get the live session index for the currently selected item.
     /// Returns None if the selection is not a live session.
     pub fn selected_live_index(&self) -> Option<usize> {
@@ -618,14 +616,18 @@ impl App {
         }
     }
 
+    /// Returns the total number of currently running live tmux sessions.
     pub fn total_running_count(&self) -> usize {
         self.live_sessions.len()
     }
 
+    /// Returns the number of live sessions whose working directory matches `project`.
     pub fn project_running_count(&self, project: &str) -> usize {
         self.live_sessions.iter().filter(|ls| ls.cwd == project).count()
     }
 
+    /// Return the preview data for the currently selected session, loading and caching it on
+    /// first access. Returns empty slices when no session is selected or a live item is selected.
     pub fn current_preview(&mut self) -> (&SessionMeta, &[PreviewMessage]) {
         static EMPTY_META: std::sync::OnceLock<SessionMeta> = std::sync::OnceLock::new();
 
@@ -694,6 +696,8 @@ impl App {
         }
     }
 
+    /// Return the most recently captured pane lines for the selected live session,
+    /// refreshing from tmux at most once every 5 seconds.
     pub fn current_live_preview(&mut self) -> Vec<String> {
         let idx = match self.selected_live_index() {
             Some(i) => i,
@@ -711,667 +715,13 @@ impl App {
         self.live_preview_cache.get(&name).cloned().unwrap_or_default()
     }
 
+    /// Re-query the ccsm tmux server for live sessions, clear the live preview cache,
+    /// and rebuild both flat and tree views.
     pub fn reload_live_sessions(&mut self) {
         self.live_sessions = live::discover_live_sessions();
         self.live_preview_cache.clear();
         self.recompute_flat_rows();
         self.recompute_tree();
-    }
-
-    fn handle_dir_browser_event(&mut self, key: crossterm::event::KeyEvent) {
-        let browser = match self.dir_browser.as_mut() {
-            Some(b) => b,
-            None => return,
-        };
-
-        if browser.input_active {
-            match key.code {
-                KeyCode::Esc => {
-                    browser.input_active = false;
-                    browser.input_text.clear();
-                }
-                KeyCode::Enter => {
-                    browser.apply_input();
-                }
-                KeyCode::Backspace => {
-                    browser.input_text.pop();
-                }
-                KeyCode::Char(c) => {
-                    let c = if key.modifiers.contains(KeyModifiers::SHIFT) {
-                        c.to_ascii_uppercase()
-                    } else {
-                        c
-                    };
-                    browser.input_text.push(c);
-                }
-                _ => {}
-            }
-            return;
-        }
-
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => {
-                self.mode = AppMode::Normal;
-                self.dir_browser = None;
-            }
-            KeyCode::Char('j') | KeyCode::Down => {
-                if !browser.entries.is_empty() {
-                    browser.selected = (browser.selected + 1).min(browser.entries.len() - 1);
-                }
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                browser.selected = browser.selected.saturating_sub(1);
-            }
-            KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => {
-                browser.enter_selected();
-            }
-            KeyCode::Char('h') | KeyCode::Left | KeyCode::Backspace => {
-                browser.go_up();
-            }
-            KeyCode::Char('/') => {
-                browser.input_active = true;
-                browser.input_text = browser.current_dir.to_string_lossy().to_string();
-            }
-            KeyCode::Char(' ') => {
-                let cwd = if let Some(entry) = browser.entries.get(browser.selected) {
-                    if entry.is_dir && entry.name != ".." {
-                        browser.current_dir.join(&entry.name)
-                    } else {
-                        browser.current_dir.clone()
-                    }
-                } else {
-                    browser.current_dir.clone()
-                };
-                let cwd = cwd.to_string_lossy().to_string();
-                let placeholder = live::generate_auto_name(&cwd, &self.live_sessions);
-                self.naming_placeholder = placeholder;
-                self.naming_cwd = Some(cwd);
-                self.naming_text.clear();
-                self.mode = AppMode::NamingSession;
-                self.dir_browser = None;
-            }
-            _ => {}
-        }
-    }
-
-    fn handle_rename_event(&mut self, key: crossterm::event::KeyEvent) {
-        // If rename_project is None, it's a live session rename
-        if self.rename_project.is_none() {
-            if key.code == KeyCode::Esc {
-                self.mode = AppMode::Normal;
-                self.rename_text.clear();
-                self.rename_session_id = None;
-                return;
-            }
-            if key.code == KeyCode::Enter {
-                if let Some(tmux_name) = self.rename_session_id.take() {
-                    let new_name = self.rename_text.trim().to_string();
-                    if !new_name.is_empty() {
-                        // Update claude session titles that match the old tmux name
-                        let cwd = self.live_sessions.iter()
-                            .find(|ls| ls.tmux_name == tmux_name)
-                            .map(|ls| ls.cwd.clone());
-                        if let Some(cwd) = cwd {
-                            for session in &mut self.sessions {
-                                if session.project == cwd && session.name.as_deref() == Some(&tmux_name) {
-                                    let _ = data::save_custom_title(&session.project, &session.session_id, &new_name);
-                                    session.name = Some(new_name.clone());
-                                }
-                            }
-                            self.preview_cache.clear();
-                        }
-                        let _ = std::process::Command::new("tmux")
-                            .args(["-L", live::TMUX_SOCKET, "rename-session", "-t", &tmux_name, &new_name])
-                            .output();
-                        self.live_sessions = live::discover_live_sessions();
-                        self.live_preview_cache.clear();
-                        self.recompute_flat_rows();
-                        self.recompute_tree();
-                    }
-                }
-                self.rename_text.clear();
-                self.mode = AppMode::Normal;
-                return;
-            }
-            if key.code == KeyCode::Backspace {
-                self.rename_text.pop();
-                return;
-            }
-            if let KeyCode::Char(c) = key.code {
-                let c = if key.modifiers.contains(KeyModifiers::SHIFT) {
-                    c.to_ascii_uppercase()
-                } else {
-                    c
-                };
-                self.rename_text.push(c);
-            }
-            return;
-        }
-
-        match key.code {
-            KeyCode::Esc => {
-                self.mode = AppMode::Normal;
-                self.rename_text.clear();
-                self.rename_session_id = None;
-                self.rename_project = None;
-            }
-            KeyCode::Enter => {
-                if let Some(session_id) = self.rename_session_id.take() {
-                    let project = self.rename_project.take().unwrap_or_default();
-                    let name = self.rename_text.trim().to_string();
-                    // Write to the session JSONL (even empty to clear)
-                    if let Err(e) = data::save_custom_title(&project, &session_id, &name) {
-                        eprintln!("Failed to save custom title: {e}");
-                    }
-                    let name_opt = if name.is_empty() { None } else { Some(name) };
-                    for s in &mut self.sessions {
-                        if s.session_id == session_id {
-                            s.name = name_opt.clone();
-                        }
-                    }
-                    self.preview_cache.clear();
-                }
-                self.rename_text.clear();
-                self.mode = AppMode::Normal;
-            }
-            KeyCode::Backspace => {
-                self.rename_text.pop();
-            }
-            KeyCode::Char(c) => {
-                let c = if key.modifiers.contains(KeyModifiers::SHIFT) {
-                    c.to_ascii_uppercase()
-                } else {
-                    c
-                };
-                self.rename_text.push(c);
-            }
-            _ => {}
-        }
-    }
-
-    fn handle_naming_event(&mut self, key: crossterm::event::KeyEvent) {
-        match key.code {
-            KeyCode::Esc => {
-                self.mode = AppMode::Normal;
-                self.naming_text.clear();
-                self.naming_cwd = None;
-            }
-            KeyCode::Enter => {
-                let raw = if self.naming_text.is_empty() {
-                    self.naming_placeholder.clone()
-                } else {
-                    self.naming_text.clone()
-                };
-                // Sanitize: tmux disallows '.' ':' and whitespace in session names
-                let name: String = raw
-                    .chars()
-                    .map(|c| if c == '.' || c == ':' || c.is_whitespace() { '-' } else { c })
-                    .collect();
-                let name = if name.is_empty() { self.naming_placeholder.clone() } else { name };
-                let cwd = self.naming_cwd.take().unwrap_or_else(|| ".".to_string());
-                self.mode = AppMode::Normal;
-                self.naming_text.clear();
-                self.launch_session = Some(LaunchRequest::NewLive { name, cwd });
-            }
-            KeyCode::Backspace => {
-                self.naming_text.pop();
-            }
-            KeyCode::Char(c) => {
-                let c = if key.modifiers.contains(KeyModifiers::SHIFT) {
-                    c.to_ascii_uppercase()
-                } else {
-                    c
-                };
-                self.naming_text.push(c);
-            }
-            _ => {}
-        }
-    }
-
-    pub fn handle_event(&mut self) -> anyhow::Result<()> {
-        if let Event::Key(key) = event::read()? {
-            // Track shift state for UI highlighting
-            match (&key.code, key.kind) {
-                // Bare shift press/release — update flag and consume event
-                (KeyCode::Modifier(ModifierKeyCode::LeftShift | ModifierKeyCode::RightShift), KeyEventKind::Press) => {
-                    self.shift_active = true;
-                    return Ok(());
-                }
-                (KeyCode::Modifier(ModifierKeyCode::LeftShift | ModifierKeyCode::RightShift), KeyEventKind::Release) => {
-                    self.shift_active = false;
-                    return Ok(());
-                }
-                // For all other keys, track shift from modifiers field
-                _ => {
-                    self.shift_active = key.modifiers.contains(KeyModifiers::SHIFT);
-                }
-            }
-
-            // Only process actions on key press, not release/repeat
-            if key.kind != KeyEventKind::Press {
-                return Ok(());
-            }
-
-            if self.mode == AppMode::UpdatePrompt {
-                match key.code {
-                    KeyCode::Char('y') => {
-                        if let update::UpdateStatus::Available(ref info) = self.update_status {
-                            self.perform_update = Some(info.clone());
-                            self.update_status = update::UpdateStatus::Downloading;
-                        }
-                        self.mode = AppMode::Normal;
-                    }
-                    KeyCode::Char('n') | KeyCode::Esc => {
-                        self.update_status = update::UpdateStatus::None;
-                        self.mode = AppMode::Normal;
-                    }
-                    _ => {}
-                }
-                return Ok(());
-            }
-
-            if self.mode == AppMode::RestartPrompt {
-                match key.code {
-                    KeyCode::Char('y') => {
-                        self.should_restart = true;
-                        self.should_quit = true;
-                    }
-                    KeyCode::Char('n') | KeyCode::Esc => {
-                        self.mode = AppMode::Normal;
-                    }
-                    _ => {}
-                }
-                return Ok(());
-            }
-
-            if self.mode == AppMode::Help {
-                self.mode = AppMode::Normal;
-                return Ok(());
-            }
-
-            if self.mode == AppMode::NamingSession {
-                self.handle_naming_event(key);
-                return Ok(());
-            }
-
-            if self.mode == AppMode::Renaming {
-                self.handle_rename_event(key);
-                return Ok(());
-            }
-
-            if self.mode == AppMode::DirBrowser {
-                self.handle_dir_browser_event(key);
-                return Ok(());
-            }
-
-            if self.filter_active {
-                match key.code {
-                    KeyCode::Esc => {
-                        self.filter_active = false;
-                        self.filter_text.clear();
-                        self.recompute_filter();
-                        self.preview_scroll = u16::MAX;
-                    }
-                    KeyCode::Enter => {
-                        self.filter_active = false;
-                    }
-                    KeyCode::Backspace => {
-                        self.filter_text.pop();
-                        self.recompute_filter();
-                        self.preview_scroll = u16::MAX;
-                    }
-                    KeyCode::Char(c) => {
-                        let c = if key.modifiers.contains(KeyModifiers::SHIFT) {
-                            c.to_ascii_uppercase()
-                        } else {
-                            c
-                        };
-                        self.filter_text.push(c);
-                        self.recompute_filter();
-                        self.preview_scroll = u16::MAX;
-                    }
-                    KeyCode::Down => {
-                        let count = self.visible_item_count();
-                        if count > 0 {
-                            self.selected =
-                                (self.selected + 1).min(count - 1);
-                            self.preview_scroll = u16::MAX;
-                        }
-                    }
-                    KeyCode::Up => {
-                        self.selected = self.selected.saturating_sub(1);
-                        self.preview_scroll = u16::MAX;
-                    }
-                    _ => {}
-                }
-                return Ok(());
-            }
-
-            match (key.code, key.modifiers) {
-                (KeyCode::Char('q'), _) | (KeyCode::Esc, _) => {
-                    self.should_quit = true;
-                }
-                (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-                    self.should_quit = true;
-                }
-                // '?' is Shift+/ on US keyboards; some terminals send Char('?') and
-                // others send Char('/') with SHIFT — handle both before the '/' filter.
-                (KeyCode::Char('?'), _) | (KeyCode::Char('/'), KeyModifiers::SHIFT) => {
-                    self.mode = AppMode::Help;
-                }
-                (KeyCode::Char('/'), _) => {
-                    self.filter_active = true;
-                }
-                (KeyCode::Tab, _) => {
-                    // Cycle: tree[Name] → tree[ShortDir] → tree[FullDir]
-                    //      → flat[Name] → flat[ShortDir] → flat[FullDir] → tree[Name]
-                    match (self.tree_view, self.display_mode) {
-                        (true, DisplayMode::Name) => {
-                            self.display_mode = DisplayMode::ShortDir;
-                            self.recompute_tree();
-                        }
-                        (true, DisplayMode::ShortDir) => {
-                            self.display_mode = DisplayMode::FullDir;
-                            self.recompute_tree();
-                        }
-                        (true, DisplayMode::FullDir) => {
-                            self.tree_view = false;
-                            self.display_mode = DisplayMode::Name;
-                        }
-                        (false, DisplayMode::Name) => {
-                            self.display_mode = DisplayMode::ShortDir;
-                        }
-                        (false, DisplayMode::ShortDir) => {
-                            self.display_mode = DisplayMode::FullDir;
-                        }
-                        (false, DisplayMode::FullDir) => {
-                            self.tree_view = true;
-                            self.display_mode = DisplayMode::Name;
-                            self.recompute_tree();
-                        }
-                    }
-                    self.selected = 0;
-                    self.preview_scroll = u16::MAX;
-                    self.save_config();
-                }
-                (KeyCode::BackTab, _) => {
-                    // Reverse cycle: opposite of Tab
-                    match (self.tree_view, self.display_mode) {
-                        (true, DisplayMode::Name) => {
-                            self.tree_view = false;
-                            self.display_mode = DisplayMode::FullDir;
-                        }
-                        (true, DisplayMode::ShortDir) => {
-                            self.display_mode = DisplayMode::Name;
-                            self.recompute_tree();
-                        }
-                        (true, DisplayMode::FullDir) => {
-                            self.display_mode = DisplayMode::ShortDir;
-                            self.recompute_tree();
-                        }
-                        (false, DisplayMode::Name) => {
-                            self.tree_view = true;
-                            self.display_mode = DisplayMode::FullDir;
-                            self.recompute_tree();
-                        }
-                        (false, DisplayMode::ShortDir) => {
-                            self.display_mode = DisplayMode::Name;
-                        }
-                        (false, DisplayMode::FullDir) => {
-                            self.display_mode = DisplayMode::ShortDir;
-                        }
-                    }
-                    self.selected = 0;
-                    self.preview_scroll = u16::MAX;
-                    self.save_config();
-                }
-                (KeyCode::Char('j'), KeyModifiers::NONE) | (KeyCode::Down, _) => {
-                    let count = self.visible_item_count();
-                    if count > 0 {
-                        self.selected =
-                            (self.selected + 1).min(count - 1);
-                        self.preview_scroll = u16::MAX;
-                    }
-                }
-                (KeyCode::Char('k'), KeyModifiers::NONE) | (KeyCode::Up, _) => {
-                    self.selected = self.selected.saturating_sub(1);
-                    self.preview_scroll = u16::MAX;
-                }
-                (KeyCode::Char('J' | 'j'), KeyModifiers::SHIFT) => {
-                    self.preview_scroll = self.preview_scroll.saturating_add(3);
-                }
-                (KeyCode::Char('K' | 'k'), KeyModifiers::SHIFT) => {
-                    self.preview_scroll = self.preview_scroll.saturating_sub(3);
-                }
-                (KeyCode::Char('e'), KeyModifiers::NONE) => {
-                    self.hide_empty = !self.hide_empty;
-                    self.recompute_filter();
-                    self.preview_scroll = u16::MAX;
-                    self.save_config();
-                }
-                (KeyCode::Char('c'), KeyModifiers::NONE) => {
-                    self.group_chains = !self.group_chains;
-                    self.preview_cache.clear();
-                    self.recompute_filter();
-                    self.preview_scroll = u16::MAX;
-                    self.save_config();
-                }
-                (KeyCode::Char('n'), KeyModifiers::NONE) => {
-                    if let Some(cwd) = self.selected_cwd() {
-                        let path = std::path::Path::new(&cwd);
-                        let dir = if path.exists() {
-                            cwd
-                        } else {
-                            ".".to_string()
-                        };
-                        let placeholder = live::generate_auto_name(&dir, &self.live_sessions);
-                        self.naming_placeholder = placeholder;
-                        self.naming_cwd = Some(dir);
-                        self.naming_text.clear();
-                        self.mode = AppMode::NamingSession;
-                    }
-                }
-                (KeyCode::Char('L' | 'l'), KeyModifiers::SHIFT) => {
-                    self.live_filter = !self.live_filter;
-                    self.recompute_flat_rows();
-                    self.recompute_tree();
-                    self.save_config();
-                }
-                (KeyCode::Char('x'), KeyModifiers::NONE) => {
-                    if let Some(idx) = self.selected_live_index() {
-                        let name = self.live_sessions[idx].tmux_name.clone();
-                        if let Err(e) = live::stop_live_session(&name) {
-                            eprintln!("Failed to stop session: {e}");
-                        }
-                        self.live_sessions = live::discover_live_sessions();
-                        self.live_preview_cache.remove(&name);
-                        self.recompute_flat_rows();
-                        self.recompute_tree();
-                    }
-                }
-                (KeyCode::Char('r'), KeyModifiers::NONE) => {
-                    // Check if a live session is selected first
-                    if let Some(idx) = self.selected_live_index() {
-                        let session = &self.live_sessions[idx];
-                        self.rename_text = session.display_name.clone();
-                        self.rename_session_id = Some(session.tmux_name.clone());
-                        self.rename_project = None;
-                        self.mode = AppMode::Renaming;
-                        return Ok(());
-                    }
-                    if let Some(idx) = self.selected_session_index() {
-                        // For chains, always rename the most recent session
-                        let resume_idx = self
-                            .chain_map
-                            .get(&idx)
-                            .and_then(|chain| {
-                                chain
-                                    .iter()
-                                    .max_by_key(|&&i| self.sessions[i].last_timestamp)
-                                    .copied()
-                            })
-                            .unwrap_or(idx);
-                        let session = &self.sessions[resume_idx];
-                        self.rename_session_id = Some(session.session_id.clone());
-                        self.rename_project = Some(session.project.clone());
-                        // Pre-fill with the chain's effective name (may come from any member)
-                        self.rename_text = self
-                            .chain_name_for(idx)
-                            .unwrap_or("")
-                            .to_string();
-                        self.mode = AppMode::Renaming;
-                    }
-                }
-                (KeyCode::Char('N' | 'n'), KeyModifiers::SHIFT) => {
-                    let start = self
-                        .selected_cwd()
-                        .map(PathBuf::from)
-                        .filter(|p| p.exists())
-                        .unwrap_or_else(|| {
-                            dirs::home_dir().unwrap_or_else(|| {
-                                if cfg!(windows) {
-                                    PathBuf::from("C:\\")
-                                } else {
-                                    PathBuf::from("/")
-                                }
-                            })
-                        });
-                    self.dir_browser = Some(DirBrowser::new(start));
-                    self.mode = AppMode::DirBrowser;
-                }
-                (KeyCode::Enter, _) => {
-                    if self.tree_view {
-                        match self.tree_rows.get(self.selected).cloned() {
-                            Some(TreeRow::Header { project, .. }) => {
-                                if self.collapsed.contains(&project) {
-                                    self.collapsed.remove(&project);
-                                } else {
-                                    self.collapsed.insert(project);
-                                }
-                                self.recompute_tree();
-                            }
-                            Some(TreeRow::Session { session_index }) => {
-                                let session_id = self.resume_session_id_for(session_index).to_string();
-                                let cwd = self.sessions[session_index].project.clone();
-                                self.launch_session = Some(LaunchRequest::Resume { session_id, cwd });
-                            }
-                            Some(TreeRow::LiveItem { live_index }) => {
-                                let name = self.live_sessions[live_index].tmux_name.clone();
-                                self.launch_session = Some(LaunchRequest::AttachLive { tmux_name: name });
-                            }
-                            Some(TreeRow::RunningHeader { project, .. }) => {
-                                let key = format!("running:{}", project);
-                                if self.collapsed.contains(&key) {
-                                    self.collapsed.remove(&key);
-                                } else {
-                                    self.collapsed.insert(key);
-                                }
-                                self.recompute_tree();
-                            }
-                            Some(TreeRow::HistoryHeader { project, .. }) => {
-                                let key = format!("history:{}", project);
-                                if self.collapsed.contains(&key) {
-                                    self.collapsed.remove(&key);
-                                } else {
-                                    self.collapsed.insert(key);
-                                }
-                                self.recompute_tree();
-                            }
-                            None => {}
-                        }
-                    } else {
-                        match self.flat_rows.get(self.selected).cloned() {
-                            Some(FlatRow::LiveItem { live_index }) => {
-                                let name = self.live_sessions[live_index].tmux_name.clone();
-                                self.launch_session = Some(LaunchRequest::AttachLive { tmux_name: name });
-                            }
-                            Some(FlatRow::HistoryItem { session_index }) => {
-                                let session_id = self.resume_session_id_for(session_index).to_string();
-                                let cwd = self.sessions[session_index].project.clone();
-                                self.launch_session = Some(LaunchRequest::Resume { session_id, cwd });
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                (KeyCode::Right, _) | (KeyCode::Char('l'), KeyModifiers::NONE)
-                    if self.tree_view =>
-                {
-                    match self.tree_rows.get(self.selected).cloned() {
-                        Some(TreeRow::Header { project, .. }) => {
-                            if self.collapsed.contains(&project) {
-                                self.collapsed.remove(&project);
-                                self.recompute_tree();
-                            }
-                        }
-                        Some(TreeRow::RunningHeader { project, .. }) => {
-                            let key = format!("running:{}", project);
-                            if self.collapsed.contains(&key) {
-                                self.collapsed.remove(&key);
-                                self.recompute_tree();
-                            }
-                        }
-                        Some(TreeRow::HistoryHeader { project, .. }) => {
-                            let key = format!("history:{}", project);
-                            if self.collapsed.contains(&key) {
-                                self.collapsed.remove(&key);
-                                self.recompute_tree();
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                (KeyCode::Left, _) | (KeyCode::Char('h'), KeyModifiers::NONE)
-                    if self.tree_view =>
-                {
-                    match self.tree_rows.get(self.selected).cloned() {
-                        Some(TreeRow::Header { project, .. }) => {
-                            if !self.collapsed.contains(&project) {
-                                self.collapsed.insert(project);
-                                self.recompute_tree();
-                            }
-                        }
-                        Some(TreeRow::RunningHeader { project, .. }) => {
-                            let key = format!("running:{}", project);
-                            if !self.collapsed.contains(&key) {
-                                self.collapsed.insert(key);
-                                self.recompute_tree();
-                            }
-                        }
-                        Some(TreeRow::HistoryHeader { project, .. }) => {
-                            let key = format!("history:{}", project);
-                            if !self.collapsed.contains(&key) {
-                                self.collapsed.insert(key);
-                                self.recompute_tree();
-                            }
-                        }
-                        Some(TreeRow::Session { .. }) => {
-                            // Move cursor to nearest HistoryHeader above
-                            for i in (0..self.selected).rev() {
-                                if matches!(self.tree_rows.get(i), Some(TreeRow::HistoryHeader { .. })) {
-                                    self.selected = i;
-                                    self.preview_scroll = u16::MAX;
-                                    break;
-                                }
-                            }
-                        }
-                        Some(TreeRow::LiveItem { .. }) => {
-                            // Move cursor to nearest RunningHeader above
-                            for i in (0..self.selected).rev() {
-                                if matches!(self.tree_rows.get(i), Some(TreeRow::RunningHeader { .. })) {
-                                    self.selected = i;
-                                    self.preview_scroll = u16::MAX;
-                                    break;
-                                }
-                            }
-                        }
-                        None => {}
-                    }
-                }
-                _ => {}
-            }
-        }
-        Ok(())
     }
 
 }
@@ -1459,8 +809,9 @@ mod tests {
         };
         assert!(app.collapsed.contains(&project));
 
-        // Simulate expand
+        // Simulate expand (project + its history sub-section)
         app.collapsed.remove(&project);
+        app.collapsed.remove(&format!("history:{}", project));
         app.recompute_tree();
 
         // beta now expanded: header + history-header + 2 sessions
@@ -1705,6 +1056,7 @@ mod tests {
 
         // Expand to see sessions
         app.collapsed.remove("/Users/sane/Dev/alpha");
+        app.collapsed.remove("history:/Users/sane/Dev/alpha");
         app.recompute_filter();
         assert_eq!(app.tree_rows.len(), 4); // 1 header + 1 history-header + 2 sessions
     }
@@ -1823,109 +1175,6 @@ mod tests {
     fn test_app_default_mode_is_normal() {
         let app = make_app(make_sessions(), None, Config::default());
         assert_eq!(app.mode, AppMode::Normal);
-        assert!(app.dir_browser.is_none());
-    }
-
-    #[test]
-    fn test_dir_browser_new_reads_entries() {
-        let browser = DirBrowser::new(std::env::temp_dir());
-        // Should always have at least ".." entry
-        assert!(!browser.entries.is_empty());
-        assert_eq!(browser.entries[0].name, "..");
-        assert_eq!(browser.selected, 0);
-        assert!(!browser.input_active);
-    }
-
-    #[test]
-    fn test_dir_browser_go_up() {
-        let start = std::env::temp_dir();
-        let mut browser = DirBrowser::new(start.clone());
-        let original = browser.current_dir.clone();
-        browser.go_up();
-        if let Some(parent) = original.parent() {
-            assert_eq!(browser.current_dir, parent.to_path_buf());
-        }
-    }
-
-    #[test]
-    fn test_dir_browser_apply_input_valid() {
-        let mut browser = DirBrowser::new(std::env::temp_dir());
-        browser.input_active = true;
-        browser.input_text = "/tmp".to_string();
-        browser.apply_input();
-        assert!(!browser.input_active);
-        assert!(browser.input_text.is_empty());
-        // /tmp should resolve to the canonical temp dir
-        assert!(browser.current_dir.exists());
-    }
-
-    #[test]
-    fn test_dir_browser_apply_input_invalid() {
-        let start = std::env::temp_dir();
-        let mut browser = DirBrowser::new(start.clone());
-        browser.input_active = true;
-        browser.input_text = "/nonexistent_dir_xyz_123".to_string();
-        browser.apply_input();
-        // Should stay at original dir since path is invalid
-        assert_eq!(browser.current_dir, start);
-        assert!(!browser.input_active);
-    }
-
-    #[test]
-    fn test_dir_browser_shows_hidden_dirs() {
-        let browser = DirBrowser::new(dirs::home_dir().unwrap_or_else(|| {
-                                if cfg!(windows) {
-                                    PathBuf::from("C:\\")
-                                } else {
-                                    PathBuf::from("/")
-                                }
-                            }));
-        // Should include dot directories (e.g. .config, .local)
-        let has_hidden = browser.entries.iter().any(|e| e.name != ".." && e.name.starts_with('.'));
-        // Home dir almost certainly has hidden dirs
-        assert!(has_hidden, "expected hidden dirs in home directory");
-    }
-
-    #[test]
-    fn test_space_key_resolves_selected_directory() {
-        let tmp = std::env::temp_dir();
-        let mut browser = DirBrowser::new(tmp.clone());
-        // Find a real subdirectory entry (not "..")
-        let dir_idx = browser.entries.iter().position(|e| e.is_dir && e.name != "..");
-        if let Some(idx) = dir_idx {
-            browser.selected = idx;
-            let entry = &browser.entries[idx];
-            let expected = tmp.join(&entry.name);
-            // Simulate what the space-key handler does
-            let cwd = if let Some(entry) = browser.entries.get(browser.selected) {
-                if entry.is_dir && entry.name != ".." {
-                    browser.current_dir.join(&entry.name)
-                } else {
-                    browser.current_dir.clone()
-                }
-            } else {
-                browser.current_dir.clone()
-            };
-            assert_eq!(cwd, expected);
-        }
-    }
-
-    #[test]
-    fn test_space_key_on_dotdot_uses_current_dir() {
-        let tmp = std::env::temp_dir();
-        let browser = DirBrowser::new(tmp.clone());
-        // First entry is always ".."
-        assert_eq!(browser.entries[0].name, "..");
-        let cwd = if let Some(entry) = browser.entries.get(0) {
-            if entry.is_dir && entry.name != ".." {
-                browser.current_dir.join(&entry.name)
-            } else {
-                browser.current_dir.clone()
-            }
-        } else {
-            browser.current_dir.clone()
-        };
-        assert_eq!(cwd, tmp);
     }
 
     #[test]

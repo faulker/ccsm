@@ -24,6 +24,8 @@ const ACCENT_PEACH: Color = Color::Rgb(250, 179, 135);
 const ACCENT_TEAL: Color = Color::Rgb(148, 226, 213);
 const HIGHLIGHT_BG: Color = Color::Rgb(69, 71, 90);
 
+/// Render the full TUI frame: session list, preview pane, info bar, status bar,
+/// and any active modal overlay (rename, update prompt, help, naming popup).
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -114,7 +116,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                     ListItem::new(Line::from(vec![
                         Span::raw("  "),
                         Span::styled(
-                            format!("{} ● Running ({})", arrow, count),
+                            format!("{} Running ({})", arrow, count),
                             Style::default().fg(ACCENT_GREEN).add_modifier(Modifier::BOLD),
                         ),
                     ]))
@@ -150,7 +152,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 FlatRow::RunningHeader { count } => {
                     ListItem::new(Line::from(vec![
                         Span::styled(
-                            format!("▾ ● Running ({})", count),
+                            format!("▾ Running ({})", count),
                             Style::default().fg(ACCENT_GREEN).add_modifier(Modifier::BOLD),
                         ),
                     ]))
@@ -391,39 +393,55 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     // Help / search bar
     let bar_style = Style::default().bg(HIGHLIGHT_BG);
-    let bottom_bar = if app.filter_active {
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                " /",
-                Style::default()
-                    .fg(ACCENT_PEACH)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(&app.filter_text, Style::default().fg(FG_TEXT)),
-            Span::styled("█", Style::default().fg(ACCENT_BLUE)),
-        ]))
-        .style(bar_style)
+    let version_label = format!("v{} ", env!("CARGO_PKG_VERSION"));
+    let version_width = version_label.len() as u16;
+    let bar_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Min(0),
+            Constraint::Length(version_width),
+        ])
+        .split(chunks[1]);
+
+    if app.filter_active {
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    " /",
+                    Style::default()
+                        .fg(ACCENT_PEACH)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(&app.filter_text, Style::default().fg(FG_TEXT)),
+                Span::styled("█", Style::default().fg(ACCENT_BLUE)),
+            ]))
+            .style(bar_style),
+            bar_chunks[0],
+        );
     } else if !app.filter_text.is_empty() {
-        Paragraph::new(Line::from(vec![
-            Span::styled(" filter: ", Style::default().fg(FG_SUBTEXT)),
-            Span::styled(&app.filter_text, Style::default().fg(FG_TEXT)),
-            Span::raw("  "),
-            Span::styled(
-                "/",
-                Style::default()
-                    .fg(ACCENT_PEACH)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" edit  ", Style::default().fg(FG_SUBTEXT)),
-            Span::styled(
-                "Esc",
-                Style::default()
-                    .fg(ACCENT_PEACH)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" clear", Style::default().fg(FG_SUBTEXT)),
-        ]))
-        .style(bar_style)
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(" filter: ", Style::default().fg(FG_SUBTEXT)),
+                Span::styled(&app.filter_text, Style::default().fg(FG_TEXT)),
+                Span::raw("  "),
+                Span::styled(
+                    "/",
+                    Style::default()
+                        .fg(ACCENT_PEACH)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" edit  ", Style::default().fg(FG_SUBTEXT)),
+                Span::styled(
+                    "Esc",
+                    Style::default()
+                        .fg(ACCENT_PEACH)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" clear", Style::default().fg(FG_SUBTEXT)),
+            ]))
+            .style(bar_style),
+            bar_chunks[0],
+        );
     } else {
         let key_style = Style::default()
             .fg(ACCENT_PEACH)
@@ -440,82 +458,205 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             hint_style
         };
 
-        let mut spans = Vec::new();
+        let mut hints: Vec<(Line, u16)> = Vec::new();
 
         // Show post-update status in help bar
         match &app.update_status {
             UpdateStatus::Downloading => {
-                spans.push(Span::styled(
-                    " Updating... ",
-                    Style::default().fg(ACCENT_PEACH).add_modifier(Modifier::BOLD),
+                let text = " Updating... ".to_string();
+                let width = text.len() as u16;
+                hints.push((
+                    Line::from(Span::styled(
+                        text,
+                        Style::default().fg(ACCENT_PEACH).add_modifier(Modifier::BOLD),
+                    )),
+                    width,
                 ));
             }
             UpdateStatus::Done(v) => {
-                spans.push(Span::styled(
-                    format!(" Updated to {} (restart to apply) ", v),
-                    Style::default().fg(ACCENT_GREEN).add_modifier(Modifier::BOLD),
+                let text = format!(" Updated to {} (restart to apply) ", v);
+                let width = text.len() as u16;
+                hints.push((
+                    Line::from(Span::styled(
+                        text,
+                        Style::default().fg(ACCENT_GREEN).add_modifier(Modifier::BOLD),
+                    )),
+                    width,
                 ));
             }
             UpdateStatus::Failed(msg) => {
-                spans.push(Span::styled(
-                    format!(" Update failed: {} ", msg),
-                    Style::default().fg(Color::Rgb(243, 139, 168)).add_modifier(Modifier::BOLD),
+                let text = format!(" Update failed: {} ", msg);
+                let width = text.len() as u16;
+                hints.push((
+                    Line::from(Span::styled(
+                        text,
+                        Style::default()
+                            .fg(Color::Rgb(243, 139, 168))
+                            .add_modifier(Modifier::BOLD),
+                    )),
+                    width,
                 ));
             }
             _ => {}
         }
 
         let is_live = app.selected_live_index().is_some();
-        spans.extend_from_slice(&[
-            Span::styled(" ↑↓/jk", key_style),
-            Span::styled(" navigate  ", hint_style),
-            Span::styled("Enter", key_style),
-            Span::styled(" open  ", hint_style),
-            Span::styled("J/K", shift_key_style),
-            Span::styled(" scroll  ", shift_hint_style),
-            Span::styled("/", key_style),
-            Span::styled(" search  ", hint_style),
-            Span::styled("Tab", shift_key_style),
-            Span::styled(" view  ", shift_hint_style),
-            Span::styled("e", key_style),
-            Span::styled(" show empty  ", hint_style),
-            Span::styled("c", key_style),
-            Span::styled(if app.group_chains { " ungroup  " } else { " group  " }, hint_style),
-            Span::styled("r", key_style),
-            Span::styled(" rename  ", hint_style),
-            Span::styled("n", key_style),
-            Span::styled(" new live  ", hint_style),
-            Span::styled("N", shift_key_style),
-            Span::styled(" browse  ", shift_hint_style),
-            Span::styled("L", shift_key_style),
-            Span::styled(" live filter  ", shift_hint_style),
-        ]);
+
+        // " ↑↓/jk navigate" = 15, " ↑↓/JK scroll" = 13 → width 16
+        hints.push((
+            Line::from(vec![
+                Span::styled(
+                    if app.shift_active { " ↑↓/JK" } else { " ↑↓/jk" },
+                    if app.shift_active { shift_key_style } else { key_style },
+                ),
+                Span::styled(
+                    if app.shift_active { " scroll" } else { " navigate" },
+                    if app.shift_active { shift_hint_style } else { hint_style },
+                ),
+            ]),
+            16,
+        ));
+        // "Enter open" = 10, "Enter open direct" = 17 → width 19
+        let enter_shift = app.shift_active && app.is_historical_selected();
+        hints.push((
+            Line::from(vec![
+                Span::styled(
+                    "Enter",
+                    if enter_shift { shift_key_style } else { key_style },
+                ),
+                Span::styled(
+                    if enter_shift { " open direct" } else { " open" },
+                    if enter_shift { shift_hint_style } else { hint_style },
+                ),
+            ]),
+            19,
+        ));
+        // "/" search = 8 → width 10
+        hints.push((
+            Line::from(vec![
+                Span::styled("/", key_style),
+                Span::styled(" search", hint_style),
+            ]),
+            10,
+        ));
+        // "Tab view" = 8 → width 10
+        hints.push((
+            Line::from(vec![
+                Span::styled("Tab", shift_key_style),
+                Span::styled(" view", shift_hint_style),
+            ]),
+            10,
+        ));
+        // "e show empty" = 12 → width 14
+        hints.push((
+            Line::from(vec![
+                Span::styled("e", key_style),
+                Span::styled(" show empty", hint_style),
+            ]),
+            14,
+        ));
+        // "c group" = 7, "c ungroup" = 9 → width 10
+        hints.push((
+            Line::from(vec![
+                Span::styled("c", key_style),
+                Span::styled(
+                    if app.group_chains { " ungroup" } else { " group" },
+                    hint_style,
+                ),
+            ]),
+            10,
+        ));
+        // "r rename" = 8 → width 10
+        hints.push((
+            Line::from(vec![
+                Span::styled("r", key_style),
+                Span::styled(" rename", hint_style),
+            ]),
+            10,
+        ));
+        // "n new live" = 10, "N new direct" = 13 → width 15
+        hints.push((
+            Line::from(vec![
+                Span::styled(
+                    if app.shift_active { "N" } else { "n" },
+                    if app.shift_active { shift_key_style } else { key_style },
+                ),
+                Span::styled(
+                    if app.shift_active { " new direct" } else { " new live" },
+                    if app.shift_active { shift_hint_style } else { hint_style },
+                ),
+            ]),
+            15,
+        ));
+        // "l live filter" = 13 → width 15
+        hints.push((
+            Line::from(vec![
+                Span::styled("l", shift_key_style),
+                Span::styled(" live filter", shift_hint_style),
+            ]),
+            15,
+        ));
         if is_live {
-            spans.push(Span::styled("x", key_style));
-            spans.push(Span::styled(" stop session  ", hint_style));
+            // "x stop session" = 14 → width 16
+            hints.push((
+                Line::from(vec![
+                    Span::styled("x", key_style),
+                    Span::styled(" stop session", hint_style),
+                ]),
+                16,
+            ));
         }
-        spans.extend_from_slice(&[
-            Span::styled("q", key_style),
-            Span::styled(" quit  ", hint_style),
-            Span::styled("?", shift_key_style),
-            Span::styled(" help", shift_hint_style),
-        ]);
+        // "q quit" = 6 → width 8
+        hints.push((
+            Line::from(vec![
+                Span::styled("q", key_style),
+                Span::styled(" quit", hint_style),
+            ]),
+            8,
+        ));
+        // "? help" = 6 → width 6 (last entry)
+        hints.push((
+            Line::from(vec![
+                Span::styled("?", shift_key_style),
+                Span::styled(" help", shift_hint_style),
+            ]),
+            6,
+        ));
 
-        Paragraph::new(Line::from(spans))
-        .style(bar_style)
-    };
+        // Insert " | " separators between entries
+        let sep_style = Style::default().fg(FG_OVERLAY);
+        let mut separated: Vec<(Line, u16)> = Vec::with_capacity(hints.len() * 2);
+        for (i, hint) in hints.into_iter().enumerate() {
+            if i > 0 {
+                separated.push((Line::from(Span::styled(" | ", sep_style)), 3));
+            }
+            separated.push(hint);
+        }
+        let hints = separated;
 
-    let version_label = format!("v{} ", env!("CARGO_PKG_VERSION"));
-    let version_width = version_label.len() as u16;
-    let bar_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Min(0),
-            Constraint::Length(version_width),
-        ])
-        .split(chunks[1]);
+        let constraints: Vec<Constraint> = hints
+            .iter()
+            .map(|(_, w)| Constraint::Length(*w))
+            .chain(std::iter::once(Constraint::Fill(1)))
+            .collect();
+        let hint_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints(constraints)
+            .split(bar_chunks[0]);
 
-    frame.render_widget(bottom_bar, bar_chunks[0]);
+        for (i, (line, _)) in hints.iter().enumerate() {
+            frame.render_widget(
+                Paragraph::new(line.clone()).style(bar_style),
+                hint_chunks[i],
+            );
+        }
+        // Fill remaining space with bar background
+        frame.render_widget(
+            Paragraph::new("").style(bar_style),
+            hint_chunks[hints.len()],
+        );
+    }
+
     frame.render_widget(
         Paragraph::new(Span::styled(
             version_label,
@@ -529,13 +670,6 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // Rename popup overlay
     if app.mode == AppMode::Renaming {
         draw_rename_popup(frame, &app.rename_text);
-    }
-
-    // Directory browser overlay
-    if app.mode == AppMode::DirBrowser {
-        if let Some(browser) = &app.dir_browser {
-            draw_dir_browser(frame, browser);
-        }
     }
 
     // Update prompt overlay
@@ -563,6 +697,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
 }
 
+/// Convert a slice of conversation messages into a styled ratatui `Text` ready for the preview pane.
+/// Each message is preceded by a role label; messages are separated by a horizontal rule.
 fn build_preview_text(messages: &[PreviewMessage]) -> Text<'static> {
     let mut lines: Vec<Line<'static>> = Vec::new();
 
@@ -613,6 +749,7 @@ fn build_preview_text(messages: &[PreviewMessage]) -> Text<'static> {
     Text::from(lines)
 }
 
+/// Convert raw tmux pane lines into a styled ratatui `Text` for the live preview pane.
 fn build_live_preview_text(lines: &[String]) -> Text<'static> {
     let text_lines: Vec<Line<'static>> = lines.iter().map(|l| {
         Line::from(Span::styled(l.clone(), Style::default().fg(FG_TEXT)))
@@ -620,6 +757,7 @@ fn build_live_preview_text(lines: &[String]) -> Text<'static> {
     Text::from(text_lines)
 }
 
+/// Render the centered popup for naming a new live session, showing a placeholder when the buffer is empty.
 fn draw_naming_popup(frame: &mut Frame, text: &str, placeholder: &str) {
     let area = centered_rect(40, 15, frame.area());
     let area = if area.height < 3 {
@@ -661,6 +799,8 @@ fn draw_naming_popup(frame: &mut Frame, text: &str, placeholder: &str) {
     frame.render_widget(popup, area);
 }
 
+/// Format a millisecond timestamp as a short human-readable relative date
+/// (e.g. `"5m ago"`, `"3h ago"`, `"2d ago"`, or `"Jan 02"` for older dates).
 fn format_relative_date(timestamp_ms: i64) -> String {
     let dt = match Local.timestamp_millis_opt(timestamp_ms) {
         chrono::LocalResult::Single(dt) => dt,
@@ -685,6 +825,8 @@ fn format_relative_date(timestamp_ms: i64) -> String {
     }
 }
 
+/// Estimate the number of terminal rows a `Text` will occupy when word-wrapped to `width` columns.
+/// Used to compute the maximum valid scroll offset before rendering.
 fn estimate_wrapped_height(text: &Text, width: usize) -> usize {
     if width == 0 {
         return text.lines.len();
@@ -702,6 +844,7 @@ fn estimate_wrapped_height(text: &Text, width: usize) -> usize {
         .sum()
 }
 
+/// Render the full-screen help overlay listing all keyboard shortcuts.
 fn render_help_popup(frame: &mut Frame, area: Rect) {
     let popup_area = centered_rect(70, 80, area);
     frame.render_widget(Clear, popup_area);
@@ -728,103 +871,89 @@ fn render_help_popup(frame: &mut Frame, area: Rect) {
         Line::from(""),
         Line::from(vec![Span::styled("  Navigation", header)]),
         Line::from(vec![
-            Span::styled("  j/k  ↑/↓    ", key),
-            Span::styled("Move selection up/down", desc),
+            Span::styled("  j/k  ↑/↓        ", key),
+            Span::styled("Move selection up/down (Shift to scroll preview)", desc),
         ]),
         Line::from(vec![
-            Span::styled("  h/l  ←/→    ", key),
+            Span::styled("  h/l  ←/→        ", key),
             Span::styled("Scroll preview left/right", desc),
         ]),
         Line::from(vec![
-            Span::styled("  Enter       ", key),
-            Span::styled("Open selected session", desc),
+            Span::styled("  Enter           ", key),
+            Span::styled("Open selected session (via tmux)", desc),
         ]),
         Line::from(vec![
-            Span::styled("  Tab/Shift+Tab  ", key),
+            Span::styled("  Shift+Enter     ", key),
+            Span::styled("Open historical session directly (no tmux)", desc),
+        ]),
+        Line::from(vec![
+            Span::styled("  Tab/Shift+Tab   ", key),
             Span::styled("Cycle view mode (tree/flat × name/dir)", desc),
-        ]),
-        Line::from(vec![
-            Span::styled("  Shift+J/K   ", key),
-            Span::styled("Scroll preview pane up/down", desc),
         ]),
         Line::from(""),
         Line::from(vec![Span::styled("  Actions", header)]),
         Line::from(vec![
-            Span::styled("  /           ", key),
+            Span::styled("  /               ", key),
             Span::styled("Enter filter/search mode", desc),
         ]),
         Line::from(vec![
-            Span::styled("  e           ", key),
+            Span::styled("  e               ", key),
             Span::styled("Toggle show empty projects (projects with no active sessions)", desc),
         ]),
         Line::from(vec![
-            Span::styled("  c           ", key),
+            Span::styled("  c               ", key),
             Span::styled("Toggle session grouping — groups are sequences of sessions where", desc),
         ]),
         Line::from(vec![
-            Span::styled("                ", key),
+            Span::styled("                      ", key),
             Span::styled("each was started from the previous one (parent → child)", desc),
         ]),
         Line::from(vec![
-            Span::styled("  n           ", key),
-            Span::styled("Start new live session in current project dir (prompts for name)", desc),
+            Span::styled("  n               ", key),
+            Span::styled("Start new live session", desc),
         ]),
         Line::from(vec![
-            Span::styled("  N           ", key),
-            Span::styled("New live session — browse for directory", desc),
+            Span::styled("  Shift+N         ", key),
+            Span::styled("Open direct claude session (no tmux)", desc),
         ]),
         Line::from(vec![
-            Span::styled("  x           ", key),
+            Span::styled("  x               ", key),
             Span::styled("Stop selected live session gracefully", desc),
         ]),
         Line::from(vec![
-            Span::styled("  L           ", key),
+            Span::styled("  L               ", key),
             Span::styled("Toggle live-only filter", desc),
         ]),
         Line::from(vec![
-            Span::styled("  r           ", key),
+            Span::styled("  r               ", key),
             Span::styled("Rename selected session or live session", desc),
         ]),
         Line::from(vec![
-            Span::styled("  q / Esc     ", key),
+            Span::styled("  q / Esc         ", key),
             Span::styled("Quit", desc),
         ]),
         Line::from(""),
         Line::from(vec![Span::styled("  Filter Mode", header)]),
         Line::from(vec![
-            Span::styled("  Enter       ", key),
+            Span::styled("  Enter           ", key),
             Span::styled("Confirm filter and return to Normal mode", desc),
         ]),
         Line::from(vec![
-            Span::styled("  Esc         ", key),
+            Span::styled("  Esc             ", key),
             Span::styled("Clear filter and return to Normal mode", desc),
         ]),
         Line::from(vec![
-            Span::styled("  Backspace   ", key),
+            Span::styled("  Backspace       ", key),
             Span::styled("Delete last character", desc),
-        ]),
-        Line::from(""),
-        Line::from(vec![Span::styled("  Directory Browser", header)]),
-        Line::from(vec![
-            Span::styled("  Space       ", key),
-            Span::styled("Select current directory", desc),
-        ]),
-        Line::from(vec![
-            Span::styled("  /           ", key),
-            Span::styled("Type a path manually", desc),
-        ]),
-        Line::from(vec![
-            Span::styled("  Esc         ", key),
-            Span::styled("Cancel and close browser", desc),
         ]),
         Line::from(""),
         Line::from(vec![Span::styled("  Rename Mode", header)]),
         Line::from(vec![
-            Span::styled("  Enter       ", key),
+            Span::styled("  Enter           ", key),
             Span::styled("Save new name", desc),
         ]),
         Line::from(vec![
-            Span::styled("  Esc         ", key),
+            Span::styled("  Esc             ", key),
             Span::styled("Cancel rename", desc),
         ]),
         Line::from(""),
@@ -838,6 +967,7 @@ fn render_help_popup(frame: &mut Frame, area: Rect) {
     frame.render_widget(paragraph, inner);
 }
 
+/// Compute a centered `Rect` that is `percent_x`% wide and `percent_y`% tall within `area`.
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
     let popup_layout = Layout::default()
         .direction(Direction::Vertical)
@@ -858,127 +988,8 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
         .split(popup_layout[1])[1]
 }
 
-fn draw_dir_browser(frame: &mut Frame, browser: &crate::app::DirBrowser) {
-    let area = centered_rect(60, 70, frame.area());
-    frame.render_widget(Clear, area);
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(3),
-            Constraint::Length(1),
-        ])
-        .split(area);
-
-    // Path bar
-    let path_content = if browser.input_active {
-        Line::from(vec![
-            Span::styled(&browser.input_text, Style::default().fg(FG_TEXT)),
-            Span::styled("█", Style::default().fg(ACCENT_BLUE)),
-        ])
-    } else {
-        Line::from(Span::styled(
-            browser.current_dir.to_string_lossy().to_string(),
-            Style::default().fg(FG_TEXT),
-        ))
-    };
-
-    let path_bar = Paragraph::new(path_content).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(ACCENT_BLUE))
-            .title(Span::styled(
-                " New Session — Directory ",
-                Style::default()
-                    .fg(ACCENT_BLUE)
-                    .add_modifier(Modifier::BOLD),
-            ))
-            .style(Style::default().bg(BG_SURFACE)),
-    );
-    frame.render_widget(path_bar, chunks[0]);
-
-    // Directory list
-    let items: Vec<ListItem> = browser
-        .entries
-        .iter()
-        .map(|entry| {
-            let style = if entry.name == ".." {
-                Style::default().fg(FG_SUBTEXT)
-            } else {
-                Style::default().fg(ACCENT_GREEN)
-            };
-            let prefix = if entry.is_dir { "📁 " } else { "  " };
-            ListItem::new(Line::from(Span::styled(
-                format!("{}{}", prefix, entry.name),
-                style,
-            )))
-        })
-        .collect();
-
-    let dir_list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(FG_OVERLAY))
-                .style(Style::default().bg(BG_SURFACE)),
-        )
-        .highlight_style(
-            Style::default()
-                .bg(HIGHLIGHT_BG)
-                .fg(ACCENT_BLUE)
-                .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol("▶ ");
-
-    let mut state = ListState::default();
-    state.select(Some(browser.selected));
-    frame.render_stateful_widget(dir_list, chunks[1], &mut state);
-
-    // Help bar
-    let help = Paragraph::new(Line::from(vec![
-        Span::styled(
-            " ↑↓",
-            Style::default()
-                .fg(ACCENT_PEACH)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" nav  ", Style::default().fg(FG_SUBTEXT)),
-        Span::styled(
-            "Enter",
-            Style::default()
-                .fg(ACCENT_PEACH)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" open  ", Style::default().fg(FG_SUBTEXT)),
-        Span::styled(
-            "Space",
-            Style::default()
-                .fg(ACCENT_PEACH)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" select  ", Style::default().fg(FG_SUBTEXT)),
-        Span::styled(
-            "/",
-            Style::default()
-                .fg(ACCENT_PEACH)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" type path  ", Style::default().fg(FG_SUBTEXT)),
-        Span::styled(
-            "Esc",
-            Style::default()
-                .fg(ACCENT_PEACH)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" cancel", Style::default().fg(FG_SUBTEXT)),
-    ]))
-    .style(Style::default().bg(HIGHLIGHT_BG));
-    frame.render_widget(help, chunks[2]);
-}
-
+/// Render the centered rename popup showing the current `text` and a block cursor.
 fn draw_rename_popup(frame: &mut Frame, text: &str) {
     let area = centered_rect(40, 15, frame.area());
     // Ensure minimum usable height of 3 lines
@@ -1010,6 +1021,7 @@ fn draw_rename_popup(frame: &mut Frame, text: &str) {
     frame.render_widget(popup, area);
 }
 
+/// Render the update-available prompt showing the current and new version with y/n options.
 fn draw_update_prompt(frame: &mut Frame, info: &crate::update::UpdateInfo) {
     let area = centered_rect(40, 15, frame.area());
     let area = if area.height < 6 {
@@ -1058,6 +1070,7 @@ fn draw_update_prompt(frame: &mut Frame, info: &crate::update::UpdateInfo) {
     frame.render_widget(popup, area);
 }
 
+/// Render the post-update restart prompt confirming the installed version with y/n options.
 fn draw_restart_prompt(frame: &mut Frame, tag: &str) {
     let area = centered_rect(40, 15, frame.area());
     let area = if area.height < 6 {
@@ -1105,6 +1118,7 @@ fn draw_restart_prompt(frame: &mut Frame, tag: &str) {
     frame.render_widget(popup, area);
 }
 
+/// Truncate `s` to at most `max` display columns, appending `…` if truncated, and right-padding with spaces to exactly `max` columns.
 fn truncate(s: &str, max: usize) -> String {
     let width = s.width();
     if width <= max {
@@ -1126,6 +1140,8 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+/// Like `truncate` but truncates from the left, prepending `…` when the string exceeds `max` columns.
+/// Useful for long directory paths where the end (project name) is most relevant.
 fn truncate_left(s: &str, max: usize) -> String {
     let width = s.width();
     if width <= max {
@@ -1150,6 +1166,8 @@ fn truncate_left(s: &str, max: usize) -> String {
     }
 }
 
+/// Like `truncate_left` but returns the raw string without trailing space padding,
+/// used for header labels in the tree view where padding is not needed.
 fn truncate_left_plain(s: &str, max: usize) -> String {
     let width = s.width();
     if width <= max {

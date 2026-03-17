@@ -1,6 +1,7 @@
 mod app;
 mod config;
 mod data;
+mod keys;
 mod live;
 mod ui;
 mod update;
@@ -17,6 +18,8 @@ use ratatui::Terminal;
 use std::io;
 use std::path::PathBuf;
 
+/// Enable raw mode, switch to the alternate screen, request keyboard enhancement flags,
+/// and return an initialised ratatui `Terminal`.
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
     terminal::enable_raw_mode()?;
     io::stdout().execute(EnterAlternateScreen)?;
@@ -30,6 +33,7 @@ fn setup_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
     Ok(terminal)
 }
 
+/// Pop keyboard enhancement flags, disable raw mode, and leave the alternate screen.
 fn restore_terminal() -> Result<()> {
     let _ = io::stdout().execute(PopKeyboardEnhancementFlags);
     terminal::disable_raw_mode()?;
@@ -37,6 +41,9 @@ fn restore_terminal() -> Result<()> {
     Ok(())
 }
 
+/// Run the main TUI event loop. Spawns a background update check, handles session
+/// launches and in-place binary updates, and returns `true` if the process should
+/// exec-restart itself (e.g. after a self-update).
 fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     sessions: Vec<data::SessionInfo>,
@@ -107,15 +114,29 @@ fn run_app(
                     let dir = if std::path::Path::new(&cwd).exists() { &cwd } else { "." };
                     let live_sessions = live::discover_live_sessions();
                     let tmux_name = live::generate_auto_name(dir, &live_sessions);
-                    live::start_live_session(&tmux_name, dir, &["--resume", &session_id])?;
+                    live::start_live_session(&tmux_name, dir, &["claude", "--resume", &session_id])?;
                     live::attach_to_session(&tmux_name)?;
+                }
+                app::LaunchRequest::Direct { session_id, cwd } => {
+                    let dir = if std::path::Path::new(&cwd).exists() { &cwd } else { "." };
+                    std::process::Command::new("claude")
+                        .arg("--resume")
+                        .arg(&session_id)
+                        .current_dir(dir)
+                        .status()?;
                 }
                 app::LaunchRequest::AttachLive { tmux_name } => {
                     live::attach_to_session(&tmux_name)?;
                 }
                 app::LaunchRequest::NewLive { name, cwd } => {
-                    live::start_live_session(&name, &cwd, &["--name", &name])?;
+                    live::start_live_session(&name, &cwd, &["claude", "--name", &name])?;
                     live::attach_to_session(&name)?;
+                }
+                app::LaunchRequest::NewDirect { cwd } => {
+                    let dir = if std::path::Path::new(&cwd).exists() { &cwd } else { "." };
+                    std::process::Command::new("claude")
+                        .current_dir(dir)
+                        .status()?;
                 }
             }
             // Reload sessions after returning from any launch
@@ -150,8 +171,11 @@ fn run_app(
     Ok(app.should_restart)
 }
 
+/// Entry point. Parses CLI arguments, loads sessions, sets up the terminal and runs the TUI.
+/// On `--new` starts a new live session and immediately attaches to it, bypassing the TUI.
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let new_session = args.iter().any(|a| a == "--new");
     let live_start = args.iter().any(|a| a == "--live");
     let flat = args.iter().any(|a| a == "--flat") || live_start;
     let filter_path = args.iter().find(|a| !a.starts_with('-')).map(|arg| {
@@ -159,6 +183,21 @@ fn main() -> Result<()> {
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|_| arg.clone())
     });
+
+    if new_session {
+        let cwd = std::env::current_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| ".".to_string());
+        let live_sessions = live::discover_live_sessions();
+        let tmux_name = live::generate_auto_name(&cwd, &live_sessions);
+        let exe = std::env::current_exe()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| "ccsm".to_string());
+        let shell_cmd = format!("claude; exec {}", exe);
+        live::start_live_session(&tmux_name, &cwd, &["sh", "-c", &shell_cmd])?;
+        live::attach_to_session(&tmux_name)?;
+        return Ok(());
+    }
 
     let sessions = data::load_sessions(filter_path.as_deref())?;
     if sessions.is_empty() && !live::is_server_running() {
