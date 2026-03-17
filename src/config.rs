@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 /// Controls how session entries are labelled in the list.
@@ -44,6 +45,9 @@ pub struct Config {
     /// When true, only projects with active live sessions are shown.
     #[serde(default)]
     pub live_filter: bool,
+    /// Set of project paths that are pinned to the top of the list.
+    #[serde(default)]
+    pub favorites: HashSet<String>,
 }
 
 impl Default for Config {
@@ -55,6 +59,7 @@ impl Default for Config {
             group_chains: true,
             last_update_check: None,
             live_filter: false,
+            favorites: HashSet::new(),
         }
     }
 }
@@ -139,6 +144,7 @@ mod tests {
             group_chains: false,
             last_update_check: None,
             live_filter: false,
+            favorites: HashSet::new(),
         };
         let json = serde_json::to_string_pretty(&config).unwrap();
         let loaded: Config = serde_json::from_str(&json).unwrap();
@@ -174,6 +180,7 @@ mod tests {
             group_chains: true,
             last_update_check: None,
             live_filter: false,
+            favorites: HashSet::new(),
         };
         let json = serde_json::to_string_pretty(&config).unwrap();
         let mut file = std::fs::File::create(&path).unwrap();
@@ -233,6 +240,7 @@ mod tests {
             group_chains: true,
             last_update_check: None,
             live_filter: false,
+            favorites: HashSet::new(),
         };
         let json = serde_json::to_string(&config).unwrap();
         assert!(json.contains("\"short_dir\""));
@@ -270,5 +278,32 @@ mod tests {
         let json = r#"{"tree_view": true, "display_mode": "name", "hide_empty": true}"#;
         let config: Config = serde_json::from_str(json).unwrap();
         assert_eq!(config.last_update_check, None);
+    }
+
+    #[test]
+    fn test_config_backward_compat_without_favorites() {
+        let json = r#"{"tree_view": true, "display_mode": "name"}"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert!(config.favorites.is_empty());
+    }
+
+    #[test]
+    fn test_config_favorites_roundtrip() {
+        let mut favorites = HashSet::new();
+        favorites.insert("/Users/sane/Dev/ccsm".to_string());
+        favorites.insert("/Users/sane/Dev/other".to_string());
+        let config = Config {
+            favorites: favorites.clone(),
+            ..Config::default()
+        };
+        let json = serde_json::to_string_pretty(&config).unwrap();
+        let loaded: Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.favorites, favorites);
+    }
+
+    #[test]
+    fn test_config_default_has_empty_favorites() {
+        let config = Config::default();
+        assert!(config.favorites.is_empty());
     }
 }

@@ -28,15 +28,24 @@ impl App {
                         if let Some(cwd) = cwd {
                             for session in &mut self.sessions {
                                 if session.project == cwd && session.name.as_deref() == Some(&tmux_name) {
-                                    let _ = data::save_custom_title(&session.project, &session.session_id, &new_name);
+                                    if let Err(e) = data::save_custom_title(&session.project, &session.session_id, &new_name) {
+                                        eprintln!("Failed to save custom title: {e}");
+                                    }
                                     session.name = Some(new_name.clone());
                                 }
                             }
                             self.preview_cache.clear();
                         }
-                        let _ = std::process::Command::new("tmux")
+                        match std::process::Command::new("tmux")
                             .args(["-L", live::TMUX_SOCKET, "rename-session", "-t", &tmux_name, &new_name])
-                            .output();
+                            .output()
+                        {
+                            Err(e) => eprintln!("Failed to rename tmux session: {e}"),
+                            Ok(out) if !out.status.success() => {
+                                eprintln!("Failed to rename tmux session: {}", String::from_utf8_lossy(&out.stderr).trim());
+                            }
+                            Ok(_) => {}
+                        }
                         self.live_sessions = live::discover_live_sessions();
                         self.live_preview_cache.clear();
                         self.recompute_flat_rows();
@@ -388,6 +397,11 @@ impl App {
                         self.mode = AppMode::NamingSession;
                     }
                 }
+                (KeyCode::Char('f'), KeyModifiers::NONE) => {
+                    self.toggle_favorite();
+                    self.recompute_flat_rows();
+                    self.recompute_tree();
+                }
                 (KeyCode::Char('l'), KeyModifiers::NONE) => {
                     self.live_filter = !self.live_filter;
                     self.recompute_flat_rows();
@@ -502,7 +516,7 @@ impl App {
                                 }
                                 self.recompute_tree();
                             }
-                            None => {}
+                            Some(TreeRow::FavoritesSeparator) | None => {}
                         }
                     } else {
                         match self.flat_rows.get(self.selected).cloned() {
@@ -590,7 +604,7 @@ impl App {
                                 }
                             }
                         }
-                        None => {}
+                        Some(TreeRow::FavoritesSeparator) | None => {}
                     }
                 }
                 _ => {}

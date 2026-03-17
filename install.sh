@@ -4,10 +4,13 @@ set -euo pipefail
 BINARY_NAME="ccsm"
 INSTALL_DIR="${HOME}/.local/bin"
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR"
+
 echo "Building ${BINARY_NAME} in release mode..."
 cargo build --release
 
-BINARY_PATH="$(cd "$(dirname "$0")" && pwd)/target/release/${BINARY_NAME}"
+BINARY_PATH="${SCRIPT_DIR}/target/release/${BINARY_NAME}"
 
 if [[ ! -f "$BINARY_PATH" ]]; then
     echo "Error: binary not found at ${BINARY_PATH}"
