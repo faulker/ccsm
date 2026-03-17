@@ -66,11 +66,13 @@ pub fn ensure_server_configured() {
     // Within tmux double-quoted strings, \\ is a literal backslash.
     // For bind-key in config files, single-quote the key spec to avoid backslash escape issues.
     let conf_content = concat!(
+        "set -g history-limit 50000\n",
+        "set -g mouse on\n",
+        "set -g default-terminal \"tmux-256color\"\n",
         "set -g status on\n",
+        "set -g status-interval 1\n",
         "set -g status-style \"bg=#1e1e2e,fg=#cdd6f4\"\n",
-        "set -g status-left \"\"\n",
-        "set -g status-right \"#[fg=#f38ba8,bold]Ctrl+\\\\ #[fg=#a6adc8]detach  #[fg=#f38ba8,bold]Ctrl+n #[fg=#a6adc8]next  #[fg=#f38ba8,bold]Ctrl+p #[fg=#a6adc8]prev\"\n",
-        "set -g status-right-length 60\n",
+        "set -g status-format[0] \"#[align=left,bg=#1e1e2e,fg=#cdd6f4]#[align=centre]#{?pane_in_mode,#[fg=#f38ba8 bold]Hit the ESC key to exit scroll mode}#[align=right]#[fg=#f38ba8 bold]Ctrl+\\\\ #[fg=#a6adc8]detach  #[fg=#f38ba8 bold]Ctrl+n #[fg=#a6adc8]next  #[fg=#f38ba8 bold]Ctrl+p #[fg=#a6adc8]prev \"\n",
         "unbind-key -q -n C-]\n",
         "unbind-key -q -n C-[\n",
         "bind-key -n 'C-\\' detach-client\n",
@@ -125,6 +127,7 @@ pub fn attach_to_session(name: &str) -> anyhow::Result<()> {
     if !is_tmux_available() {
         anyhow::bail!("tmux is not installed — live sessions require tmux");
     }
+    ensure_server_configured();
     let status = std::process::Command::new("tmux")
         .args(["-L", TMUX_SOCKET, "attach-session", "-t", name])
         .status()?;
