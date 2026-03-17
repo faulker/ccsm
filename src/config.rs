@@ -1,16 +1,21 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// Controls how session entries are labelled in the list.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum DisplayMode {
+    /// Show only the project directory's base name.
     #[default]
     Name,
+    /// Show the last two path components (e.g. `Dev/ccsm`).
     ShortDir,
+    /// Show the full absolute path.
     FullDir,
 }
 
 impl DisplayMode {
+    /// Returns the short human-readable label shown in the UI title bar.
     pub fn label(self) -> &'static str {
         match self {
             Self::Name => "[name]",
@@ -20,16 +25,23 @@ impl DisplayMode {
     }
 }
 
+/// Persisted application configuration stored in `~/.config/ccsm/config.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    /// Whether to use the tree view (true) or flat list view (false).
     pub tree_view: bool,
+    /// How session labels are displayed in the list.
     pub display_mode: DisplayMode,
+    /// When true, sessions with no JSONL data are hidden from the list.
     #[serde(default = "default_true")]
     pub hide_empty: bool,
+    /// When true, sessions sharing a slug are grouped into a single chain entry.
     #[serde(default = "default_true")]
     pub group_chains: bool,
+    /// Unix timestamp (seconds) of the last update check, or `None` if never checked.
     #[serde(default)]
     pub last_update_check: Option<i64>,
+    /// When true, only projects with active live sessions are shown.
     #[serde(default)]
     pub live_filter: bool,
 }
@@ -47,16 +59,19 @@ impl Default for Config {
     }
 }
 
+/// Serde default helper that returns `true`.
 fn default_true() -> bool {
     true
 }
 
+/// Returns the platform-specific path to `ccsm/config.json` inside the user's config directory.
 fn config_path() -> Option<PathBuf> {
     let base = dirs::config_dir().or_else(|| dirs::home_dir().map(|h| h.join(".config")))?;
     Some(base.join("ccsm").join("config.json"))
 }
 
 impl Config {
+    /// Load the config from disk, returning `Config::default()` if the file does not exist or cannot be parsed.
     pub fn load() -> Self {
         config_path()
             .and_then(|path| std::fs::read_to_string(path).ok())
@@ -64,6 +79,7 @@ impl Config {
             .unwrap_or_default()
     }
 
+    /// Returns true if no update check has been performed in the last 24 hours.
     #[allow(dead_code)]
     pub fn should_check_for_update(&self) -> bool {
         match self.last_update_check {
@@ -75,11 +91,13 @@ impl Config {
         }
     }
 
+    /// Records the current time as the last update check timestamp and saves the config.
     pub fn mark_update_checked(&mut self) -> anyhow::Result<()> {
         self.last_update_check = Some(chrono::Utc::now().timestamp());
         self.save()
     }
 
+    /// Serialize the config to pretty-printed JSON and write it to the config file path.
     pub fn save(&self) -> anyhow::Result<()> {
         let path = config_path().ok_or_else(|| anyhow::anyhow!("Could not determine config directory"))?;
         if let Some(parent) = path.parent() {

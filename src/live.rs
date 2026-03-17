@@ -2,13 +2,19 @@
 
 pub const TMUX_SOCKET: &str = "ccsm";
 
+/// A running tmux session managed by ccsm on the dedicated `ccsm` tmux socket.
 pub struct LiveSession {
+    /// The tmux session name used to target it in tmux commands.
     pub tmux_name: String,
+    /// The name shown in the UI (same as `tmux_name` unless renamed).
     pub display_name: String,
+    /// Working directory of the tmux session (from `#{session_path}`).
     pub cwd: String,
+    /// Base name of the working directory, used as a short project label.
     pub project_name: String,
 }
 
+/// Returns true if the ccsm tmux server is currently running (i.e. `tmux -L ccsm list-sessions` succeeds).
 pub fn is_server_running() -> bool {
     std::process::Command::new("tmux")
         .args(["-L", TMUX_SOCKET, "list-sessions"])
@@ -17,6 +23,8 @@ pub fn is_server_running() -> bool {
         .unwrap_or(false)
 }
 
+/// Query the ccsm tmux server for all running sessions and return them as `LiveSession` values.
+/// Returns an empty vec if the server is not running or the command fails.
 pub fn discover_live_sessions() -> Vec<LiveSession> {
     if !is_server_running() {
         return vec![];
@@ -52,6 +60,7 @@ pub fn discover_live_sessions() -> Vec<LiveSession> {
         .collect()
 }
 
+/// Returns the path to the ccsm tmux configuration file (`~/.config/ccsm/tmux.conf`).
 pub fn conf_path() -> std::path::PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
@@ -60,6 +69,7 @@ pub fn conf_path() -> std::path::PathBuf {
         .join("tmux.conf")
 }
 
+/// Write the ccsm tmux config file and, if the server is already running, source it to apply changes.
 pub fn ensure_server_configured() {
     let conf_path = conf_path();
     let _ = std::fs::create_dir_all(conf_path.parent().unwrap());
@@ -88,6 +98,7 @@ pub fn ensure_server_configured() {
         .output();
 }
 
+/// Returns true if `tmux` is installed and reachable on the system PATH.
 pub fn is_tmux_available() -> bool {
     std::process::Command::new("tmux")
         .arg("-V")
@@ -96,7 +107,9 @@ pub fn is_tmux_available() -> bool {
         .unwrap_or(false)
 }
 
-pub fn start_live_session(name: &str, cwd: &str, claude_args: &[&str]) -> anyhow::Result<()> {
+/// Create a new detached tmux session named `name` with working directory `cwd`,
+/// running `cmd` as the initial command. Starts the ccsm tmux server if needed.
+pub fn start_live_session(name: &str, cwd: &str, cmd: &[&str]) -> anyhow::Result<()> {
     if !is_tmux_available() {
         anyhow::bail!("tmux is not installed — live sessions require tmux");
     }
@@ -110,9 +123,8 @@ pub fn start_live_session(name: &str, cwd: &str, claude_args: &[&str]) -> anyhow
         "new-session", "-d",
         "-s", name,
         "-c", cwd,
-        "claude",
     ];
-    cmd_args.extend(claude_args);
+    cmd_args.extend(cmd);
     let output = std::process::Command::new("tmux")
         .args(&cmd_args)
         .output()?;
@@ -123,6 +135,7 @@ pub fn start_live_session(name: &str, cwd: &str, claude_args: &[&str]) -> anyhow
     Ok(())
 }
 
+/// Attach the current process to the named tmux session on the ccsm socket.
 pub fn attach_to_session(name: &str) -> anyhow::Result<()> {
     if !is_tmux_available() {
         anyhow::bail!("tmux is not installed — live sessions require tmux");
@@ -137,6 +150,7 @@ pub fn attach_to_session(name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Send Ctrl+C to interrupt any running process, then kill the named tmux session.
 pub fn stop_live_session(name: &str) -> anyhow::Result<()> {
     // Send Ctrl+C to interrupt any running process before killing the session
     let _ = std::process::Command::new("tmux")
@@ -152,6 +166,8 @@ pub fn stop_live_session(name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Capture the last `lines` lines from the pane of the named tmux session.
+/// Returns an empty vec if the session does not exist or the command fails.
 pub fn poll_pane_buffer(name: &str, lines: usize) -> Vec<String> {
     let lines_str = format!("-{}", lines);
     let output = std::process::Command::new("tmux")
@@ -172,6 +188,9 @@ pub fn poll_pane_buffer(name: &str, lines: usize) -> Vec<String> {
     }
 }
 
+/// Generate a unique session name of the form `<project>-A`, `<project>-B`, etc.,
+/// skipping letters already used by sessions in `existing`. Falls back to numeric
+/// suffixes starting at 27 once all 26 letters are taken.
 pub fn generate_auto_name(cwd: &str, existing: &[LiveSession]) -> String {
     let project = std::path::Path::new(cwd)
         .file_name()

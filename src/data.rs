@@ -6,39 +6,60 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
+/// Summary record for one Claude session, built from `~/.claude/history.jsonl`.
 #[derive(Debug, Clone)]
 pub struct SessionInfo {
+    /// Unique session identifier (UUID-like string from Claude).
     pub session_id: String,
+    /// Absolute path of the project directory.
     pub project: String,
+    /// Base name of the project directory, used for display.
     pub project_name: String,
+    /// Earliest entry timestamp seen for this session (milliseconds).
     pub first_timestamp: i64,
+    /// Most recent entry timestamp seen for this session (milliseconds).
     pub last_timestamp: i64,
+    /// Number of history entries belonging to this session.
     pub entry_count: usize,
+    /// True if a corresponding JSONL session file exists on disk.
     pub has_data: bool,
+    /// Optional custom title set by the user via the rename feature.
     pub name: Option<String>,
+    /// Optional slug read from the session JSONL, used to group chained sessions.
     pub slug: Option<String>,
 }
 
+/// Metadata extracted from a session JSONL file used to populate the details bar.
 #[derive(Debug, Clone, Default)]
 pub struct SessionMeta {
+    /// Working directory recorded in the session file.
     pub cwd: Option<String>,
+    /// Git branch recorded in the session file.
     pub git_branch: Option<String>,
+    /// Session ID (usually the most recent in a chain).
     pub session_id: Option<String>,
+    /// Custom title set via `custom-title` entries, if any.
     pub session_name: Option<String>,
+    /// All session IDs that make up the chain, sorted oldest to newest.
     pub all_session_ids: Vec<String>,
 }
 
+/// A single conversation turn shown in the preview pane.
 #[derive(Debug, Clone)]
 pub struct PreviewMessage {
+    /// Role of the speaker: `"user"`, `"assistant"`, or `"system"`.
     pub role: String,
+    /// Plain text content of the message (XML tags stripped).
     pub text: String,
 }
 
+/// Minimal deserialization target used to extract the `slug` field from a JSONL line.
 #[derive(Deserialize)]
 struct SlugLine {
     slug: Option<String>,
 }
 
+/// One line from `~/.claude/history.jsonl`, capturing session identity and timing.
 #[derive(Deserialize)]
 struct HistoryEntry {
     #[serde(default)]
@@ -50,6 +71,7 @@ struct HistoryEntry {
     session_id: Option<String>,
 }
 
+/// One line from a session JSONL file.
 #[derive(Deserialize)]
 struct SessionEntry {
     #[serde(rename = "type")]
@@ -64,19 +86,24 @@ struct SessionEntry {
     custom_title: Option<String>,
 }
 
+/// The message object nested inside a `SessionEntry`.
 #[derive(Deserialize)]
 struct MessageData {
     role: Option<String>,
     content: Option<ContentValue>,
 }
 
+/// Message content is either a plain string or an array of typed content blocks.
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum ContentValue {
+    /// Simple text-only content.
     Text(String),
+    /// Structured content blocks (e.g. text, thinking, tool_use).
     Blocks(Vec<ContentBlock>),
 }
 
+/// A single block within a structured content array.
 #[derive(Deserialize)]
 struct ContentBlock {
     #[serde(rename = "type")]
@@ -133,6 +160,8 @@ pub fn strip_xml_tags(input: &str) -> String {
     result
 }
 
+/// Load all sessions from `~/.claude/history.jsonl`, optionally restricting to entries
+/// whose project path starts with `filter_path`. Returns sessions sorted by most recent activity.
 pub fn load_sessions(filter_path: Option<&str>) -> Result<Vec<SessionInfo>> {
     let history_path = dirs::home_dir()
         .context("No home directory")?
@@ -216,10 +245,13 @@ pub fn load_sessions(filter_path: Option<&str>) -> Result<Vec<SessionInfo>> {
     Ok(result)
 }
 
+/// Convert an absolute project path to the directory name Claude uses on disk
+/// by replacing every non-alphanumeric character with a hyphen.
 fn project_to_dir_name(project: &str) -> String {
     project.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect()
 }
 
+/// Returns the path to a session's JSONL file under `~/.claude/projects/`, or `None` if it does not exist.
 fn session_file_path(project: &str, session_id: &str) -> Option<PathBuf> {
     let home = dirs::home_dir()?;
     let dir_name = project_to_dir_name(project);
@@ -260,6 +292,7 @@ fn read_slug(path: &Path) -> Option<String> {
     None
 }
 
+/// Format a millisecond timestamp as a short local date string (e.g. `"Jan 02 15:04"`).
 fn format_session_boundary_date(timestamp_ms: i64) -> String {
     match Local.timestamp_millis_opt(timestamp_ms) {
         chrono::LocalResult::Single(dt) => dt.format("%b %d %H:%M").to_string(),
@@ -411,6 +444,7 @@ pub fn load_chain_preview(sessions: &[&SessionInfo]) -> (SessionMeta, Vec<Previe
     (combined_meta, all_messages)
 }
 
+/// Load the most recent 20 messages from a single session for display in the preview pane.
 pub fn load_preview(project: &str, session_id: &str) -> (SessionMeta, Vec<PreviewMessage>) {
     let (meta, messages) = load_session_messages(project, session_id);
     // Keep last 20 turns

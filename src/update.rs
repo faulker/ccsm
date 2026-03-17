@@ -3,13 +3,18 @@ use serde::Deserialize;
 use std::cmp::Ordering;
 use std::io::Read;
 
+/// A semantic version triple parsed from a version string such as `"v1.2.3"`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Version {
+    /// Major version number.
     pub major: u32,
+    /// Minor version number.
     pub minor: u32,
+    /// Patch version number.
     pub patch: u32,
 }
 
+/// Lexicographic ordering on (major, minor, patch).
 impl Ord for Version {
     fn cmp(&self, other: &Self) -> Ordering {
         self.major
@@ -19,48 +24,64 @@ impl Ord for Version {
     }
 }
 
+/// Delegates to `Ord`.
 impl PartialOrd for Version {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
+/// Formats the version as `"major.minor.patch"`.
 impl std::fmt::Display for Version {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
     }
 }
 
+/// Information about an available update returned by `check_for_update`.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct UpdateInfo {
+    /// The version currently running.
     pub current: Version,
+    /// The newest version available on GitHub Releases.
     pub latest: Version,
+    /// Direct download URL for the release asset matching the current platform.
     pub download_url: String,
+    /// The full GitHub release tag (e.g. `"v1.2.0"`).
     pub tag: String,
 }
 
+/// Tracks the state of the background update check and download lifecycle.
 #[derive(Debug, Clone)]
 pub enum UpdateStatus {
+    /// No update is available or the check has not completed yet.
     None,
+    /// An update is available with the given info; user has not responded yet.
     Available(UpdateInfo),
+    /// The user confirmed and a download is in progress.
     Downloading,
+    /// The update was installed successfully; the string is the new version tag.
     Done(String),
+    /// The update attempt failed; the string describes the error.
     Failed(String),
 }
 
+/// Subset of the GitHub Releases API response used for update checks.
 #[derive(Deserialize)]
 struct GitHubRelease {
     tag_name: String,
     assets: Vec<ReleaseAsset>,
 }
 
+/// A single release asset (binary archive) attached to a GitHub release.
 #[derive(Deserialize)]
 struct ReleaseAsset {
     name: String,
     browser_download_url: String,
 }
 
+/// Parse a version string like `"1.2.3"` or `"v1.2.3"` into a `Version`, returning `None` on failure.
 pub fn parse_version(s: &str) -> Option<Version> {
     let s = s.strip_prefix('v').unwrap_or(s);
     let parts: Vec<&str> = s.split('.').collect();
@@ -74,6 +95,8 @@ pub fn parse_version(s: &str) -> Option<Version> {
     })
 }
 
+/// Returns the expected GitHub release asset filename for the current OS/arch and the given release tag.
+/// Returns `None` for unsupported platforms.
 pub fn asset_name_for_current_platform(tag: &str) -> Option<String> {
     let (target, ext) = match (std::env::consts::ARCH, std::env::consts::OS) {
         ("aarch64", "macos") => ("aarch64-apple-darwin", "tar.gz"),
@@ -86,6 +109,8 @@ pub fn asset_name_for_current_platform(tag: &str) -> Option<String> {
     Some(format!("ccsm-{}-{}.{}", tag, target, ext))
 }
 
+/// Query the GitHub Releases API for the latest ccsm release and return `UpdateInfo`
+/// if a newer version is available for the current platform, otherwise `None`.
 pub fn check_for_update() -> Option<UpdateInfo> {
     let current = parse_version(env!("CARGO_PKG_VERSION"))?;
 
@@ -113,6 +138,8 @@ pub fn check_for_update() -> Option<UpdateInfo> {
     })
 }
 
+/// Download the release archive from `info.download_url`, extract it, and replace the
+/// running binary in-place. On failure the original binary is restored from a backup.
 pub fn perform_update(info: &UpdateInfo) -> Result<()> {
     const MAX_DOWNLOAD_SIZE: u64 = 50 * 1024 * 1024;
 
@@ -173,6 +200,8 @@ pub fn perform_update(info: &UpdateInfo) -> Result<()> {
     Ok(())
 }
 
+/// Extract a `.tar.gz` archive from `bytes` into `dest`, rejecting any entry with
+/// an absolute or path-traversal component to prevent directory traversal attacks.
 fn extract_tar_gz(bytes: &[u8], dest: &std::path::Path) -> Result<()> {
     let decoder = flate2::read::GzDecoder::new(bytes);
     let mut archive = tar::Archive::new(decoder);
@@ -195,6 +224,7 @@ fn extract_tar_gz(bytes: &[u8], dest: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// Extract a `.zip` archive from `bytes` into `dest`, rejecting entries with path-traversal names.
 fn extract_zip(bytes: &[u8], dest: &std::path::Path) -> Result<()> {
     let cursor = std::io::Cursor::new(bytes);
     let mut archive = zip::ZipArchive::new(cursor).context("Failed to read zip archive")?;
@@ -220,6 +250,7 @@ fn extract_zip(bytes: &[u8], dest: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// Search `dir` (and one level of subdirectories) for the ccsm binary and return its path.
 fn find_binary(dir: &std::path::Path) -> Option<std::path::PathBuf> {
     let binary_name = if cfg!(windows) { "ccsm.exe" } else { "ccsm" };
 

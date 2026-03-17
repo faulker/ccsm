@@ -9,48 +9,6 @@ Sessions grouped by project with an expanded group showing individual sessions. 
 
 ![Tree view with session preview](screenshots/session-tree-view.png)
 
-### Display Modes
-
-Cycle through display modes with `Tab` to change how projects are labeled in the session list.
-
-**Tree view — project:**
-
-![Tree view with project labels](screenshots/sessions-tree-project-view.png)
-
-**Tree view — short directory path:**
-
-![Tree view with short directory labels](screenshots/sessions-tree-short-dir-view.png)
-
-**Tree view — full directory path:**
-
-![Tree view with full directory labels](screenshots/sessions-tree-full-dir-view.png)
-
-### Flat View
-
-All sessions in a single chronological list with project name, relative timestamp, and message count.
-
-**Flat view — project name:**
-
-![Flat view with name labels](screenshots/sessions-flat-name-view.png)
-
-**Flat view — short directory path:**
-
-![Flat view with short directory labels](screenshots/sessions-flat-short-dir-view.png)
-
-**Flat view — full directory path:**
-
-![Flat view with full directory labels](screenshots/sessions-flat-full-dir-view.png)
-
-### Rename Session
-Press `r` to rename a session with a custom title that appears alongside the timestamp and message count.
-
-![Rename session dialog](screenshots/rename-session-dialog.png)
-
-### Directory Browser
-Press `N` to open a full directory browser overlay for starting a new Claude session in any directory.
-
-![New session directory picker](screenshots/new-session-directory-picker.png)
-
 ## Features
 
 - **Tree view** (default) — sessions grouped by project, collapsed on startup, expand/collapse with arrow keys
@@ -58,9 +16,9 @@ Press `N` to open a full directory browser overlay for starting a new Claude ses
 - **Display modes** — cycle through Name, Short Dir, and Full Dir labels for project groups in tree view
 - Shows a scrollable preview of conversation messages (last 20 turns)
 - **Session info bar** — displays working directory and git branch for the selected session; shows the project directory even when a header row is selected with no active session
-- Resume any session directly — opens `claude --resume <id>` in the original project directory
+- Resume any session via tmux (`Enter`) or directly in the foreground without tmux (`Shift+Enter`)
 - **Live sessions** — start and manage tmux-backed Claude sessions; running sessions appear at the top of the list with a live indicator
-- **New session** — start a new live session in the selected project's directory (`n`, prompts for a name) or browse to any directory (`N`)
+- **New session** — start a new live session in the selected project's directory (`n`, prompts for a name) or browse to any directory (`N`); or bypass the TUI entirely with `ccsm --new` to start a session in the current directory
 - **Directory browser** — full overlay for navigating the filesystem, with path input and directory listing
 - **Live-only filter** — toggle with `Shift+L` to show only running sessions; persisted in config
 - **Stop live session** — kill the selected running session with `x`
@@ -83,6 +41,8 @@ Press `N` to open a full directory browser overlay for starting a new Claude ses
 - [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) installed and on your `PATH`
 - Existing session history in `~/.claude/`
 - `tmux` installed for live session support (optional — history browsing works without it)
+  - **macOS:** `brew install tmux` (requires [Homebrew](https://brew.sh))
+  - **Linux:** `sudo apt install tmux` / `sudo dnf install tmux` / your distro's package manager
 
 ## Install
 
@@ -147,6 +107,14 @@ Use `--live` to start directly in live-only filter mode (implies `--flat`), show
 ./target/release/ccsm --live
 ```
 
+Use `--new` to immediately start a new live Claude session in the current directory and attach to it, without opening the TUI. After Claude exits, ccsm relaunches automatically:
+
+```sh
+./target/release/ccsm --new
+# or from anywhere:
+ccsm --new
+```
+
 ## Key Bindings
 
 | Key | Action |
@@ -155,7 +123,8 @@ Use `--live` to start directly in live-only filter mode (implies `--flat`), show
 | `k` / `↑` | Previous session |
 | `l` / `→` | Expand group (tree view) |
 | `h` / `←` | Collapse group (tree view) |
-| `Enter` | Resume session / attach to live session / toggle group |
+| `Enter` | Resume session in tmux / attach to live session / toggle group |
+| `Shift+Enter` | Resume historical session directly in the foreground (no tmux) |
 | `Tab` / `Shift+Tab` | Cycle: tree [name] → tree [short dir] → tree [full dir] → flat → tree [name] |
 | `Shift+J` | Scroll preview down |
 | `Shift+K` | Scroll preview up |
@@ -270,11 +239,12 @@ Settings are persisted to `~/.config/ccsm/config.json` and automatically saved w
 4. Filters to user/assistant messages and displays the last 20 turns as a preview
 5. On startup, spawns a background thread to check GitHub Releases for newer versions (respects 24h cooldown)
 6. Session custom titles are loaded in the background to avoid blocking startup
-7. On `Enter` (history session), suspends the TUI and runs `claude --resume <id>` in the session's original directory; on return, sessions are reloaded
+7. On `Enter` (history session), wraps the resume in a new tmux live session and attaches to it; on `Shift+Enter`, runs `claude --resume <id>` directly in the foreground without tmux; on return, sessions are reloaded
 8. On `Enter` (live session), attaches to the tmux session and suspends the TUI; detach with `Ctrl+\` to return
 9. On `n`/`N`, prompts for a session name then starts a new detached tmux session running `claude` in the chosen directory and attaches to it; uses a dedicated tmux server (`-L ccsm`) with a custom status bar
-10. If the user accepts an update, the TUI suspends, downloads the new binary, replaces the current executable, and resumes
-11. After Claude exits, the TUI resumes and reloads the session list
+10. With `--new`, skips the TUI, creates a live tmux session in the current directory, attaches immediately, and re-execs ccsm when Claude exits
+11. If the user accepts an update, the TUI suspends, downloads the new binary, replaces the current executable, and resumes
+12. After Claude exits, the TUI resumes and reloads the session list
 
 ## Dependencies
 
@@ -286,7 +256,9 @@ Settings are persisted to `~/.config/ccsm/config.json` and automatically saved w
 - `anyhow` — error handling
 - `ureq` — lightweight HTTP client for GitHub Releases API
 - `flate2` — gzip decompression for release archives
-- `tar` — tar archive extraction
+- `tar` / `zip` — archive extraction for release downloads
+- `tempfile` — temporary directories for safe binary replacement
+- `unicode-width` — correct text width calculation for multi-byte characters
 
 ## Tests
 
