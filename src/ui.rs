@@ -494,210 +494,145 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             hint_style
         };
 
-        let mut hints: Vec<(Line, u16)> = Vec::new();
+        fn hint_width(line: &Line) -> u16 {
+            line.spans.iter().map(|s| s.content.width() as u16).sum()
+        }
+
+        let mut hints: Vec<Line> = Vec::new();
 
         // Show post-update status in help bar
         match &app.update_status {
             UpdateStatus::Downloading => {
-                let text = " Updating... ".to_string();
-                let width = text.len() as u16;
-                hints.push((
-                    Line::from(Span::styled(
-                        text,
-                        Style::default().fg(ACCENT_PEACH).add_modifier(Modifier::BOLD),
-                    )),
-                    width,
-                ));
-            }
-            UpdateStatus::Done(v) => {
-                let text = format!(" Updated to {} (restart to apply) ", v);
-                let width = text.len() as u16;
-                hints.push((
-                    Line::from(Span::styled(
-                        text,
-                        Style::default().fg(ACCENT_GREEN).add_modifier(Modifier::BOLD),
-                    )),
-                    width,
-                ));
+                hints.push(Line::from(Span::styled(
+                    " Updating... ",
+                    Style::default().fg(ACCENT_PEACH).add_modifier(Modifier::BOLD),
+                )));
             }
             UpdateStatus::Failed(msg) => {
-                let text = format!(" Update failed: {} ", msg);
-                let width = text.len() as u16;
-                hints.push((
-                    Line::from(Span::styled(
-                        text,
-                        Style::default()
-                            .fg(Color::Rgb(243, 139, 168))
-                            .add_modifier(Modifier::BOLD),
-                    )),
-                    width,
-                ));
+                hints.push(Line::from(Span::styled(
+                    format!(" Update failed: {} ", msg),
+                    Style::default()
+                        .fg(Color::Rgb(243, 139, 168))
+                        .add_modifier(Modifier::BOLD),
+                )));
             }
             _ => {}
         }
 
         let is_live = app.selected_live_index().is_some();
 
-        // " ↑↓/jk navigate" = 15, " ↑↓/JK scroll" = 13 → width 16
-        hints.push((
-            Line::from(vec![
-                Span::styled(
-                    if app.shift_active { " ↑↓/JK" } else { " ↑↓/jk" },
-                    if app.shift_active { shift_key_style } else { key_style },
-                ),
-                Span::styled(
-                    if app.shift_active { " scroll" } else { " navigate" },
-                    if app.shift_active { shift_hint_style } else { hint_style },
-                ),
-            ]),
-            16,
-        ));
-        // "Enter open" = 10, "Enter open direct" = 17 → width 19
+        hints.push(Line::from(vec![
+            Span::styled(
+                if app.shift_active { " ↑↓/JK" } else { " ↑↓/jk" },
+                if app.shift_active { shift_key_style } else { key_style },
+            ),
+            Span::styled(
+                if app.shift_active { " scroll" } else { " navigate" },
+                if app.shift_active { shift_hint_style } else { hint_style },
+            ),
+        ]));
         let enter_shift = app.shift_active && app.is_historical_selected();
-        hints.push((
-            Line::from(vec![
-                Span::styled(
-                    "Enter",
-                    if enter_shift { shift_key_style } else { key_style },
-                ),
-                Span::styled(
-                    if enter_shift { " open direct" } else { " open" },
-                    if enter_shift { shift_hint_style } else { hint_style },
-                ),
-            ]),
-            19,
-        ));
-        // "/" search = 8 → width 10
-        hints.push((
-            Line::from(vec![
-                Span::styled("/", key_style),
-                Span::styled(" search", hint_style),
-            ]),
-            10,
-        ));
-        // "Tab view" = 8 → width 10
-        hints.push((
-            Line::from(vec![
-                Span::styled("Tab", shift_key_style),
-                Span::styled(" view", shift_hint_style),
-            ]),
-            10,
-        ));
-        // "e show empty" = 12 → width 14
-        hints.push((
-            Line::from(vec![
-                Span::styled("e", key_style),
-                Span::styled(" show empty", hint_style),
-            ]),
-            14,
-        ));
-        // "c group" = 7, "c ungroup" = 9 → width 10
-        hints.push((
-            Line::from(vec![
-                Span::styled("c", key_style),
-                Span::styled(
-                    if app.group_chains { " ungroup" } else { " group" },
-                    hint_style,
-                ),
-            ]),
-            10,
-        ));
-        // "r rename" = 8 → width 10
-        hints.push((
-            Line::from(vec![
-                Span::styled("r", key_style),
-                Span::styled(" rename", hint_style),
-            ]),
-            10,
-        ));
-        // "n new live" = 10, "N new direct" = 13 → width 15
-        hints.push((
-            Line::from(vec![
-                Span::styled(
-                    if app.shift_active { "N" } else { "n" },
-                    if app.shift_active { shift_key_style } else { key_style },
-                ),
-                Span::styled(
-                    if app.shift_active { " new direct" } else { " new live" },
-                    if app.shift_active { shift_hint_style } else { hint_style },
-                ),
-            ]),
-            15,
-        ));
-        // "l live filter" = 13 → width 15
-        hints.push((
-            Line::from(vec![
-                Span::styled("l", shift_key_style),
-                Span::styled(" live filter", shift_hint_style),
-            ]),
-            15,
-        ));
-        // "f favorite" = 10 → width 12
-        hints.push((
-            Line::from(vec![
-                Span::styled("f", key_style),
-                Span::styled(" favorite", hint_style),
-            ]),
-            12,
-        ));
+        hints.push(Line::from(vec![
+            Span::styled(
+                "Enter",
+                if enter_shift { shift_key_style } else { key_style },
+            ),
+            Span::styled(
+                if enter_shift { " open direct" } else { " open" },
+                if enter_shift { shift_hint_style } else { hint_style },
+            ),
+        ]));
+        hints.push(Line::from(vec![
+            Span::styled("/", key_style),
+            Span::styled(" search", hint_style),
+        ]));
+        hints.push(Line::from(vec![
+            Span::styled("o", key_style),
+            Span::styled(" config", hint_style),
+        ]));
+        hints.push(Line::from(vec![
+            Span::styled("r", key_style),
+            Span::styled(" rename", hint_style),
+        ]));
+        hints.push(Line::from(vec![
+            Span::styled(
+                if app.shift_active { "N" } else { "n" },
+                if app.shift_active { shift_key_style } else { key_style },
+            ),
+            Span::styled(
+                if app.shift_active { " new direct" } else { " new live" },
+                if app.shift_active { shift_hint_style } else { hint_style },
+            ),
+        ]));
+        hints.push(Line::from(vec![
+            Span::styled("l", shift_key_style),
+            Span::styled(" live filter", shift_hint_style),
+        ]));
+        hints.push(Line::from(vec![
+            Span::styled("f", key_style),
+            Span::styled(" favorite", hint_style),
+        ]));
         if is_live {
-            // "x stop session" = 14 → width 16
-            hints.push((
-                Line::from(vec![
-                    Span::styled("x", key_style),
-                    Span::styled(" stop session", hint_style),
-                ]),
-                16,
-            ));
+            hints.push(Line::from(vec![
+                Span::styled("x", key_style),
+                Span::styled(" stop session", hint_style),
+            ]));
         }
-        // "q quit" = 6 → width 8
-        hints.push((
-            Line::from(vec![
-                Span::styled("q", key_style),
-                Span::styled(" quit", hint_style),
-            ]),
-            8,
-        ));
-        // "? help" = 6 → width 6 (last entry)
-        hints.push((
-            Line::from(vec![
-                Span::styled("?", shift_key_style),
-                Span::styled(" help", shift_hint_style),
-            ]),
-            6,
-        ));
+        hints.push(Line::from(vec![
+            Span::styled("q", key_style),
+            Span::styled(" quit", hint_style),
+        ]));
+        hints.push(Line::from(vec![
+            Span::styled("?", shift_key_style),
+            Span::styled(" help", shift_hint_style),
+        ]));
 
-        // Insert " | " separators between entries
-        let sep_style = Style::default().fg(FG_OVERLAY);
-        let mut separated: Vec<(Line, u16)> = Vec::with_capacity(hints.len() * 2);
-        for (i, hint) in hints.into_iter().enumerate() {
+        // Calculate dynamic spacing between hints
+        let hint_widths: Vec<u16> = hints.iter().map(|h| hint_width(h)).collect();
+        let total_hint_width: u16 = hint_widths.iter().sum();
+        let available = bar_chunks[0].width;
+        let num_gaps = hints.len().saturating_sub(1) as u16;
+        let gap_size = if num_gaps > 0 && available > total_hint_width {
+            ((available - total_hint_width) / num_gaps).min(6)
+        } else {
+            1
+        };
+
+        // Build constraints: hint, gap, hint, gap, ..., hint, Fill(1)
+        let mut constraints: Vec<Constraint> = Vec::new();
+        for (i, w) in hint_widths.iter().enumerate() {
             if i > 0 {
-                separated.push((Line::from(Span::styled(" | ", sep_style)), 3));
+                constraints.push(Constraint::Length(gap_size));
             }
-            separated.push(hint);
+            constraints.push(Constraint::Length(*w));
         }
-        let hints = separated;
+        constraints.push(Constraint::Fill(1));
 
-        let constraints: Vec<Constraint> = hints
-            .iter()
-            .map(|(_, w)| Constraint::Length(*w))
-            .chain(std::iter::once(Constraint::Fill(1)))
-            .collect();
         let hint_chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints(constraints)
             .split(bar_chunks[0]);
 
-        for (i, (line, _)) in hints.iter().enumerate() {
+        for (i, hint) in hints.iter().enumerate() {
+            let chunk_idx = i * 2; // each hint is at even indices (0, 2, 4, ...)
             frame.render_widget(
-                Paragraph::new(line.clone()).style(bar_style),
-                hint_chunks[i],
+                Paragraph::new(hint.clone()).style(bar_style),
+                hint_chunks[chunk_idx],
             );
+            // Gap chunks (odd indices) get bar background
+            if i > 0 {
+                let gap_idx = chunk_idx - 1;
+                frame.render_widget(
+                    Paragraph::new("").style(bar_style),
+                    hint_chunks[gap_idx],
+                );
+            }
         }
         // Fill remaining space with bar background
+        let last_idx = hints.len() * 2 - 1;
         frame.render_widget(
             Paragraph::new("").style(bar_style),
-            hint_chunks[hints.len()],
+            hint_chunks[last_idx],
         );
     }
 
@@ -723,13 +658,6 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         }
     }
 
-    // Restart prompt overlay
-    if app.mode == AppMode::RestartPrompt {
-        if let UpdateStatus::Done(ref tag) = app.update_status {
-            draw_restart_prompt(frame, tag);
-        }
-    }
-
     // Help overlay
     if app.mode == AppMode::Help {
         render_help_popup(frame, frame.area());
@@ -738,6 +666,18 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // NamingSession overlay (centered popup)
     if app.mode == AppMode::NamingSession {
         draw_naming_popup(frame, &app.naming_input, &app.naming_placeholder);
+    }
+
+    // Config popup
+    if app.mode == AppMode::Config {
+        crate::config_popup::draw_config_popup(frame, app);
+    }
+
+    // DuplicateSession confirmation popup
+    if app.mode == AppMode::DuplicateSession {
+        if let Some(ref name) = app.duplicate_name.clone() {
+            draw_duplicate_popup(frame, name);
+        }
     }
 }
 
@@ -897,7 +837,7 @@ fn apply_sgr(params: &str, mut style: Style) -> Style {
             // 256-color / true-color foreground
             38 if codes.get(i + 1) == Some(&5) => {
                 if let Some(&n) = codes.get(i + 2) {
-                    style = style.fg(Color::Indexed(n as u8));
+                    style = style.fg(Color::Indexed(n.min(255) as u8));
                     i += 2;
                 }
             }
@@ -905,14 +845,14 @@ fn apply_sgr(params: &str, mut style: Style) -> Style {
                 if let (Some(&r), Some(&g), Some(&b)) =
                     (codes.get(i + 2), codes.get(i + 3), codes.get(i + 4))
                 {
-                    style = style.fg(Color::Rgb(r as u8, g as u8, b as u8));
+                    style = style.fg(Color::Rgb(r.min(255) as u8, g.min(255) as u8, b.min(255) as u8));
                     i += 4;
                 }
             }
             // 256-color / true-color background
             48 if codes.get(i + 1) == Some(&5) => {
                 if let Some(&n) = codes.get(i + 2) {
-                    style = style.bg(Color::Indexed(n as u8));
+                    style = style.bg(Color::Indexed(n.min(255) as u8));
                     i += 2;
                 }
             }
@@ -920,7 +860,7 @@ fn apply_sgr(params: &str, mut style: Style) -> Style {
                 if let (Some(&r), Some(&g), Some(&b)) =
                     (codes.get(i + 2), codes.get(i + 3), codes.get(i + 4))
                 {
-                    style = style.bg(Color::Rgb(r as u8, g as u8, b as u8));
+                    style = style.bg(Color::Rgb(r.min(255) as u8, g.min(255) as u8, b.min(255) as u8));
                     i += 4;
                 }
             }
@@ -981,6 +921,58 @@ fn draw_naming_popup(frame: &mut Frame, input: &tui_input::Input, placeholder: &
             ))
             .style(Style::default().bg(BG_SURFACE)),
     );
+    frame.render_widget(popup, area);
+}
+
+/// Render the duplicate-session confirmation popup with open/rename/cancel options.
+fn draw_duplicate_popup(frame: &mut Frame, name: &str) {
+    let area = centered_rect(44, 20, frame.area());
+    let area = if area.height < 7 {
+        Rect { height: 7, ..area }
+    } else {
+        area
+    };
+    frame.render_widget(Clear, area);
+
+    let key_style = Style::default().fg(ACCENT_PEACH).add_modifier(Modifier::BOLD);
+    let text_style = Style::default().fg(FG_TEXT);
+    let dim_style = Style::default().fg(FG_SUBTEXT);
+
+    let content = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("Session ", text_style),
+            Span::styled(format!("\"{}\"", name), Style::default().fg(ACCENT_PEACH).add_modifier(Modifier::BOLD)),
+            Span::styled(" already exists", text_style),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  o", key_style),
+            Span::styled(" / Enter  open existing session", text_style),
+        ]),
+        Line::from(vec![
+            Span::styled("  r", key_style),
+            Span::styled("          choose a different name", text_style),
+        ]),
+        Line::from(vec![
+            Span::styled("  Esc", key_style),
+            Span::styled("       cancel", dim_style),
+        ]),
+    ];
+
+    let popup = Paragraph::new(content)
+        .alignment(ratatui::layout::Alignment::Left)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(ACCENT_PEACH))
+                .title(Span::styled(
+                    " Duplicate Session Name ",
+                    Style::default().fg(ACCENT_PEACH).add_modifier(Modifier::BOLD),
+                ))
+                .style(Style::default().bg(BG_SURFACE)),
+        );
     frame.render_widget(popup, area);
 }
 
@@ -1071,10 +1063,6 @@ fn render_help_popup(frame: &mut Frame, area: Rect) {
             Span::styled("  Shift+Enter     ", key),
             Span::styled("Open historical session directly (no tmux)", desc),
         ]),
-        Line::from(vec![
-            Span::styled("  Tab/Shift+Tab   ", key),
-            Span::styled("Cycle view mode (tree/flat × name/dir)", desc),
-        ]),
         Line::from(""),
         Line::from(vec![Span::styled("  Actions", header)]),
         Line::from(vec![
@@ -1082,16 +1070,8 @@ fn render_help_popup(frame: &mut Frame, area: Rect) {
             Span::styled("Enter filter/search mode", desc),
         ]),
         Line::from(vec![
-            Span::styled("  e               ", key),
-            Span::styled("Toggle show empty projects (projects with no active sessions)", desc),
-        ]),
-        Line::from(vec![
-            Span::styled("  c               ", key),
-            Span::styled("Toggle session grouping — groups are sequences of sessions where", desc),
-        ]),
-        Line::from(vec![
-            Span::styled("                      ", key),
-            Span::styled("each was started from the previous one (parent → child)", desc),
+            Span::styled("  o               ", key),
+            Span::styled("Open config popup (view mode, hide empty, group chains)", desc),
         ]),
         Line::from(vec![
             Span::styled("  n               ", key),
@@ -1248,7 +1228,7 @@ fn draw_update_prompt(frame: &mut Frame, info: &crate::update::UpdateInfo) {
         Line::from(""),
         Line::from(vec![
             Span::styled("  y", key_style),
-            Span::styled(" update   ", text_style),
+            Span::styled(" update & restart   ", text_style),
             Span::styled("n/Esc", key_style),
             Span::styled(" skip", text_style),
         ]),
@@ -1263,54 +1243,6 @@ fn draw_update_prompt(frame: &mut Frame, info: &crate::update::UpdateInfo) {
                 .border_style(Style::default().fg(ACCENT_GREEN))
                 .title(Span::styled(
                     " Update Available ",
-                    Style::default()
-                        .fg(ACCENT_GREEN)
-                        .add_modifier(Modifier::BOLD),
-                ))
-                .style(Style::default().bg(BG_SURFACE)),
-        );
-    frame.render_widget(popup, area);
-}
-
-/// Render the post-update restart prompt confirming the installed version with y/n options.
-fn draw_restart_prompt(frame: &mut Frame, tag: &str) {
-    let area = centered_rect(40, 15, frame.area());
-    let area = if area.height < 6 {
-        Rect { height: 6, ..area }
-    } else {
-        area
-    };
-    frame.render_widget(Clear, area);
-
-    let key_style = Style::default()
-        .fg(ACCENT_PEACH)
-        .add_modifier(Modifier::BOLD);
-    let text_style = Style::default().fg(FG_TEXT);
-
-    let content = vec![
-        Line::from(""),
-        Line::from(Span::styled(
-            format!("Updated to {}", tag),
-            Style::default().fg(ACCENT_GREEN).add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("  y", key_style),
-            Span::styled(" restart now   ", text_style),
-            Span::styled("n/Esc", key_style),
-            Span::styled(" later", text_style),
-        ]),
-    ];
-
-    let popup = Paragraph::new(content)
-        .alignment(ratatui::layout::Alignment::Center)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(ACCENT_GREEN))
-                .title(Span::styled(
-                    " Update Installed ",
                     Style::default()
                         .fg(ACCENT_GREEN)
                         .add_modifier(Modifier::BOLD),

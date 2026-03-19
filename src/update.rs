@@ -61,8 +61,6 @@ pub enum UpdateStatus {
     Available(UpdateInfo),
     /// The user confirmed and a download is in progress.
     Downloading,
-    /// The update was installed successfully; the string is the new version tag.
-    Done(String),
     /// The update attempt failed; the string describes the error.
     Failed(String),
 }
@@ -160,7 +158,8 @@ pub fn perform_update(info: &UpdateInfo) -> Result<()> {
 
     let temp_dir = tempfile::tempdir().context("Failed to create temp directory")?;
 
-    if info.download_url.ends_with(".zip") {
+    let is_zip = info.download_url.split('?').next().unwrap_or("").ends_with(".zip");
+    if is_zip {
         extract_zip(&bytes, temp_dir.path())?;
     } else {
         extract_tar_gz(&bytes, temp_dir.path())?;
@@ -180,19 +179,16 @@ pub fn perform_update(info: &UpdateInfo) -> Result<()> {
         std::fs::copy(&new_binary, &new_path)
             .context("Failed to write new binary for Windows update")?;
         let bat_path = current_exe.with_extension("bat");
-        let current_name = current_exe
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "ccsm.exe".to_string());
+        let pid = std::process::id();
         let script = format!(
             "@echo off\r\n\
              :wait\r\n\
-             tasklist /fi \"imagename eq {name}\" 2>nul | find /i \"{name}\" >nul\r\n\
+             tasklist /fi \"pid eq {pid}\" 2>nul | find \"{pid}\" >nul\r\n\
              if %errorlevel% == 0 (timeout /t 1 /nobreak >nul & goto wait)\r\n\
              timeout /t 1 /nobreak >nul\r\n\
              move /y \"{new}\" \"{cur}\" >nul\r\n\
              del \"%~f0\"\r\n",
-            name = current_name,
+            pid = pid,
             new = new_path.display(),
             cur = current_exe.display(),
         );

@@ -19,14 +19,14 @@ Sessions grouped by project with an expanded group showing individual sessions. 
 - Resume any session via tmux (`Enter`) or directly in the foreground without tmux (`Shift+Enter`)
 - **Live sessions** — start and manage tmux-backed Claude sessions; running sessions appear at the top of the list with a live indicator
 - **New session** — start a new live tmux session in the selected project's directory (`n`, prompts for a name); or start a foreground claude session directly in the selected directory (`Shift+N`, no tmux); or bypass the TUI entirely with `ccsm --new` to start a session in the current directory
+- **Duplicate detection** — when creating or renaming a session, duplicate names are caught with options to open the existing session, pick a different name, or cancel
 - **Live-only filter** — toggle with `l` to show only running sessions; persisted in config
 - **Stop live session** — kill the selected running session with `x`
 - Search and filter sessions by project name or path
-- Toggle visibility of empty sessions (no data file) with `e`
-- **Session grouping** — toggle with `c` to group chained sessions (sequences where each was started from the previous)
+- **Config popup** — press `o` to toggle hide-empty, session grouping, and view mode from a single popup
 - Lazy-loads and caches session previews for fast navigation
 - **Live session preview** — shows live tmux pane output for running sessions
-- **Auto-update** — checks GitHub Releases in the background on startup (every 24h), shows a centered prompt with current vs new version, and self-updates the binary on confirm
+- **Auto-update** — checks GitHub Releases in the background on startup (every 24h), shows a centered prompt with current vs new version, and self-updates the binary on confirm; automatically restarts after a successful update
 - **Session names** — custom titles loaded in the background for fast startup
 - **Help overlay** — press `?` for a full in-app keybinding reference
 - **Favorites** — pin projects to the top of the list with `f`; shown with a ★ indicator; persisted in config
@@ -34,6 +34,8 @@ Sessions grouped by project with an expanded group showing individual sessions. 
 - Optional path argument to scope sessions to a specific directory
 - Version label displayed in the bottom-right of the help bar
 - Catppuccin Mocha-inspired color theme
+- **Smart redraw** — only redraws the screen when state changes, with adaptive polling for live session previews
+- **Ghostty/tmux compatibility** — keyboard input normalization for correct Shift+key handling
 
 ## Requirements
 
@@ -115,6 +117,12 @@ Use `--new` to immediately start a new live Claude session in the current direct
 ccsm --new
 ```
 
+Use `--spawn` from within a live tmux session to create a new session and switch to it without leaving tmux:
+
+```sh
+ccsm --spawn
+```
+
 ## Key Bindings
 
 | Key | Action |
@@ -129,8 +137,7 @@ ccsm --new
 | `Shift+J` | Scroll preview down |
 | `Shift+K` | Scroll preview up |
 | `/` | Activate search/filter mode |
-| `c` | Toggle session grouping (group/ungroup related sessions) |
-| `e` | Toggle show/hide empty sessions |
+| `o` | Open config popup (hide-empty, session grouping, view mode) |
 | `f` | Toggle favorite — pins project to top of list (shown with ★) |
 | `n` | Start new live session in selected project's directory (prompts for name) |
 | `Shift+N` | Start new foreground claude session in selected project's directory (no tmux) |
@@ -146,7 +153,7 @@ When an update is available, a centered dialog appears:
 
 | Key | Action |
 |---|---|
-| `y` | Download and install the update |
+| `y` | Download, install, and restart |
 | `n` / `Esc` | Dismiss until next run |
 
 ### Filter Mode
@@ -180,6 +187,7 @@ While attached to a live session in tmux:
 | `Ctrl+\` | Detach and return to ccsm |
 | `Ctrl+n` | Switch to next live session |
 | `Ctrl+p` | Switch to previous live session |
+| `Ctrl+l` | Spawn a new live session and switch to it |
 
 ## Live Sessions
 
@@ -233,7 +241,7 @@ Settings are persisted to `~/.config/ccsm/config.json` and automatically saved w
 8. On `Enter` (live session), attaches to the tmux session and suspends the TUI; detach with `Ctrl+\` to return
 9. On `n`/`N`, prompts for a session name then starts a new detached tmux session running `claude` in the chosen directory and attaches to it; uses a dedicated tmux server (`-L ccsm`) with a custom status bar
 10. With `--new`, skips the TUI, creates a live tmux session in the current directory, attaches immediately, and re-execs ccsm when Claude exits
-11. If the user accepts an update, the TUI suspends, downloads the new binary, replaces the current executable, and resumes
+11. If the user accepts an update, the TUI suspends, downloads the new binary, replaces the current executable, and automatically restarts
 12. After Claude exits, the TUI resumes and reloads the session list
 
 ## Dependencies

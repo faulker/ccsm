@@ -49,6 +49,7 @@ jobs:
           VERSION="${VERSION%%-*}"
           VERSION="${VERSION%%+*}"
           IFS='.' read -r MAJOR MINOR PATCH <<< "$VERSION"
+          MAJOR="${MAJOR:-0}"; MINOR="${MINOR:-0}"; PATCH="${PATCH:-0}"
 
           case "$BUMP_TYPE" in
             major)
@@ -76,6 +77,7 @@ jobs:
         env:
           NEW_TAG: ${{ steps.bump.outputs.new_tag }}
         run: |
+          set -e
           VERSION="${NEW_TAG#v}"
           sed -i "s/^version = \".*\"/version = \"${VERSION}\"/" Cargo.toml
           cargo generate-lockfile
@@ -89,6 +91,7 @@ jobs:
         env:
           NEW_TAG: ${{ steps.bump.outputs.new_tag }}
         run: |
+          set -e
           git tag "$NEW_TAG"
           git push origin "$NEW_TAG"
 
@@ -137,7 +140,11 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           VERSION="${RELEASE_TAG#v}"
-          sed -i'' -e "s/^version = \".*\"/version = \"${VERSION}\"/" Cargo.toml
+          if [[ "$OSTYPE" == "darwin"* ]]; then
+            sed -i '' -e "s/^version = \".*\"/version = \"${VERSION}\"/" Cargo.toml
+          else
+            sed -i -e "s/^version = \".*\"/version = \"${VERSION}\"/" Cargo.toml
+          fi
 
       - name: Set version in Cargo.toml (Windows)
         if: runner.os == 'Windows'

@@ -80,21 +80,28 @@ pub fn ensure_server_configured() -> anyhow::Result<()> {
     }
     // Within tmux double-quoted strings, \\ is a literal backslash.
     // For bind-key in config files, single-quote the key spec to avoid backslash escape issues.
-    let mut conf_content = concat!(
-        "set -g history-limit 50000\n",
-        "set -g mouse on\n",
-        "set -g default-terminal \"tmux-256color\"\n",
-        "set -g extended-keys on\n",
-        "set -g status on\n",
-        "set -g status-interval 1\n",
-        "set -g status-style \"bg=#1e1e2e,fg=#cdd6f4\"\n",
-        "set -g status-format[0] \"#[align=left,bg=#1e1e2e,fg=#cdd6f4]#[align=centre]#{?pane_in_mode,#[fg=#f38ba8 bold]Hit the ESC key to exit scroll mode}#[align=right]#[fg=#f38ba8 bold]Ctrl+\\\\ #[fg=#a6adc8]detach  #[fg=#f38ba8 bold]Ctrl+n #[fg=#a6adc8]next  #[fg=#f38ba8 bold]Ctrl+p #[fg=#a6adc8]prev \"\n",
-        "unbind-key -q -n C-]\n",
-        "unbind-key -q -n C-[\n",
-        "bind-key -n 'C-\\' detach-client\n",
-        "bind-key -n C-n switch-client -n\n",
-        "bind-key -n C-p switch-client -p\n",
-    ).to_string();
+    let exe_path = std::env::current_exe()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| "ccsm".to_string());
+    let mut conf_content = format!(
+        concat!(
+            "set -g history-limit 50000\n",
+            "set -g mouse on\n",
+            "set -g default-terminal \"tmux-256color\"\n",
+            "set -g extended-keys on\n",
+            "set -g status on\n",
+            "set -g status-interval 1\n",
+            "set -g status-style \"bg=#1e1e2e,fg=#cdd6f4\"\n",
+            "set -g status-format[0] \"#[align=left,bg=#1e1e2e,fg=#cdd6f4]#[align=centre]#{{?pane_in_mode,#[fg=#f38ba8 bold]Hit the ESC key to exit scroll mode}}#[align=right]#[fg=#f38ba8 bold]Ctrl+\\\\ #[fg=#a6adc8]detach  #[fg=#f38ba8 bold]Ctrl+l #[fg=#a6adc8]new  #[fg=#f38ba8 bold]Ctrl+n #[fg=#a6adc8]next  #[fg=#f38ba8 bold]Ctrl+p #[fg=#a6adc8]prev \"\n",
+            "unbind-key -q -n C-]\n",
+            "unbind-key -q -n C-[\n",
+            "bind-key -n 'C-\\' detach-client\n",
+            "bind-key -n C-l run-shell 'cd \"#{{pane_current_path}}\" && \"{}\" --spawn'\n",
+            "bind-key -n C-n switch-client -n\n",
+            "bind-key -n C-p switch-client -p\n",
+        ),
+        exe_path,
+    );
 
     // When running inside Ghostty, bind Shift+Enter to send ESC + Enter (\x1b\r).
     // Ghostty supports the kitty keyboard protocol, so tmux (with extended-keys on)
@@ -164,6 +171,21 @@ pub fn attach_to_session(name: &str) -> anyhow::Result<()> {
         .status()?;
     if !status.success() {
         anyhow::bail!("Failed to attach to session '{}'", name);
+    }
+    Ok(())
+}
+
+/// Switch the current tmux client to the named session on the ccsm socket.
+/// Only works when already inside a tmux client (i.e. the `--spawn` use case).
+pub fn switch_to_session(name: &str) -> anyhow::Result<()> {
+    if !is_tmux_available() {
+        anyhow::bail!("tmux is not installed — live sessions require tmux");
+    }
+    let status = std::process::Command::new("tmux")
+        .args(["-L", TMUX_SOCKET, "switch-client", "-t", name])
+        .status()?;
+    if !status.success() {
+        anyhow::bail!("Failed to switch to session '{}'", name);
     }
     Ok(())
 }

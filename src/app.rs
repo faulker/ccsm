@@ -76,12 +76,23 @@ pub enum AppMode {
     Renaming,
     /// The update-available confirmation prompt is shown.
     UpdatePrompt,
-    /// The post-update restart confirmation prompt is shown.
-    RestartPrompt,
     /// The help overlay is displayed.
     Help,
     /// The new-session naming popup is open.
     NamingSession,
+    /// A duplicate session name was entered; waiting for the user to choose open vs. rename.
+    DuplicateSession,
+    /// The config popup is open.
+    Config,
+}
+
+/// Tracks which popup triggered the duplicate-name check, so we can return to the right mode.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DuplicateSource {
+    /// Duplicate detected while naming a new live session.
+    NamingSession,
+    /// Duplicate detected while renaming an existing live session.
+    Renaming,
 }
 
 
@@ -143,6 +154,8 @@ pub struct App {
     pub names_receiver: Option<std::sync::mpsc::Receiver<HashMap<String, String>>>,
     /// Set to true when the process should exec-restart itself after an update.
     pub should_restart: bool,
+    /// Set to true whenever state changes require the screen to be redrawn.
+    pub needs_redraw: bool,
     /// All currently running live tmux sessions on the ccsm socket.
     pub live_sessions: Vec<LiveSession>,
     /// When true, only projects with active live sessions are shown.
@@ -160,6 +173,14 @@ pub struct App {
     pub flat_rows: Vec<FlatRow>,
     /// Set of project paths pinned to the top of the list.
     pub favorites: HashSet<String>,
+    /// The conflicting session name that triggered `AppMode::DuplicateSession`.
+    pub duplicate_name: Option<String>,
+    /// Which popup triggered the duplicate check, so we know where to return.
+    pub duplicate_source: Option<DuplicateSource>,
+    /// The cwd to restore if the user chooses to pick a different name (NamingSession source only).
+    pub duplicate_cwd: Option<String>,
+    /// Currently selected row in the config popup (0..2).
+    pub config_selected: usize,
 }
 
 /// Truncate a path to its last 2 components (e.g. "/Users/sane/Dev/ccsm" -> "Dev/ccsm").
@@ -209,6 +230,7 @@ impl App {
             update_receiver: None,
             names_receiver: None,
             should_restart: false,
+            needs_redraw: true,
             live_sessions: live::discover_live_sessions(),
             live_filter,
             naming_input: Input::default(),
@@ -217,6 +239,10 @@ impl App {
             live_preview_cache: HashMap::new(),
             flat_rows: Vec::new(),
             favorites,
+            duplicate_name: None,
+            duplicate_source: None,
+            duplicate_cwd: None,
+            config_selected: 0,
         };
         app.spawn_load_session_names();
         app.init_tree();
@@ -763,6 +789,65 @@ impl App {
             self.live_preview_cache.insert(name.clone(), (output, now));
         }
         self.live_preview_cache.get(&name).map(|(s, _)| s.clone()).unwrap_or_default()
+    }
+
+    /// Cycle view mode forward: tree[Name] → tree[ShortDir] → tree[FullDir]
+    /// → flat[Name] → flat[ShortDir] → flat[FullDir] → tree[Name].
+    pub fn cycle_view_forward(&mut self) {
+        match (self.tree_view, self.display_mode) {
+            (true, crate::config::DisplayMode::Name) => {
+                self.display_mode = crate::config::DisplayMode::ShortDir;
+                self.recompute_tree();
+            }
+            (true, crate::config::DisplayMode::ShortDir) => {
+                self.display_mode = crate::config::DisplayMode::FullDir;
+                self.recompute_tree();
+            }
+            (true, crate::config::DisplayMode::FullDir) => {
+                self.tree_view = false;
+                self.display_mode = crate::config::DisplayMode::Name;
+            }
+            (false, crate::config::DisplayMode::Name) => {
+                self.display_mode = crate::config::DisplayMode::ShortDir;
+            }
+            (false, crate::config::DisplayMode::ShortDir) => {
+                self.display_mode = crate::config::DisplayMode::FullDir;
+            }
+            (false, crate::config::DisplayMode::FullDir) => {
+                self.tree_view = true;
+                self.display_mode = crate::config::DisplayMode::Name;
+                self.recompute_tree();
+            }
+        }
+    }
+
+    /// Cycle view mode backward (reverse of `cycle_view_forward`).
+    pub fn cycle_view_backward(&mut self) {
+        match (self.tree_view, self.display_mode) {
+            (true, crate::config::DisplayMode::Name) => {
+                self.tree_view = false;
+                self.display_mode = crate::config::DisplayMode::FullDir;
+            }
+            (true, crate::config::DisplayMode::ShortDir) => {
+                self.display_mode = crate::config::DisplayMode::Name;
+                self.recompute_tree();
+            }
+            (true, crate::config::DisplayMode::FullDir) => {
+                self.display_mode = crate::config::DisplayMode::ShortDir;
+                self.recompute_tree();
+            }
+            (false, crate::config::DisplayMode::Name) => {
+                self.tree_view = true;
+                self.display_mode = crate::config::DisplayMode::FullDir;
+                self.recompute_tree();
+            }
+            (false, crate::config::DisplayMode::ShortDir) => {
+                self.display_mode = crate::config::DisplayMode::Name;
+            }
+            (false, crate::config::DisplayMode::FullDir) => {
+                self.display_mode = crate::config::DisplayMode::ShortDir;
+            }
+        }
     }
 
     /// Re-query the ccsm tmux server for live sessions, clear the live preview cache,
@@ -1411,61 +1496,32 @@ mod tests {
     fn test_tab_cycles_all_six_modes() {
         let mut app = make_app(make_sessions(), None, Config::default());
 
-        // Helper to simulate tab press logic
-        fn simulate_tab(app: &mut App) {
-            match (app.tree_view, app.display_mode) {
-                (true, DisplayMode::Name) => {
-                    app.display_mode = DisplayMode::ShortDir;
-                    app.recompute_tree();
-                }
-                (true, DisplayMode::ShortDir) => {
-                    app.display_mode = DisplayMode::FullDir;
-                    app.recompute_tree();
-                }
-                (true, DisplayMode::FullDir) => {
-                    app.tree_view = false;
-                    app.display_mode = DisplayMode::Name;
-                }
-                (false, DisplayMode::Name) => {
-                    app.display_mode = DisplayMode::ShortDir;
-                }
-                (false, DisplayMode::ShortDir) => {
-                    app.display_mode = DisplayMode::FullDir;
-                }
-                (false, DisplayMode::FullDir) => {
-                    app.tree_view = true;
-                    app.display_mode = DisplayMode::Name;
-                    app.recompute_tree();
-                }
-            }
-        }
-
         // Start: tree + Name
         assert!(app.tree_view);
         assert_eq!(app.display_mode, DisplayMode::Name);
 
-        simulate_tab(&mut app);
+        app.cycle_view_forward();
         assert!(app.tree_view);
         assert_eq!(app.display_mode, DisplayMode::ShortDir);
 
-        simulate_tab(&mut app);
+        app.cycle_view_forward();
         assert!(app.tree_view);
         assert_eq!(app.display_mode, DisplayMode::FullDir);
 
-        simulate_tab(&mut app);
+        app.cycle_view_forward();
         assert!(!app.tree_view);
         assert_eq!(app.display_mode, DisplayMode::Name);
 
-        simulate_tab(&mut app);
+        app.cycle_view_forward();
         assert!(!app.tree_view);
         assert_eq!(app.display_mode, DisplayMode::ShortDir);
 
-        simulate_tab(&mut app);
+        app.cycle_view_forward();
         assert!(!app.tree_view);
         assert_eq!(app.display_mode, DisplayMode::FullDir);
 
         // Full cycle back to tree + Name
-        simulate_tab(&mut app);
+        app.cycle_view_forward();
         assert!(app.tree_view);
         assert_eq!(app.display_mode, DisplayMode::Name);
     }
@@ -1474,62 +1530,95 @@ mod tests {
     fn test_backtab_cycles_reverse() {
         let mut app = make_app(make_sessions(), None, Config::default());
 
-        fn simulate_backtab(app: &mut App) {
-            match (app.tree_view, app.display_mode) {
-                (true, DisplayMode::Name) => {
-                    app.tree_view = false;
-                    app.display_mode = DisplayMode::FullDir;
-                }
-                (true, DisplayMode::ShortDir) => {
-                    app.display_mode = DisplayMode::Name;
-                    app.recompute_tree();
-                }
-                (true, DisplayMode::FullDir) => {
-                    app.display_mode = DisplayMode::ShortDir;
-                    app.recompute_tree();
-                }
-                (false, DisplayMode::Name) => {
-                    app.tree_view = true;
-                    app.display_mode = DisplayMode::FullDir;
-                    app.recompute_tree();
-                }
-                (false, DisplayMode::ShortDir) => {
-                    app.display_mode = DisplayMode::Name;
-                }
-                (false, DisplayMode::FullDir) => {
-                    app.display_mode = DisplayMode::ShortDir;
-                }
-            }
-        }
-
         // Start: tree + Name
         assert!(app.tree_view);
         assert_eq!(app.display_mode, DisplayMode::Name);
 
         // Reverse: tree+Name → flat+FullDir
-        simulate_backtab(&mut app);
+        app.cycle_view_backward();
         assert!(!app.tree_view);
         assert_eq!(app.display_mode, DisplayMode::FullDir);
 
-        simulate_backtab(&mut app);
+        app.cycle_view_backward();
         assert!(!app.tree_view);
         assert_eq!(app.display_mode, DisplayMode::ShortDir);
 
-        simulate_backtab(&mut app);
+        app.cycle_view_backward();
         assert!(!app.tree_view);
         assert_eq!(app.display_mode, DisplayMode::Name);
 
-        simulate_backtab(&mut app);
+        app.cycle_view_backward();
         assert!(app.tree_view);
         assert_eq!(app.display_mode, DisplayMode::FullDir);
 
-        simulate_backtab(&mut app);
+        app.cycle_view_backward();
         assert!(app.tree_view);
         assert_eq!(app.display_mode, DisplayMode::ShortDir);
 
-        simulate_backtab(&mut app);
+        app.cycle_view_backward();
         assert!(app.tree_view);
         assert_eq!(app.display_mode, DisplayMode::Name);
+    }
+
+    #[test]
+    fn test_config_selected_bounds() {
+        let mut app = make_app(make_sessions(), None, Config::default());
+        app.mode = AppMode::Config;
+        assert_eq!(app.config_selected, 0);
+
+        // Can't go below 0
+        app.config_selected = 0;
+        if app.config_selected > 0 { app.config_selected -= 1; }
+        assert_eq!(app.config_selected, 0);
+
+        // Navigate down
+        app.config_selected = 1;
+        assert_eq!(app.config_selected, 1);
+        app.config_selected = 2;
+        assert_eq!(app.config_selected, 2);
+
+        // Can't go above 2
+        if app.config_selected < 2 { app.config_selected += 1; }
+        assert_eq!(app.config_selected, 2);
+    }
+
+    #[test]
+    fn test_config_toggle_hide_empty() {
+        let mut app = make_app(make_sessions_mixed_data(), None, Config::default());
+        app.tree_view = false;
+        app.mode = AppMode::Config;
+        app.config_selected = 0;
+
+        // Default: hide_empty = true
+        assert!(app.hide_empty);
+        app.recompute_filter();
+        assert_eq!(app.filtered_indices.len(), 2); // s1, s3 (s2 has no data)
+
+        // Toggle hide_empty off
+        app.hide_empty = !app.hide_empty;
+        app.recompute_filter();
+        assert!(!app.hide_empty);
+        assert_eq!(app.filtered_indices.len(), 3); // all sessions visible
+    }
+
+    #[test]
+    fn test_config_toggle_group_chains() {
+        let mut app = make_app(make_chained_sessions(), None, Config::default());
+        app.tree_view = false;
+        app.mode = AppMode::Config;
+        app.config_selected = 1;
+
+        // Default: group_chains = true
+        assert!(app.group_chains);
+        app.recompute_filter();
+        assert_eq!(app.filtered_indices.len(), 2); // chain collapsed
+
+        // Toggle group_chains off
+        app.group_chains = !app.group_chains;
+        app.preview_cache.clear();
+        app.recompute_filter();
+        assert!(!app.group_chains);
+        assert_eq!(app.filtered_indices.len(), 3); // all sessions visible
     }
 
     #[test]

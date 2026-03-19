@@ -1,6 +1,20 @@
-use crate::app::{App, AppMode, FlatRow, LaunchRequest, TreeRow};
+use crate::app::{App, AppMode, DuplicateSource, FlatRow, LaunchRequest, TreeRow};
 use crate::{data, live};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, ModifierKeyCode};
+
+/// Normalize a key event so that Shift+letter produces an uppercase `Char`.
+///
+/// With the enhanced keyboard protocol, crossterm reports `Char('a')` with
+/// `KeyModifiers::SHIFT` rather than `Char('A')`.  `tui_input` inserts the
+/// char as-is, so we uppercase it here before delegation.
+fn normalize_key(mut key: crossterm::event::KeyEvent) -> crossterm::event::KeyEvent {
+    if let KeyCode::Char(c) = key.code {
+        if key.modifiers.contains(KeyModifiers::SHIFT) && c.is_ascii_lowercase() {
+            key.code = KeyCode::Char(c.to_ascii_uppercase());
+        }
+    }
+    key
+}
 
 impl App {
     /// Handle a key event while the rename popup is open.
@@ -21,9 +35,20 @@ impl App {
                     self.rename_session_id = None;
                 }
                 KeyCode::Enter => {
-                    if let Some(tmux_name) = self.rename_session_id.take() {
+                    if let Some(tmux_name) = self.rename_session_id.clone() {
                         let new_name = self.rename_input.value().trim().to_string();
                         if !new_name.is_empty() {
+                            // Check for a duplicate name (ignoring the session being renamed)
+                            let is_duplicate = new_name != tmux_name
+                                && self.live_sessions.iter().any(|ls| ls.tmux_name == new_name);
+                            if is_duplicate {
+                                self.duplicate_name = Some(new_name);
+                                self.duplicate_source = Some(DuplicateSource::Renaming);
+                                self.duplicate_cwd = None;
+                                self.mode = AppMode::DuplicateSession;
+                                return;
+                            }
+
                             let cwd = self.live_sessions.iter()
                                 .find(|ls| ls.tmux_name == tmux_name)
                                 .map(|ls| ls.cwd.clone());
@@ -54,11 +79,12 @@ impl App {
                             self.recompute_tree();
                         }
                     }
+                    self.rename_session_id = None;
                     self.rename_input = tui_input::Input::default();
                     self.mode = AppMode::Normal;
                 }
                 _ => {
-                    self.rename_input.handle_event(&Event::Key(key));
+                    self.rename_input.handle_event(&Event::Key(normalize_key(key)));
                 }
             }
             return;
@@ -91,7 +117,7 @@ impl App {
                 self.mode = AppMode::Normal;
             }
             _ => {
-                self.rename_input.handle_event(&Event::Key(key));
+                self.rename_input.handle_event(&Event::Key(normalize_key(key)));
             }
         }
     }
@@ -122,14 +148,73 @@ impl App {
                     .map(|c| if c == '.' || c == ':' || c.is_whitespace() { '-' } else { c })
                     .collect();
                 let name = if name.is_empty() { self.naming_placeholder.clone() } else { name };
+                // Check for a duplicate before consuming state
+                if self.live_sessions.iter().any(|ls| ls.tmux_name == name) {
+                    self.duplicate_name = Some(name);
+                    self.duplicate_source = Some(DuplicateSource::NamingSession);
+                    self.duplicate_cwd = self.naming_cwd.take();
+                    self.mode = AppMode::DuplicateSession;
+                    return;
+                }
                 let cwd = self.naming_cwd.take().unwrap_or_else(|| ".".to_string());
                 self.mode = AppMode::Normal;
                 self.naming_input = tui_input::Input::default();
                 self.launch_session = Some(LaunchRequest::NewLive { name, cwd });
             }
             _ => {
-                self.naming_input.handle_event(&Event::Key(key));
+                self.naming_input.handle_event(&Event::Key(normalize_key(key)));
             }
+        }
+    }
+
+    /// Handle a key event while the duplicate-session confirmation popup is open.
+    ///
+    /// `o`/Enter opens the existing session, `r` returns to naming/renaming, `Esc` cancels.
+    fn handle_duplicate_event(&mut self, key: crossterm::event::KeyEvent) {
+        let name = match self.duplicate_name.clone() {
+            Some(n) => n,
+            None => {
+                self.mode = AppMode::Normal;
+                return;
+            }
+        };
+
+        match key.code {
+            KeyCode::Char('o') | KeyCode::Enter => {
+                self.launch_session = Some(LaunchRequest::AttachLive { tmux_name: name });
+                self.duplicate_name = None;
+                self.duplicate_source = None;
+                self.duplicate_cwd = None;
+                self.naming_input = tui_input::Input::default();
+                self.rename_input = tui_input::Input::default();
+                self.rename_session_id = None;
+                self.mode = AppMode::Normal;
+            }
+            KeyCode::Char('r') => {
+                match self.duplicate_source.take() {
+                    Some(DuplicateSource::NamingSession) => {
+                        self.naming_cwd = self.duplicate_cwd.take();
+                        self.mode = AppMode::NamingSession;
+                    }
+                    Some(DuplicateSource::Renaming) | None => {
+                        self.duplicate_cwd = None;
+                        self.mode = AppMode::Renaming;
+                    }
+                }
+                self.duplicate_name = None;
+            }
+            KeyCode::Esc => {
+                self.duplicate_name = None;
+                self.duplicate_source = None;
+                self.duplicate_cwd = None;
+                self.naming_input = tui_input::Input::default();
+                self.naming_cwd = None;
+                self.rename_input = tui_input::Input::default();
+                self.rename_session_id = None;
+                self.rename_project = None;
+                self.mode = AppMode::Normal;
+            }
+            _ => {}
         }
     }
 
@@ -148,10 +233,12 @@ impl App {
                 // Bare shift press/release — update flag and consume event
                 (KeyCode::Modifier(ModifierKeyCode::LeftShift | ModifierKeyCode::RightShift), KeyEventKind::Press) => {
                     self.shift_active = true;
+                    self.needs_redraw = true;
                     return Ok(());
                 }
                 (KeyCode::Modifier(ModifierKeyCode::LeftShift | ModifierKeyCode::RightShift), KeyEventKind::Release) => {
                     self.shift_active = false;
+                    self.needs_redraw = true;
                     return Ok(());
                 }
                 // For all other keys, track shift from modifiers field
@@ -183,20 +270,6 @@ impl App {
                 return Ok(());
             }
 
-            if self.mode == AppMode::RestartPrompt {
-                match key.code {
-                    KeyCode::Char('y') => {
-                        self.should_restart = true;
-                        self.should_quit = true;
-                    }
-                    KeyCode::Char('n') | KeyCode::Esc => {
-                        self.mode = AppMode::Normal;
-                    }
-                    _ => {}
-                }
-                return Ok(());
-            }
-
             if self.mode == AppMode::Help {
                 self.mode = AppMode::Normal;
                 return Ok(());
@@ -212,6 +285,15 @@ impl App {
                 return Ok(());
             }
 
+            if self.mode == AppMode::DuplicateSession {
+                self.handle_duplicate_event(key);
+                return Ok(());
+            }
+
+            if self.mode == AppMode::Config {
+                self.handle_config_event(key);
+                return Ok(());
+            }
 
             if self.filter_active {
                 use crossterm::event::Event;
@@ -238,7 +320,7 @@ impl App {
                         self.preview_scroll = u16::MAX;
                     }
                     _ => {
-                        if self.filter_input.handle_event(&Event::Key(key)).is_some() {
+                        if self.filter_input.handle_event(&Event::Key(normalize_key(key))).is_some() {
                             self.recompute_filter();
                             self.preview_scroll = u16::MAX;
                         }
@@ -262,68 +344,8 @@ impl App {
                 (KeyCode::Char('/'), _) => {
                     self.filter_active = true;
                 }
-                (KeyCode::Tab, _) => {
-                    // Cycle: tree[Name] → tree[ShortDir] → tree[FullDir]
-                    //      → flat[Name] → flat[ShortDir] → flat[FullDir] → tree[Name]
-                    match (self.tree_view, self.display_mode) {
-                        (true, crate::config::DisplayMode::Name) => {
-                            self.display_mode = crate::config::DisplayMode::ShortDir;
-                            self.recompute_tree();
-                        }
-                        (true, crate::config::DisplayMode::ShortDir) => {
-                            self.display_mode = crate::config::DisplayMode::FullDir;
-                            self.recompute_tree();
-                        }
-                        (true, crate::config::DisplayMode::FullDir) => {
-                            self.tree_view = false;
-                            self.display_mode = crate::config::DisplayMode::Name;
-                        }
-                        (false, crate::config::DisplayMode::Name) => {
-                            self.display_mode = crate::config::DisplayMode::ShortDir;
-                        }
-                        (false, crate::config::DisplayMode::ShortDir) => {
-                            self.display_mode = crate::config::DisplayMode::FullDir;
-                        }
-                        (false, crate::config::DisplayMode::FullDir) => {
-                            self.tree_view = true;
-                            self.display_mode = crate::config::DisplayMode::Name;
-                            self.recompute_tree();
-                        }
-                    }
-                    self.selected = 0;
-                    self.preview_scroll = u16::MAX;
-                    self.save_config();
-                }
-                (KeyCode::BackTab, _) => {
-                    // Reverse cycle: opposite of Tab
-                    match (self.tree_view, self.display_mode) {
-                        (true, crate::config::DisplayMode::Name) => {
-                            self.tree_view = false;
-                            self.display_mode = crate::config::DisplayMode::FullDir;
-                        }
-                        (true, crate::config::DisplayMode::ShortDir) => {
-                            self.display_mode = crate::config::DisplayMode::Name;
-                            self.recompute_tree();
-                        }
-                        (true, crate::config::DisplayMode::FullDir) => {
-                            self.display_mode = crate::config::DisplayMode::ShortDir;
-                            self.recompute_tree();
-                        }
-                        (false, crate::config::DisplayMode::Name) => {
-                            self.tree_view = true;
-                            self.display_mode = crate::config::DisplayMode::FullDir;
-                            self.recompute_tree();
-                        }
-                        (false, crate::config::DisplayMode::ShortDir) => {
-                            self.display_mode = crate::config::DisplayMode::Name;
-                        }
-                        (false, crate::config::DisplayMode::FullDir) => {
-                            self.display_mode = crate::config::DisplayMode::ShortDir;
-                        }
-                    }
-                    self.selected = 0;
-                    self.preview_scroll = u16::MAX;
-                    self.save_config();
+                (KeyCode::Char('o'), KeyModifiers::NONE) => {
+                    self.mode = AppMode::Config;
                 }
                 (KeyCode::Char('j'), KeyModifiers::NONE) | (KeyCode::Down, KeyModifiers::NONE) => {
                     let count = self.visible_item_count();
@@ -342,19 +364,6 @@ impl App {
                 }
                 (KeyCode::Char('K' | 'k'), KeyModifiers::SHIFT) | (KeyCode::Up, KeyModifiers::SHIFT) => {
                     self.preview_scroll = self.preview_scroll.saturating_sub(3);
-                }
-                (KeyCode::Char('e'), KeyModifiers::NONE) => {
-                    self.hide_empty = !self.hide_empty;
-                    self.recompute_filter();
-                    self.preview_scroll = u16::MAX;
-                    self.save_config();
-                }
-                (KeyCode::Char('c'), KeyModifiers::NONE) => {
-                    self.group_chains = !self.group_chains;
-                    self.preview_cache.clear();
-                    self.recompute_filter();
-                    self.preview_scroll = u16::MAX;
-                    self.save_config();
                 }
                 (KeyCode::Char('n'), KeyModifiers::NONE) => {
                     if let Some(cwd) = self.selected_cwd() {

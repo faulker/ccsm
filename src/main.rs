@@ -1,5 +1,6 @@
 mod app;
 mod config;
+mod config_popup;
 mod data;
 mod keys;
 mod live;
@@ -77,10 +78,23 @@ fn run_app(
     }
 
     loop {
-        terminal.draw(|frame| ui::draw(frame, &mut app))?;
+        if app.needs_redraw {
+            terminal.draw(|frame| ui::draw(frame, &mut app))?;
+            app.needs_redraw = false;
+        }
 
-        if event::poll(std::time::Duration::from_millis(100))? {
+        let poll_timeout = if app.selected_live_index().is_some() {
+            std::time::Duration::from_millis(250)
+        } else {
+            std::time::Duration::from_millis(1000)
+        };
+
+        if event::poll(poll_timeout)? {
+            app.needs_redraw = true;
             app.handle_event()?;
+        } else if app.selected_live_index().is_some() {
+            // Periodic redraw so the live preview pane stays fresh
+            app.needs_redraw = true;
         }
 
         // Check for background update result
@@ -88,6 +102,7 @@ fn run_app(
             if let Ok(info) = rx.try_recv() {
                 app.update_status = update::UpdateStatus::Available(info);
                 app.update_receiver = None;
+                app.needs_redraw = true;
                 // Only show popup if user isn't in a modal (filter, rename, dir browser)
                 if app.mode == app::AppMode::Normal && !app.filter_active {
                     app.mode = app::AppMode::UpdatePrompt;
@@ -100,6 +115,7 @@ fn run_app(
             if let Ok(names) = rx.try_recv() {
                 app.names_receiver = None;
                 app.apply_session_names(names);
+                app.needs_redraw = true;
             }
         }
 
@@ -145,6 +161,7 @@ fn run_app(
             }
             app.reload_live_sessions();
             *terminal = setup_terminal()?;
+            app.needs_redraw = true;
         }
 
         if let Some(info) = app.perform_update.take() {
@@ -152,10 +169,8 @@ fn run_app(
             eprintln!("Downloading {}...", info.tag);
             match update::perform_update(&info) {
                 Ok(()) => {
-                    app.update_status =
-                        update::UpdateStatus::Done(info.tag.clone());
-                    *terminal = setup_terminal()?;
-                    app.mode = app::AppMode::RestartPrompt;
+                    app.should_restart = true;
+                    app.should_quit = true;
                 }
                 Err(e) => {
                     let msg = format!("{:#}", e);
@@ -163,6 +178,7 @@ fn run_app(
                     app.update_status = update::UpdateStatus::Failed(msg);
                     std::thread::sleep(std::time::Duration::from_secs(2));
                     *terminal = setup_terminal()?;
+                    app.needs_redraw = true;
                 }
             }
         }
@@ -176,6 +192,7 @@ fn run_app(
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let new_session = args.iter().any(|a| a == "--new");
+    let spawn_session = args.iter().any(|a| a == "--spawn");
     let live_start = args.iter().any(|a| a == "--live");
     let flat = args.iter().any(|a| a == "--flat") || live_start;
     let filter_path = args.iter().find(|a| !a.starts_with('-')).map(|arg| {
@@ -184,7 +201,7 @@ fn main() -> Result<()> {
             .unwrap_or_else(|_| arg.clone())
     });
 
-    if new_session {
+    if new_session || spawn_session {
         let cwd = std::env::current_dir()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|_| ".".to_string());
@@ -195,7 +212,11 @@ fn main() -> Result<()> {
             .unwrap_or_else(|_| "ccsm".to_string());
         let shell_cmd = format!("claude; exec {}", exe);
         live::start_live_session(&tmux_name, &cwd, &["sh", "-c", &shell_cmd])?;
-        live::attach_to_session(&tmux_name)?;
+        if spawn_session {
+            live::switch_to_session(&tmux_name)?;
+        } else {
+            live::attach_to_session(&tmux_name)?;
+        }
         return Ok(());
     }
 
