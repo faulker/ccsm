@@ -434,25 +434,31 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         .split(chunks[1]);
 
     if app.filter_active {
+        let filter_val = app.filter_input.value();
+        let cursor = app.filter_input.visual_cursor();
+        let char_count = filter_val.chars().count();
+        let before: String = filter_val.chars().take(cursor).collect();
+        let mut cursor_spans = vec![
+            Span::styled(" /", Style::default().fg(ACCENT_PEACH).add_modifier(Modifier::BOLD)),
+            Span::styled(before, Style::default().fg(FG_TEXT)),
+        ];
+        if cursor >= char_count {
+            cursor_spans.push(Span::styled("█", Style::default().fg(ACCENT_BLUE)));
+        } else {
+            let on_cursor: String = filter_val.chars().nth(cursor).unwrap().to_string();
+            let after: String = filter_val.chars().skip(cursor + 1).collect();
+            cursor_spans.push(Span::styled(on_cursor, Style::default().bg(ACCENT_BLUE).fg(BG_SURFACE)));
+            cursor_spans.push(Span::styled(after, Style::default().fg(FG_TEXT)));
+        }
         frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(
-                    " /",
-                    Style::default()
-                        .fg(ACCENT_PEACH)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(&app.filter_text, Style::default().fg(FG_TEXT)),
-                Span::styled("█", Style::default().fg(ACCENT_BLUE)),
-            ]))
-            .style(bar_style),
+            Paragraph::new(Line::from(cursor_spans)).style(bar_style),
             bar_chunks[0],
         );
-    } else if !app.filter_text.is_empty() {
+    } else if !app.filter_input.value().is_empty() {
         frame.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled(" filter: ", Style::default().fg(FG_SUBTEXT)),
-                Span::styled(&app.filter_text, Style::default().fg(FG_TEXT)),
+                Span::styled(app.filter_input.value(), Style::default().fg(FG_TEXT)),
                 Span::raw("  "),
                 Span::styled(
                     "/",
@@ -707,7 +713,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     // Rename popup overlay
     if app.mode == AppMode::Renaming {
-        draw_rename_popup(frame, &app.rename_text);
+        draw_rename_popup(frame, &app.rename_input);
     }
 
     // Update prompt overlay
@@ -731,7 +737,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     // NamingSession overlay (centered popup)
     if app.mode == AppMode::NamingSession {
-        draw_naming_popup(frame, &app.naming_text, &app.naming_placeholder);
+        draw_naming_popup(frame, &app.naming_input, &app.naming_placeholder);
     }
 }
 
@@ -925,8 +931,9 @@ fn apply_sgr(params: &str, mut style: Style) -> Style {
     style
 }
 
+
 /// Render the centered popup for naming a new live session, showing a placeholder when the buffer is empty.
-fn draw_naming_popup(frame: &mut Frame, text: &str, placeholder: &str) {
+fn draw_naming_popup(frame: &mut Frame, input: &tui_input::Input, placeholder: &str) {
     let area = centered_rect(40, 3, frame.area());
     let area = if area.height < 3 {
         Rect { height: 3, ..area }
@@ -935,20 +942,31 @@ fn draw_naming_popup(frame: &mut Frame, text: &str, placeholder: &str) {
     };
     frame.render_widget(Clear, area);
 
-    let display_text = if text.is_empty() { placeholder } else { text };
-    let is_placeholder = text.is_empty();
-
-    let content = Line::from(vec![
-        Span::styled(
-            display_text.to_string(),
-            if is_placeholder {
-                Style::default().fg(FG_OVERLAY)
-            } else {
-                Style::default().fg(FG_TEXT)
-            },
-        ),
-        Span::styled("\u{2588}", Style::default().fg(ACCENT_BLUE)),
-    ]);
+    let content = if input.value().is_empty() {
+        Line::from(vec![
+            Span::styled(placeholder.to_string(), Style::default().fg(FG_OVERLAY)),
+            Span::styled("\u{2588}", Style::default().fg(ACCENT_BLUE)),
+        ])
+    } else {
+        let cursor = input.visual_cursor();
+        let char_count = input.value().chars().count();
+        let before: String = input.value().chars().take(cursor).collect();
+        let content_line = if cursor >= char_count {
+            vec![
+                Span::styled(before, Style::default().fg(FG_TEXT)),
+                Span::styled("\u{2588}", Style::default().fg(ACCENT_BLUE)),
+            ]
+        } else {
+            let on_cursor: String = input.value().chars().nth(cursor).unwrap().to_string();
+            let after: String = input.value().chars().skip(cursor + 1).collect();
+            vec![
+                Span::styled(before, Style::default().fg(FG_TEXT)),
+                Span::styled(on_cursor, Style::default().bg(ACCENT_BLUE).fg(BG_SURFACE)),
+                Span::styled(after, Style::default().fg(FG_TEXT)),
+            ]
+        };
+        Line::from(content_line)
+    };
 
     let popup = Paragraph::new(content).block(
         Block::default()
@@ -1161,8 +1179,8 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 
 
 /// Render the centered rename popup showing the current `text` and a block cursor.
-fn draw_rename_popup(frame: &mut Frame, text: &str) {
-    let area = centered_rect(40, 15, frame.area());
+fn draw_rename_popup(frame: &mut Frame, input: &tui_input::Input) {
+    let area = centered_rect(40, 3, frame.area());
     // Ensure minimum usable height of 3 lines
     let area = if area.height < 3 {
         Rect { height: 3, ..area }
@@ -1171,10 +1189,23 @@ fn draw_rename_popup(frame: &mut Frame, text: &str) {
     };
     frame.render_widget(Clear, area);
 
-    let content = Line::from(vec![
-        Span::styled(text, Style::default().fg(FG_TEXT)),
-        Span::styled("\u{2588}", Style::default().fg(ACCENT_BLUE)),
-    ]);
+    let cursor = input.visual_cursor();
+    let char_count = input.value().chars().count();
+    let before: String = input.value().chars().take(cursor).collect();
+    let content = if cursor >= char_count {
+        Line::from(vec![
+            Span::styled(before, Style::default().fg(FG_TEXT)),
+            Span::styled("\u{2588}", Style::default().fg(ACCENT_BLUE)),
+        ])
+    } else {
+        let on_cursor: String = input.value().chars().nth(cursor).unwrap().to_string();
+        let after: String = input.value().chars().skip(cursor + 1).collect();
+        Line::from(vec![
+            Span::styled(before, Style::default().fg(FG_TEXT)),
+            Span::styled(on_cursor, Style::default().bg(ACCENT_BLUE).fg(BG_SURFACE)),
+            Span::styled(after, Style::default().fg(FG_TEXT)),
+        ])
+    };
 
     let popup = Paragraph::new(content).block(
         Block::default()

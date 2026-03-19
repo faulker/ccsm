@@ -5,84 +5,77 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, Modifie
 impl App {
     /// Handle a key event while the rename popup is open.
     ///
-    /// When `rename_project` is `None` the rename targets a live tmux session; otherwise it
-    /// targets a historical Claude session. Esc cancels, Enter commits the new name,
-    /// Backspace deletes the last character, and printable characters are appended to `rename_text`.
+    /// Esc cancels, Enter commits the new name, all other editing keys
+    /// (arrows, Home/End, Backspace, Delete, printable chars) are delegated
+    /// to the `rename_input` state via `tui_input`.
     fn handle_rename_event(&mut self, key: crossterm::event::KeyEvent) {
-        // If rename_project is None, it's a live session rename
+        use crossterm::event::Event;
+        use tui_input::backend::crossterm::EventHandler;
+
+        // Live session rename (rename_project is None)
         if self.rename_project.is_none() {
-            if key.code == KeyCode::Esc {
-                self.mode = AppMode::Normal;
-                self.rename_text.clear();
-                self.rename_session_id = None;
-                return;
-            }
-            if key.code == KeyCode::Enter {
-                if let Some(tmux_name) = self.rename_session_id.take() {
-                    let new_name = self.rename_text.trim().to_string();
-                    if !new_name.is_empty() {
-                        // Update claude session titles that match the old tmux name
-                        let cwd = self.live_sessions.iter()
-                            .find(|ls| ls.tmux_name == tmux_name)
-                            .map(|ls| ls.cwd.clone());
-                        if let Some(cwd) = cwd {
-                            for session in &mut self.sessions {
-                                if session.project == cwd && session.name.as_deref() == Some(&tmux_name) {
-                                    if let Err(e) = data::save_custom_title(&session.project, &session.session_id, &new_name) {
-                                        eprintln!("Failed to save custom title: {e}");
-                                    }
-                                    session.name = Some(new_name.clone());
-                                }
-                            }
-                            self.preview_cache.clear();
-                        }
-                        match std::process::Command::new("tmux")
-                            .args(["-L", live::TMUX_SOCKET, "rename-session", "-t", &tmux_name, &new_name])
-                            .output()
-                        {
-                            Err(e) => eprintln!("Failed to rename tmux session: {e}"),
-                            Ok(out) if !out.status.success() => {
-                                eprintln!("Failed to rename tmux session: {}", String::from_utf8_lossy(&out.stderr).trim());
-                            }
-                            Ok(_) => {}
-                        }
-                        self.live_sessions = live::discover_live_sessions();
-                        self.live_preview_cache.clear();
-                        self.recompute_flat_rows();
-                        self.recompute_tree();
-                    }
+            match key.code {
+                KeyCode::Esc => {
+                    self.mode = AppMode::Normal;
+                    self.rename_input = tui_input::Input::default();
+                    self.rename_session_id = None;
                 }
-                self.rename_text.clear();
-                self.mode = AppMode::Normal;
-                return;
-            }
-            if key.code == KeyCode::Backspace {
-                self.rename_text.pop();
-                return;
-            }
-            if let KeyCode::Char(c) = key.code {
-                let c = if key.modifiers.contains(KeyModifiers::SHIFT) {
-                    c.to_ascii_uppercase()
-                } else {
-                    c
-                };
-                self.rename_text.push(c);
+                KeyCode::Enter => {
+                    if let Some(tmux_name) = self.rename_session_id.take() {
+                        let new_name = self.rename_input.value().trim().to_string();
+                        if !new_name.is_empty() {
+                            let cwd = self.live_sessions.iter()
+                                .find(|ls| ls.tmux_name == tmux_name)
+                                .map(|ls| ls.cwd.clone());
+                            if let Some(cwd) = cwd {
+                                for session in &mut self.sessions {
+                                    if session.project == cwd && session.name.as_deref() == Some(&tmux_name) {
+                                        if let Err(e) = data::save_custom_title(&session.project, &session.session_id, &new_name) {
+                                            eprintln!("Failed to save custom title: {e}");
+                                        }
+                                        session.name = Some(new_name.clone());
+                                    }
+                                }
+                                self.preview_cache.clear();
+                            }
+                            match std::process::Command::new("tmux")
+                                .args(["-L", live::TMUX_SOCKET, "rename-session", "-t", &tmux_name, &new_name])
+                                .output()
+                            {
+                                Err(e) => eprintln!("Failed to rename tmux session: {e}"),
+                                Ok(out) if !out.status.success() => {
+                                    eprintln!("Failed to rename tmux session: {}", String::from_utf8_lossy(&out.stderr).trim());
+                                }
+                                Ok(_) => {}
+                            }
+                            self.live_sessions = live::discover_live_sessions();
+                            self.live_preview_cache.clear();
+                            self.recompute_flat_rows();
+                            self.recompute_tree();
+                        }
+                    }
+                    self.rename_input = tui_input::Input::default();
+                    self.mode = AppMode::Normal;
+                }
+                _ => {
+                    self.rename_input.handle_event(&Event::Key(key));
+                }
             }
             return;
         }
 
+        // Historical session rename
         match key.code {
             KeyCode::Esc => {
                 self.mode = AppMode::Normal;
-                self.rename_text.clear();
+                self.rename_input = tui_input::Input::default();
                 self.rename_session_id = None;
                 self.rename_project = None;
             }
             KeyCode::Enter => {
                 if let Some(session_id) = self.rename_session_id.take() {
                     let project = self.rename_project.take().unwrap_or_default();
-                    let name = self.rename_text.trim().to_string();
-                    // Write to the session JSONL (even empty to clear)
+                    let name = self.rename_input.value().trim().to_string();
                     if let Err(e) = data::save_custom_title(&project, &session_id, &name) {
                         eprintln!("Failed to save custom title: {e}");
                     }
@@ -94,39 +87,34 @@ impl App {
                     }
                     self.preview_cache.clear();
                 }
-                self.rename_text.clear();
+                self.rename_input = tui_input::Input::default();
                 self.mode = AppMode::Normal;
             }
-            KeyCode::Backspace => {
-                self.rename_text.pop();
+            _ => {
+                self.rename_input.handle_event(&Event::Key(key));
             }
-            KeyCode::Char(c) => {
-                let c = if key.modifiers.contains(KeyModifiers::SHIFT) {
-                    c.to_ascii_uppercase()
-                } else {
-                    c
-                };
-                self.rename_text.push(c);
-            }
-            _ => {}
         }
     }
 
     /// Handle a key event while the new-session naming popup is open.
-    /// Esc cancels, Enter confirms (using the placeholder if the buffer is empty),
-    /// Backspace removes the last character, and printable characters are appended.
+    ///
+    /// Esc cancels, Enter confirms (using the placeholder if empty), all other
+    /// editing keys are delegated to `naming_input` via `tui_input`.
     fn handle_naming_event(&mut self, key: crossterm::event::KeyEvent) {
+        use crossterm::event::Event;
+        use tui_input::backend::crossterm::EventHandler;
+
         match key.code {
             KeyCode::Esc => {
                 self.mode = AppMode::Normal;
-                self.naming_text.clear();
+                self.naming_input = tui_input::Input::default();
                 self.naming_cwd = None;
             }
             KeyCode::Enter => {
-                let raw = if self.naming_text.is_empty() {
+                let raw = if self.naming_input.value().is_empty() {
                     self.naming_placeholder.clone()
                 } else {
-                    self.naming_text.clone()
+                    self.naming_input.value().to_string()
                 };
                 // Sanitize: tmux disallows '.' ':' and whitespace in session names
                 let name: String = raw
@@ -136,21 +124,12 @@ impl App {
                 let name = if name.is_empty() { self.naming_placeholder.clone() } else { name };
                 let cwd = self.naming_cwd.take().unwrap_or_else(|| ".".to_string());
                 self.mode = AppMode::Normal;
-                self.naming_text.clear();
+                self.naming_input = tui_input::Input::default();
                 self.launch_session = Some(LaunchRequest::NewLive { name, cwd });
             }
-            KeyCode::Backspace => {
-                self.naming_text.pop();
+            _ => {
+                self.naming_input.handle_event(&Event::Key(key));
             }
-            KeyCode::Char(c) => {
-                let c = if key.modifiers.contains(KeyModifiers::SHIFT) {
-                    c.to_ascii_uppercase()
-                } else {
-                    c
-                };
-                self.naming_text.push(c);
-            }
-            _ => {}
         }
     }
 
@@ -161,6 +140,10 @@ impl App {
     pub fn handle_event(&mut self) -> anyhow::Result<()> {
         if let Event::Key(key) = event::read()? {
             // Track shift state for UI highlighting
+            // Capture before updating — needed for terminals (e.g. Ghostty) that don't
+            // populate KeyModifiers::SHIFT on Enter, so the pre-update value is used
+            // as a fallback in the Shift+Enter match arm below.
+            let prev_shift_active = self.shift_active;
             match (&key.code, key.kind) {
                 // Bare shift press/release — update flag and consume event
                 (KeyCode::Modifier(ModifierKeyCode::LeftShift | ModifierKeyCode::RightShift), KeyEventKind::Press) => {
@@ -231,36 +214,22 @@ impl App {
 
 
             if self.filter_active {
+                use crossterm::event::Event;
+                use tui_input::backend::crossterm::EventHandler;
                 match key.code {
                     KeyCode::Esc => {
                         self.filter_active = false;
-                        self.filter_text.clear();
+                        self.filter_input = tui_input::Input::default();
                         self.recompute_filter();
                         self.preview_scroll = u16::MAX;
                     }
                     KeyCode::Enter => {
                         self.filter_active = false;
                     }
-                    KeyCode::Backspace => {
-                        self.filter_text.pop();
-                        self.recompute_filter();
-                        self.preview_scroll = u16::MAX;
-                    }
-                    KeyCode::Char(c) => {
-                        let c = if key.modifiers.contains(KeyModifiers::SHIFT) {
-                            c.to_ascii_uppercase()
-                        } else {
-                            c
-                        };
-                        self.filter_text.push(c);
-                        self.recompute_filter();
-                        self.preview_scroll = u16::MAX;
-                    }
                     KeyCode::Down => {
                         let count = self.visible_item_count();
                         if count > 0 {
-                            self.selected =
-                                (self.selected + 1).min(count - 1);
+                            self.selected = (self.selected + 1).min(count - 1);
                             self.preview_scroll = u16::MAX;
                         }
                     }
@@ -268,7 +237,12 @@ impl App {
                         self.selected = self.selected.saturating_sub(1);
                         self.preview_scroll = u16::MAX;
                     }
-                    _ => {}
+                    _ => {
+                        if self.filter_input.handle_event(&Event::Key(key)).is_some() {
+                            self.recompute_filter();
+                            self.preview_scroll = u16::MAX;
+                        }
+                    }
                 }
                 return Ok(());
             }
@@ -393,7 +367,7 @@ impl App {
                         let placeholder = live::generate_auto_name(&dir, &self.live_sessions);
                         self.naming_placeholder = placeholder;
                         self.naming_cwd = Some(dir);
-                        self.naming_text.clear();
+                        self.naming_input = tui_input::Input::default();
                         self.mode = AppMode::NamingSession;
                     }
                 }
@@ -424,7 +398,7 @@ impl App {
                     // Check if a live session is selected first
                     if let Some(idx) = self.selected_live_index() {
                         let session = &self.live_sessions[idx];
-                        self.rename_text = session.display_name.clone();
+                        self.rename_input = tui_input::Input::from(session.display_name.clone());
                         self.rename_session_id = Some(session.tmux_name.clone());
                         self.rename_project = None;
                         self.mode = AppMode::Renaming;
@@ -446,10 +420,9 @@ impl App {
                         self.rename_session_id = Some(session.session_id.clone());
                         self.rename_project = Some(session.project.clone());
                         // Pre-fill with the chain's effective name (may come from any member)
-                        self.rename_text = self
-                            .chain_name_for(idx)
-                            .unwrap_or("")
-                            .to_string();
+                        self.rename_input = tui_input::Input::from(
+                            self.chain_name_for(idx).unwrap_or("").to_string()
+                        );
                         self.mode = AppMode::Renaming;
                     }
                 }
@@ -460,7 +433,7 @@ impl App {
                         .unwrap_or_else(|| ".".to_string());
                     self.launch_session = Some(LaunchRequest::NewDirect { cwd });
                 }
-                (KeyCode::Enter, _) if key.modifiers.contains(KeyModifiers::SHIFT) && self.is_historical_selected() => {
+                (KeyCode::Enter, _) if (key.modifiers.contains(KeyModifiers::SHIFT) || prev_shift_active) && self.is_historical_selected() => {
                     // Shift+Enter: open historical session directly (no tmux)
                     if self.tree_view {
                         if let Some(TreeRow::Session { session_index }) =

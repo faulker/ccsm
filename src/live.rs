@@ -80,10 +80,11 @@ pub fn ensure_server_configured() -> anyhow::Result<()> {
     }
     // Within tmux double-quoted strings, \\ is a literal backslash.
     // For bind-key in config files, single-quote the key spec to avoid backslash escape issues.
-    let conf_content = concat!(
+    let mut conf_content = concat!(
         "set -g history-limit 50000\n",
         "set -g mouse on\n",
         "set -g default-terminal \"tmux-256color\"\n",
+        "set -g extended-keys on\n",
         "set -g status on\n",
         "set -g status-interval 1\n",
         "set -g status-style \"bg=#1e1e2e,fg=#cdd6f4\"\n",
@@ -93,8 +94,17 @@ pub fn ensure_server_configured() -> anyhow::Result<()> {
         "bind-key -n 'C-\\' detach-client\n",
         "bind-key -n C-n switch-client -n\n",
         "bind-key -n C-p switch-client -p\n",
-    );
-    std::fs::write(&conf_path, conf_content)
+    ).to_string();
+
+    // When running inside Ghostty, bind Shift+Enter to send ESC + Enter (\x1b\r).
+    // Ghostty supports the kitty keyboard protocol, so tmux (with extended-keys on)
+    // receives Shift+Enter as S-Enter; we forward it as the escape sequence that
+    // Claude interprets as "new line without submitting".
+    if std::env::var("TERM_PROGRAM").ok().as_deref() == Some("ghostty") {
+        conf_content.push_str("bind-key -n S-Enter send-keys Escape Enter\n");
+    }
+
+    std::fs::write(&conf_path, &conf_content)
         .with_context(|| format!("Failed to write tmux config: {}", conf_path.display()))?;
     // If the server is already running, source the config to update bindings.
     // If not running, start-server is unreliable on tmux 3.x — the server is started

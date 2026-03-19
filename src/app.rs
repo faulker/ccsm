@@ -4,6 +4,7 @@ use crate::live::{self, LiveSession};
 use crate::update;
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
+use tui_input::Input;
 
 /// One visible row in the tree-view session list.
 #[derive(Debug, Clone, PartialEq)]
@@ -98,8 +99,8 @@ pub struct App {
     pub should_quit: bool,
     /// Populated when a session launch has been requested; consumed by the main loop.
     pub launch_session: Option<LaunchRequest>,
-    /// Text currently typed into the filter input.
-    pub filter_text: String,
+    /// Input state for the live filter bar.
+    pub filter_input: Input,
     /// True while the filter input is in focus (editing mode).
     pub filter_active: bool,
     /// Indices into `sessions` that match the current filter, sorted by recency.
@@ -126,8 +127,8 @@ pub struct App {
     pub config: Config,
     /// True while a Shift key is held down, used to highlight shift-key hints in the status bar.
     pub shift_active: bool,
-    /// Buffer holding the text typed in the rename input popup.
-    pub rename_text: String,
+    /// Input state for the rename popup.
+    pub rename_input: Input,
     /// Session ID being renamed, or tmux name if renaming a live session.
     pub rename_session_id: Option<String>,
     /// Project path for the session being renamed (`None` when renaming a live session).
@@ -146,8 +147,8 @@ pub struct App {
     pub live_sessions: Vec<LiveSession>,
     /// When true, only projects with active live sessions are shown.
     pub live_filter: bool,
-    /// Text typed into the new-session naming popup.
-    pub naming_text: String,
+    /// Input state for the new-session naming popup.
+    pub naming_input: Input,
     /// Auto-generated placeholder shown when `naming_text` is empty.
     pub naming_placeholder: String,
     /// Working directory to use for the new session being named.
@@ -186,7 +187,7 @@ impl App {
             preview_scroll: u16::MAX,
             should_quit: false,
             launch_session: None,
-            filter_text: String::new(),
+            filter_input: Input::default(),
             filter_active: false,
             filtered_indices,
             filter_path,
@@ -200,7 +201,7 @@ impl App {
             mode: AppMode::Normal,
             config,
             shift_active: false,
-            rename_text: String::new(),
+            rename_input: Input::default(),
             rename_session_id: None,
             rename_project: None,
             update_status: update::UpdateStatus::None,
@@ -210,7 +211,7 @@ impl App {
             should_restart: false,
             live_sessions: live::discover_live_sessions(),
             live_filter,
-            naming_text: String::new(),
+            naming_input: Input::default(),
             naming_placeholder: String::new(),
             naming_cwd: None,
             live_preview_cache: HashMap::new(),
@@ -297,7 +298,7 @@ impl App {
     /// Recompute `filtered_indices` from the current filter text, hide-empty flag, and chain
     /// grouping setting, then rebuild both tree and flat views and clamp the selection.
     pub(crate) fn recompute_filter(&mut self) {
-        let query = self.filter_text.to_lowercase();
+        let query = self.filter_input.value().to_lowercase();
         let initial_indices: Vec<usize> = if query.is_empty() {
             (0..self.sessions.len())
                 .filter(|&i| !self.hide_empty || self.sessions[i].has_data)
@@ -778,6 +779,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tui_input::Input;
 
     /// Creates an App with live sessions cleared so tests are not affected by
     /// any tmux sessions running on the host machine.
@@ -834,7 +836,7 @@ mod tests {
         assert_eq!(app.filtered_indices, vec![2, 1, 0]);
         assert_eq!(app.selected, 0);
         assert!(!app.filter_active);
-        assert!(app.filter_text.is_empty());
+        assert!(app.filter_input.value().is_empty());
         assert!(app.tree_view);
         assert!(!app.shift_active);
     }
@@ -891,7 +893,7 @@ mod tests {
     #[test]
     fn test_filter_narrows_indices() {
         let mut app = make_app(make_sessions(), None, Config::default());
-        app.filter_text = "beta".into();
+        app.filter_input = Input::from("beta");
         app.recompute_filter();
         assert_eq!(app.filtered_indices, vec![1]);
     }
@@ -899,7 +901,7 @@ mod tests {
     #[test]
     fn test_filter_case_insensitive() {
         let mut app = make_app(make_sessions(), None, Config::default());
-        app.filter_text = "ALPHA".into();
+        app.filter_input = Input::from("ALPHA");
         app.recompute_filter();
         assert_eq!(app.filtered_indices, vec![0]);
     }
@@ -907,7 +909,7 @@ mod tests {
     #[test]
     fn test_filter_matches_path() {
         let mut app = make_app(make_sessions(), None, Config::default());
-        app.filter_text = "/Dev/gamma".into();
+        app.filter_input = Input::from("/Dev/gamma");
         app.recompute_filter();
         assert_eq!(app.filtered_indices, vec![2]);
     }
@@ -915,7 +917,7 @@ mod tests {
     #[test]
     fn test_filter_no_match() {
         let mut app = make_app(make_sessions(), None, Config::default());
-        app.filter_text = "nonexistent".into();
+        app.filter_input = Input::from("nonexistent");
         app.recompute_filter();
         assert!(app.filtered_indices.is_empty());
         assert_eq!(app.selected_session_index(), None);
@@ -924,11 +926,11 @@ mod tests {
     #[test]
     fn test_clear_filter_restores_all() {
         let mut app = make_app(make_sessions(), None, Config::default());
-        app.filter_text = "beta".into();
+        app.filter_input = Input::from("beta");
         app.recompute_filter();
         assert_eq!(app.filtered_indices.len(), 1);
 
-        app.filter_text.clear();
+        app.filter_input = Input::default();
         app.recompute_filter();
         // Sorted by last_timestamp desc: s3(4000), s2(3000), s1(2000) → [2, 1, 0]
         assert_eq!(app.filtered_indices, vec![2, 1, 0]);
@@ -939,7 +941,7 @@ mod tests {
         let mut app = make_app(make_sessions(), None, Config::default());
         app.tree_view = false;
         app.selected = 2;
-        app.filter_text = "alpha".into();
+        app.filter_input = Input::from("alpha");
         app.recompute_filter();
         // selected was 2 but only 1 match, should clamp to 0
         assert_eq!(app.selected, 0);
@@ -950,7 +952,7 @@ mod tests {
     fn test_selected_session_index() {
         let mut app = make_app(make_sessions(), None, Config::default());
         app.tree_view = false;
-        app.filter_text = "amma".into(); // matches only gamma
+        app.filter_input = Input::from("amma"); // matches only gamma
         app.recompute_filter();
         assert_eq!(app.filtered_indices, vec![2]);
         app.selected = 0;
@@ -1097,7 +1099,7 @@ mod tests {
     fn test_tree_with_filter() {
         let mut app = make_app(make_sessions_with_shared_projects(), None, Config::default());
         app.display_mode = DisplayMode::Name;
-        app.filter_text = "alpha".into();
+        app.filter_input = Input::from("alpha");
         app.recompute_filter();
         // Only alpha sessions should appear, but collapsed
         assert_eq!(app.tree_rows.len(), 1); // 1 header (collapsed)
@@ -1355,12 +1357,12 @@ mod tests {
         let mut app = make_app(make_sessions_mixed_data(), None, Config::default());
         app.tree_view = false;
         app.hide_empty = true;
-        app.filter_text = "a".into(); // matches alpha and gamma; sorted desc: s3(4000), s1(2000) → [2, 0]
+        app.filter_input = Input::from("a"); // matches alpha and gamma; sorted desc: s3(4000), s1(2000) → [2, 0]
         app.recompute_filter();
         assert_eq!(app.filtered_indices, vec![2, 0]);
 
         // beta matches text but has_data=false
-        app.filter_text = "beta".into();
+        app.filter_input = Input::from("beta");
         app.recompute_filter();
         assert!(app.filtered_indices.is_empty());
     }
@@ -1553,7 +1555,7 @@ mod tests {
         let idx = app.selected_session_index().unwrap();
         let session_id = app.sessions[idx].session_id.clone();
         app.rename_session_id = Some(session_id.clone());
-        app.rename_text = String::new();
+        app.rename_input = Input::default();
         app.mode = AppMode::Renaming;
 
         assert_eq!(app.mode, AppMode::Renaming);
