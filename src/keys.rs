@@ -63,7 +63,8 @@ impl App {
                                 }
                                 self.preview_cache.clear();
                             }
-                            match std::process::Command::new("tmux")
+                            let tmux = crate::config::Config::load().tmux_bin().to_string();
+                            match std::process::Command::new(&tmux)
                                 .args(["-L", live::TMUX_SOCKET, "rename-session", "-t", &tmux_name, &new_name])
                                 .output()
                             {
@@ -292,6 +293,11 @@ impl App {
 
             if self.mode == AppMode::Config {
                 self.handle_config_event(key);
+                return Ok(());
+            }
+
+            if self.mode == AppMode::MissingDeps {
+                self.handle_missing_deps_event(key);
                 return Ok(());
             }
 

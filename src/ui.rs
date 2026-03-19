@@ -673,6 +673,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         crate::config_popup::draw_config_popup(frame, app);
     }
 
+    // MissingDeps popup
+    if app.mode == AppMode::MissingDeps {
+        crate::config_popup::draw_missing_deps_popup(frame, app);
+    }
+
     // DuplicateSession confirmation popup
     if app.mode == AppMode::DuplicateSession {
         if let Some(ref name) = app.duplicate_name.clone() {

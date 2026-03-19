@@ -84,6 +84,8 @@ pub enum AppMode {
     DuplicateSession,
     /// The config popup is open.
     Config,
+    /// One or more required binaries (claude/tmux) are missing.
+    MissingDeps,
 }
 
 /// Tracks which popup triggered the duplicate-name check, so we can return to the right mode.
@@ -179,8 +181,16 @@ pub struct App {
     pub duplicate_source: Option<DuplicateSource>,
     /// The cwd to restore if the user chooses to pick a different name (NamingSession source only).
     pub duplicate_cwd: Option<String>,
-    /// Currently selected row in the config popup (0..2).
+    /// Currently selected row in the config popup (0..4).
     pub config_selected: usize,
+    /// True when the `claude` binary cannot be found at startup.
+    pub missing_claude: bool,
+    /// True when the `tmux` binary cannot be found at startup.
+    pub missing_tmux: bool,
+    /// True when editing a text field in the config popup (path fields).
+    pub config_editing: bool,
+    /// Input state for the path text field in the config popup.
+    pub config_path_input: Input,
 }
 
 /// Truncate a path to its last 2 components (e.g. "/Users/sane/Dev/ccsm" -> "Dev/ccsm").
@@ -243,7 +253,21 @@ impl App {
             duplicate_source: None,
             duplicate_cwd: None,
             config_selected: 0,
+            missing_claude: false,
+            missing_tmux: false,
+            config_editing: false,
+            config_path_input: Input::default(),
         };
+
+        // Check for required binaries
+        let claude_ok = Config::is_bin_available(app.config.claude_bin());
+        let tmux_ok = Config::is_bin_available(app.config.tmux_bin());
+        if !claude_ok || !tmux_ok {
+            app.missing_claude = !claude_ok;
+            app.missing_tmux = !tmux_ok;
+            app.mode = AppMode::MissingDeps;
+        }
+
         app.spawn_load_session_names();
         app.init_tree();
         app.recompute_filter();
@@ -307,6 +331,7 @@ impl App {
         self.config.group_chains = self.group_chains;
         self.config.live_filter = self.live_filter;
         self.config.favorites = self.favorites.clone();
+        // claude_path and tmux_path are saved directly on config when edited
         if let Err(e) = self.config.save() {
             eprintln!("Failed to save config: {e}");
         }

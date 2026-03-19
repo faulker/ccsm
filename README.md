@@ -1,6 +1,6 @@
 # ccsm — Claude Code Session Manager
 
-A terminal UI for browsing your Claude Code session history, previewing conversations, resuming or starting sessions in their original working directory, and managing live tmux-backed Claude sessions.
+A terminal UI that puts all your Claude Code sessions in one place. Browse past conversations, resume where you left off, and spin up new sessions — all without leaving the terminal. If you juggle multiple projects or frequently context-switch between Claude sessions, ccsm keeps everything organized and a keystroke away so you can stay in flow.
 
 ## Screenshots
 
@@ -11,31 +11,19 @@ Sessions grouped by project with an expanded group showing individual sessions. 
 
 ## Features
 
-- **Tree view** (default) — sessions grouped by project, collapsed on startup, expand/collapse with arrow keys
-- **Flat view** — all sessions in a single sorted list with project name, date, and message count
-- **Display modes** — cycle through Name, Short Dir, and Full Dir labels for project groups in tree view
-- Shows a scrollable preview of conversation messages (last 20 turns)
-- **Session info bar** — displays working directory and git branch for the selected session; shows the project directory even when a header row is selected with no active session
-- Resume any session via tmux (`Enter`) or directly in the foreground without tmux (`Shift+Enter`)
-- **Live sessions** — start and manage tmux-backed Claude sessions; running sessions appear at the top of the list with a live indicator
-- **New session** — start a new live tmux session in the selected project's directory (`n`, prompts for a name); or start a foreground claude session directly in the selected directory (`Shift+N`, no tmux); or bypass the TUI entirely with `ccsm --new` to start a session in the current directory
-- **Duplicate detection** — when creating or renaming a session, duplicate names are caught with options to open the existing session, pick a different name, or cancel
-- **Live-only filter** — toggle with `l` to show only running sessions; persisted in config
-- **Stop live session** — kill the selected running session with `x`
-- Search and filter sessions by project name or path
-- **Config popup** — press `o` to toggle hide-empty, session grouping, and view mode from a single popup
-- Lazy-loads and caches session previews for fast navigation
-- **Live session preview** — shows live tmux pane output for running sessions
-- **Auto-update** — checks GitHub Releases in the background on startup (every 24h), shows a centered prompt with current vs new version, and self-updates the binary on confirm; automatically restarts after a successful update
-- **Session names** — custom titles loaded in the background for fast startup
-- **Help overlay** — press `?` for a full in-app keybinding reference
-- **Favorites** — pin projects to the top of the list with `f`; shown with a ★ indicator; persisted in config
-- **Persistent config** — view mode, display mode, hide-empty, session grouping, live filter preference, favorites, and update check timestamp saved to `~/.config/ccsm/config.json`
-- Optional path argument to scope sessions to a specific directory
-- Version label displayed in the bottom-right of the help bar
-- Catppuccin Mocha-inspired color theme
-- **Smart redraw** — only redraws the screen when state changes, with adaptive polling for live session previews
-- **Ghostty/tmux compatibility** — keyboard input normalization for correct Shift+key handling
+- **Tree & flat views** — browse sessions grouped by project or as a flat list; cycle display modes with `Tab`
+- **Conversation preview** — scrollable preview of the last 20 turns with working directory and git branch in the info bar
+- **Resume anywhere** — resume a session in tmux (`Enter`) or directly in the foreground (`Shift+Enter`)
+- **Live sessions** — start, attach, detach, rename, and stop tmux-backed Claude sessions; running sessions surface at the top with a live indicator and real-time pane preview
+- **Quick launch** — `n` for a named tmux session, `Shift+N` for a foreground session, or `ccsm --new` / `ccsm --spawn` to skip the TUI entirely
+- **Duplicate detection** — catches duplicate session names with options to open, rename, or cancel
+- **Search & filter** — filter by project name or path; toggle live-only mode with `l`
+- **Favorites** — pin projects to the top of the list with `f`
+- **Config popup** — press `o` to toggle hide-empty, session grouping, and view mode in one place
+- **Auto-update** — background update checks with one-key install and automatic restart
+- **Help overlay** — press `?` for a full keybinding reference
+- **Persistent config** — preferences saved to `~/.config/ccsm/config.json`
+- Catppuccin Mocha color theme
 
 ## Requirements
 
@@ -85,35 +73,31 @@ The binary will be at `target/release/ccsm`.
 ## Run
 
 ```sh
-cargo run --release
-# or
-./target/release/ccsm
+ccsm
 ```
 
 Optionally pass a path to show only sessions from that directory:
 
 ```sh
-./target/release/ccsm ~/projects/my-app
+ccsm ~/projects/my-app
 ```
 
 Use `--flat` to start in flat view instead of the default grouped tree view:
 
 ```sh
-./target/release/ccsm --flat
-./target/release/ccsm --flat ~/projects/my-app
+ccsm --flat
+ccsm --flat ~/projects/my-app
 ```
 
 Use `--live` to start directly in live-only filter mode (implies `--flat`), showing only running tmux sessions:
 
 ```sh
-./target/release/ccsm --live
+ccsm --live
 ```
 
 Use `--new` to immediately start a new live Claude session in the current directory and attach to it, without opening the TUI. After Claude exits, ccsm relaunches automatically:
 
 ```sh
-./target/release/ccsm --new
-# or from anywhere:
 ccsm --new
 ```
 

@@ -51,6 +51,7 @@ fn run_app(
     filter_path: Option<String>,
     flat: bool,
     live_start: bool,
+    new_session: bool,
 ) -> Result<bool> {
     let config = config::Config::load();
     let mut app = App::new(sessions, filter_path.clone(), config);
@@ -60,6 +61,13 @@ fn run_app(
     if live_start {
         app.live_filter = true;
         app.recompute_flat_rows();
+    }
+    if new_session {
+        let cwd = std::env::current_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| ".".to_string());
+        let name = live::generate_auto_name(&cwd, &app.live_sessions);
+        app.launch_session = Some(app::LaunchRequest::NewLive { name, cwd });
     }
 
     // Always spawn background update check (non-blocking)
@@ -130,12 +138,14 @@ fn run_app(
                     let dir = if std::path::Path::new(&cwd).exists() { &cwd } else { "." };
                     let live_sessions = live::discover_live_sessions();
                     let tmux_name = live::generate_auto_name(dir, &live_sessions);
-                    live::start_live_session(&tmux_name, dir, &["claude", "--resume", &session_id])?;
+                    let claude = config::Config::load().claude_bin().to_string();
+                    live::start_live_session(&tmux_name, dir, &[&claude, "--resume", &session_id])?;
                     live::attach_to_session(&tmux_name)?;
                 }
                 app::LaunchRequest::Direct { session_id, cwd } => {
                     let dir = if std::path::Path::new(&cwd).exists() { &cwd } else { "." };
-                    std::process::Command::new("claude")
+                    let claude = config::Config::load().claude_bin().to_string();
+                    std::process::Command::new(&claude)
                         .arg("--resume")
                         .arg(&session_id)
                         .current_dir(dir)
@@ -145,12 +155,14 @@ fn run_app(
                     live::attach_to_session(&tmux_name)?;
                 }
                 app::LaunchRequest::NewLive { name, cwd } => {
-                    live::start_live_session(&name, &cwd, &["claude", "--name", &name])?;
+                    let claude = config::Config::load().claude_bin().to_string();
+                    live::start_live_session(&name, &cwd, &[&claude, "--name", &name])?;
                     live::attach_to_session(&name)?;
                 }
                 app::LaunchRequest::NewDirect { cwd } => {
                     let dir = if std::path::Path::new(&cwd).exists() { &cwd } else { "." };
-                    std::process::Command::new("claude")
+                    let claude = config::Config::load().claude_bin().to_string();
+                    std::process::Command::new(&claude)
                         .current_dir(dir)
                         .status()?;
                 }
@@ -188,7 +200,7 @@ fn run_app(
 }
 
 /// Entry point. Parses CLI arguments, loads sessions, sets up the terminal and runs the TUI.
-/// On `--new` starts a new live session and immediately attaches to it, bypassing the TUI.
+/// On `--new` starts the TUI and immediately launches a new live session (like pressing `n`).
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let new_session = args.iter().any(|a| a == "--new");
@@ -201,7 +213,7 @@ fn main() -> Result<()> {
             .unwrap_or_else(|_| arg.clone())
     });
 
-    if new_session || spawn_session {
+    if spawn_session {
         let cwd = std::env::current_dir()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|_| ".".to_string());
@@ -210,13 +222,10 @@ fn main() -> Result<()> {
         let exe = std::env::current_exe()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|_| "ccsm".to_string());
-        let shell_cmd = format!("claude; exec {}", exe);
+        let claude = config::Config::load().claude_bin().to_string();
+        let shell_cmd = format!("{}; exec {}", claude, exe);
         live::start_live_session(&tmux_name, &cwd, &["sh", "-c", &shell_cmd])?;
-        if spawn_session {
-            live::switch_to_session(&tmux_name)?;
-        } else {
-            live::attach_to_session(&tmux_name)?;
-        }
+        live::switch_to_session(&tmux_name)?;
         return Ok(());
     }
 
@@ -244,7 +253,7 @@ fn main() -> Result<()> {
     }));
 
     let mut terminal = setup_terminal()?;
-    let should_restart = run_app(&mut terminal, sessions, filter_path, flat, live_start)?;
+    let should_restart = run_app(&mut terminal, sessions, filter_path, flat, live_start, new_session)?;
     restore_terminal()?;
 
     if should_restart {

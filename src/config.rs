@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Controls how session entries are labelled in the list.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
@@ -48,6 +48,12 @@ pub struct Config {
     /// Set of project paths that are pinned to the top of the list.
     #[serde(default)]
     pub favorites: HashSet<String>,
+    /// Custom path to the `claude` binary (None = look up "claude" on PATH).
+    #[serde(default)]
+    pub claude_path: Option<String>,
+    /// Custom path to the `tmux` binary (None = look up "tmux" on PATH).
+    #[serde(default)]
+    pub tmux_path: Option<String>,
 }
 
 impl Default for Config {
@@ -60,6 +66,8 @@ impl Default for Config {
             last_update_check: None,
             live_filter: false,
             favorites: HashSet::new(),
+            claude_path: None,
+            tmux_path: None,
         }
     }
 }
@@ -100,6 +108,29 @@ impl Config {
     pub fn mark_update_checked(&mut self) -> anyhow::Result<()> {
         self.last_update_check = Some(chrono::Utc::now().timestamp());
         self.save()
+    }
+
+    /// Returns the configured claude binary path, or `"claude"` if unset.
+    pub fn claude_bin(&self) -> &str {
+        self.claude_path.as_deref().unwrap_or("claude")
+    }
+
+    /// Returns the configured tmux binary path, or `"tmux"` if unset.
+    pub fn tmux_bin(&self) -> &str {
+        self.tmux_path.as_deref().unwrap_or("tmux")
+    }
+
+    /// Returns true if the given binary name/path is findable on the system.
+    pub fn is_bin_available(bin: &str) -> bool {
+        if Path::new(bin).is_absolute() {
+            Path::new(bin).exists()
+        } else {
+            std::process::Command::new("sh")
+                .args(["-c", &format!("command -v {}", bin)])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        }
     }
 
     /// Serialize the config to pretty-printed JSON and write it to the config file path.
@@ -145,6 +176,8 @@ mod tests {
             last_update_check: None,
             live_filter: false,
             favorites: HashSet::new(),
+            claude_path: None,
+            tmux_path: None,
         };
         let json = serde_json::to_string_pretty(&config).unwrap();
         let loaded: Config = serde_json::from_str(&json).unwrap();
@@ -181,6 +214,8 @@ mod tests {
             last_update_check: None,
             live_filter: false,
             favorites: HashSet::new(),
+            claude_path: None,
+            tmux_path: None,
         };
         let json = serde_json::to_string_pretty(&config).unwrap();
         let mut file = std::fs::File::create(&path).unwrap();
@@ -241,6 +276,8 @@ mod tests {
             last_update_check: None,
             live_filter: false,
             favorites: HashSet::new(),
+            claude_path: None,
+            tmux_path: None,
         };
         let json = serde_json::to_string(&config).unwrap();
         assert!(json.contains("\"short_dir\""));
@@ -305,5 +342,61 @@ mod tests {
     fn test_config_default_has_empty_favorites() {
         let config = Config::default();
         assert!(config.favorites.is_empty());
+    }
+
+    #[test]
+    fn test_config_backward_compat_without_paths() {
+        let json = r#"{"tree_view": true, "display_mode": "name"}"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(config.claude_path, None);
+        assert_eq!(config.tmux_path, None);
+    }
+
+    #[test]
+    fn test_claude_bin_default() {
+        let config = Config::default();
+        assert_eq!(config.claude_bin(), "claude");
+    }
+
+    #[test]
+    fn test_tmux_bin_default() {
+        let config = Config::default();
+        assert_eq!(config.tmux_bin(), "tmux");
+    }
+
+    #[test]
+    fn test_claude_bin_custom() {
+        let mut config = Config::default();
+        config.claude_path = Some("/usr/local/bin/claude".to_string());
+        assert_eq!(config.claude_bin(), "/usr/local/bin/claude");
+    }
+
+    #[test]
+    fn test_tmux_bin_custom() {
+        let mut config = Config::default();
+        config.tmux_path = Some("/opt/bin/tmux".to_string());
+        assert_eq!(config.tmux_bin(), "/opt/bin/tmux");
+    }
+
+    #[test]
+    fn test_config_paths_roundtrip() {
+        let mut config = Config::default();
+        config.claude_path = Some("/usr/local/bin/claude".to_string());
+        config.tmux_path = Some("/opt/bin/tmux".to_string());
+        let json = serde_json::to_string_pretty(&config).unwrap();
+        let loaded: Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.claude_path, Some("/usr/local/bin/claude".to_string()));
+        assert_eq!(loaded.tmux_path, Some("/opt/bin/tmux".to_string()));
+    }
+
+    #[test]
+    fn test_is_bin_available_absolute_nonexistent() {
+        assert!(!Config::is_bin_available("/nonexistent/path/to/binary"));
+    }
+
+    #[test]
+    fn test_is_bin_available_bare_name_sh() {
+        // `sh` should be available on any system
+        assert!(Config::is_bin_available("sh"));
     }
 }

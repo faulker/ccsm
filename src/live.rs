@@ -1,5 +1,6 @@
 // Manages the dedicated ccsm tmux server and live sessions
 
+use crate::config::Config;
 use anyhow::Context;
 
 pub const TMUX_SOCKET: &str = "ccsm";
@@ -18,7 +19,8 @@ pub struct LiveSession {
 
 /// Returns true if the ccsm tmux server is currently running (i.e. `tmux -L ccsm list-sessions` succeeds).
 pub fn is_server_running() -> bool {
-    std::process::Command::new("tmux")
+    let tmux = Config::load().tmux_bin().to_string();
+    std::process::Command::new(&tmux)
         .args(["-L", TMUX_SOCKET, "list-sessions"])
         .output()
         .map(|o| o.status.success())
@@ -31,7 +33,8 @@ pub fn discover_live_sessions() -> Vec<LiveSession> {
     if !is_server_running() {
         return vec![];
     }
-    let output = std::process::Command::new("tmux")
+    let tmux = Config::load().tmux_bin().to_string();
+    let output = std::process::Command::new(&tmux)
         .args([
             "-L", TMUX_SOCKET,
             "list-sessions",
@@ -117,15 +120,17 @@ pub fn ensure_server_configured() -> anyhow::Result<()> {
     // If not running, start-server is unreliable on tmux 3.x — the server is started
     // implicitly when new-session runs (see start_live_session which passes -f).
     // Sourcing failure is non-fatal.
-    let _ = std::process::Command::new("tmux")
+    let tmux = Config::load().tmux_bin().to_string();
+    let _ = std::process::Command::new(&tmux)
         .args(["-L", TMUX_SOCKET, "source-file", &conf_path.to_string_lossy()])
         .output();
     Ok(())
 }
 
-/// Returns true if `tmux` is installed and reachable on the system PATH.
+/// Returns true if the configured tmux binary is installed and reachable.
 pub fn is_tmux_available() -> bool {
-    std::process::Command::new("tmux")
+    let tmux = Config::load().tmux_bin().to_string();
+    std::process::Command::new(&tmux)
         .arg("-V")
         .output()
         .map(|o| o.status.success())
@@ -142,6 +147,7 @@ pub fn start_live_session(name: &str, cwd: &str, cmd: &[&str]) -> anyhow::Result
     let conf_path_str = conf_path().to_string_lossy().into_owned();
     // Pass -f so that if the server isn't running yet, it starts with our config.
     // If the server is already running, -f is ignored by tmux.
+    let tmux = Config::load().tmux_bin().to_string();
     let mut cmd_args = vec![
         "-L", TMUX_SOCKET,
         "-f", &conf_path_str,
@@ -150,7 +156,7 @@ pub fn start_live_session(name: &str, cwd: &str, cmd: &[&str]) -> anyhow::Result
         "-c", cwd,
     ];
     cmd_args.extend(cmd);
-    let output = std::process::Command::new("tmux")
+    let output = std::process::Command::new(&tmux)
         .args(&cmd_args)
         .output()?;
     if !output.status.success() {
@@ -166,7 +172,8 @@ pub fn attach_to_session(name: &str) -> anyhow::Result<()> {
         anyhow::bail!("tmux is not installed — live sessions require tmux");
     }
     ensure_server_configured()?;
-    let status = std::process::Command::new("tmux")
+    let tmux = Config::load().tmux_bin().to_string();
+    let status = std::process::Command::new(&tmux)
         .args(["-L", TMUX_SOCKET, "attach-session", "-t", name])
         .status()?;
     if !status.success() {
@@ -181,7 +188,8 @@ pub fn switch_to_session(name: &str) -> anyhow::Result<()> {
     if !is_tmux_available() {
         anyhow::bail!("tmux is not installed — live sessions require tmux");
     }
-    let status = std::process::Command::new("tmux")
+    let tmux = Config::load().tmux_bin().to_string();
+    let status = std::process::Command::new(&tmux)
         .args(["-L", TMUX_SOCKET, "switch-client", "-t", name])
         .status()?;
     if !status.success() {
@@ -192,11 +200,12 @@ pub fn switch_to_session(name: &str) -> anyhow::Result<()> {
 
 /// Send Ctrl+C to interrupt any running process, then kill the named tmux session.
 pub fn stop_live_session(name: &str) -> anyhow::Result<()> {
+    let tmux = Config::load().tmux_bin().to_string();
     // Send Ctrl+C to interrupt any running process before killing the session
-    let _ = std::process::Command::new("tmux")
+    let _ = std::process::Command::new(&tmux)
         .args(["-L", TMUX_SOCKET, "send-keys", "-t", name, "C-c", ""])
         .output();
-    let output = std::process::Command::new("tmux")
+    let output = std::process::Command::new(&tmux)
         .args(["-L", TMUX_SOCKET, "kill-session", "-t", name])
         .output()?;
     if !output.status.success() {
@@ -210,8 +219,9 @@ pub fn stop_live_session(name: &str) -> anyhow::Result<()> {
 /// preserving ANSI escape sequences. Returns an empty string if the session
 /// does not exist or the command fails.
 pub fn poll_pane_buffer(name: &str, lines: usize) -> String {
+    let tmux = Config::load().tmux_bin().to_string();
     let lines_str = format!("-{}", lines);
-    let output = std::process::Command::new("tmux")
+    let output = std::process::Command::new(&tmux)
         .args([
             "-L", TMUX_SOCKET,
             "capture-pane", "-t", name,
