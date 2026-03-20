@@ -14,13 +14,14 @@ Sessions grouped by project with an expanded group showing individual sessions. 
 - **Tree & flat views** — browse sessions grouped by project or as a flat list; cycle display modes with `Tab`
 - **Conversation preview** — scrollable preview of the last 20 turns with working directory and git branch in the info bar
 - **Resume anywhere** — resume a session in tmux (`Enter`) or directly in the foreground (`Shift+Enter`)
-- **Live sessions** — start, attach, detach, rename, and stop tmux-backed Claude sessions; running sessions surface at the top with a live indicator and real-time pane preview
+- **Live sessions** — start, attach, detach, rename, and stop tmux-backed Claude sessions; running sessions surface at the top with activity indicators (● active, ● idle, ▶ waiting) and real-time pane preview
 - **Quick launch** — `n` for a named tmux session, `Shift+N` for a foreground session, or `ccsm --new` / `ccsm --spawn` to skip the TUI entirely
 - **Duplicate detection** — catches duplicate session names with options to open, rename, or cancel
 - **Search & filter** — filter by project name or path; toggle live-only mode with `l`
 - **Favorites** — pin projects to the top of the list with `f`
-- **Config popup** — press `o` to toggle hide-empty, session grouping, and view mode in one place
-- **Auto-update** — background update checks with one-key install and automatic restart
+- **Mouse scroll** — scroll the preview pane with the mouse wheel; auto-scrolls to bottom for live sessions
+- **Config popup** — press `o` to toggle hide-empty, session grouping, view mode, and custom binary paths; includes an About section with version and repo link
+- **Auto-update** — background update checks with one-key install, SHA256 checksum verification, and automatic restart
 - **Help overlay** — press `?` for a full keybinding reference
 - **Persistent config** — preferences saved to `~/.config/ccsm/config.json`
 - Catppuccin Mocha color theme
@@ -118,8 +119,8 @@ ccsm --spawn
 | `Enter` | Resume session in tmux / attach to live session / toggle group |
 | `Shift+Enter` | Resume historical session directly in the foreground (no tmux) |
 | `Tab` / `Shift+Tab` | Cycle: tree [name] → tree [short dir] → tree [full dir] → flat → tree [name] |
-| `Shift+J` | Scroll preview down |
-| `Shift+K` | Scroll preview up |
+| `Shift+J` / `Mouse wheel ↓` | Scroll preview down |
+| `Shift+K` / `Mouse wheel ↑` | Scroll preview up (disables auto-scroll for live sessions) |
 | `/` | Activate search/filter mode |
 | `o` | Open config popup (hide-empty, session grouping, view mode) |
 | `f` | Toggle favorite — pins project to top of list (shown with ★) |
@@ -175,7 +176,11 @@ While attached to a live session in tmux:
 
 ## Live Sessions
 
-Live sessions are tmux-backed Claude Code sessions managed through a dedicated tmux server (`ccsm` socket). They appear at the top of the session list with a green `●` indicator.
+Live sessions are tmux-backed Claude Code sessions managed through a dedicated tmux server (`ccsm` socket). They appear at the top of the session list with color-coded activity indicators:
+
+- **● Green** — active (Claude is working)
+- **● Amber** — idle (waiting at the prompt)
+- **▶ Red** — waiting (Claude is asking for user input/approval)
 
 - **Start**: press `n` (starts a named live tmux session in the current project dir) or `Shift+N` (starts claude directly in the foreground, no tmux)
 - **Attach**: press `Enter` on any live session to attach
@@ -225,7 +230,7 @@ Settings are persisted to `~/.config/ccsm/config.json` and automatically saved w
 8. On `Enter` (live session), attaches to the tmux session and suspends the TUI; detach with `Ctrl+\` to return
 9. On `n`/`N`, prompts for a session name then starts a new detached tmux session running `claude` in the chosen directory and attaches to it; uses a dedicated tmux server (`-L ccsm`) with a custom status bar
 10. With `--new`, skips the TUI, creates a live tmux session in the current directory, attaches immediately, and re-execs ccsm when Claude exits
-11. If the user accepts an update, the TUI suspends, downloads the new binary, replaces the current executable, and automatically restarts
+11. If the user accepts an update, the TUI suspends, downloads the new binary, verifies the SHA256 checksum against the release's `checksums-sha256.txt`, replaces the current executable, and automatically restarts
 12. After Claude exits, the TUI resumes and reloads the session list
 
 ## Dependencies
@@ -241,6 +246,8 @@ Settings are persisted to `~/.config/ccsm/config.json` and automatically saved w
 - `tar` / `zip` — archive extraction for release downloads
 - `tempfile` — temporary directories for safe binary replacement
 - `unicode-width` — correct text width calculation for multi-byte characters
+- `regex` — pattern matching for live session activity detection
+- `sha2` — SHA256 checksum verification for update downloads
 
 ## Tests
 
