@@ -1,6 +1,8 @@
 // Manages the dedicated ccsm tmux server and live sessions
 
 use anyhow::Context;
+use regex::Regex;
+use std::sync::LazyLock;
 
 pub const TMUX_SOCKET: &str = "ccsm";
 
@@ -33,9 +35,11 @@ pub fn discover_live_sessions(tmux: &str) -> Vec<LiveSession> {
     }
     let output = std::process::Command::new(tmux)
         .args([
-            "-L", TMUX_SOCKET,
+            "-L",
+            TMUX_SOCKET,
             "list-sessions",
-            "-F", "#{session_name}:#{session_path}",
+            "-F",
+            "#{session_name}\t#{session_path}",
         ])
         .output();
     let output = match output {
@@ -45,9 +49,9 @@ pub fn discover_live_sessions(tmux: &str) -> Vec<LiveSession> {
     let text = String::from_utf8_lossy(&output.stdout);
     text.lines()
         .filter_map(|line| {
-            let mut parts = line.splitn(2, ':');
-            let name = parts.next()?.to_string();
-            let path = parts.next().unwrap_or("").to_string();
+            let (name, path) = line.split_once('\t')?;
+            let name = name.to_string();
+            let path = path.to_string();
             let project_name = std::path::Path::new(&path)
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
@@ -63,17 +67,14 @@ pub fn discover_live_sessions(tmux: &str) -> Vec<LiveSession> {
 }
 
 /// Returns the path to the ccsm tmux configuration file (`~/.config/ccsm/tmux.conf`).
-pub fn conf_path() -> std::path::PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join(".config")
-        .join("ccsm")
-        .join("tmux.conf")
+pub fn conf_path() -> Option<std::path::PathBuf> {
+    dirs::home_dir().map(|h| h.join(".config").join("ccsm").join("tmux.conf"))
 }
 
 /// Write the ccsm tmux config file and, if the server is already running, source it to apply changes.
 pub fn ensure_server_configured(tmux: &str) -> anyhow::Result<()> {
-    let conf_path = conf_path();
+    let conf_path = conf_path()
+        .ok_or_else(|| anyhow::anyhow!("Could not determine home directory for config path"))?;
     if let Some(parent) = conf_path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create config directory: {}", parent.display()))?;
@@ -118,7 +119,12 @@ pub fn ensure_server_configured(tmux: &str) -> anyhow::Result<()> {
     // implicitly when new-session runs (see start_live_session which passes -f).
     // Sourcing failure is non-fatal.
     let _ = std::process::Command::new(tmux)
-        .args(["-L", TMUX_SOCKET, "source-file", &conf_path.to_string_lossy()])
+        .args([
+            "-L",
+            TMUX_SOCKET,
+            "source-file",
+            &conf_path.to_string_lossy(),
+        ])
         .output();
     Ok(())
 }
@@ -139,20 +145,26 @@ pub fn start_live_session(tmux: &str, name: &str, cwd: &str, cmd: &[&str]) -> an
         anyhow::bail!("tmux is not installed — live sessions require tmux");
     }
     ensure_server_configured(tmux)?;
-    let conf_path_str = conf_path().to_string_lossy().into_owned();
+    let conf_path_str = conf_path()
+        .ok_or_else(|| anyhow::anyhow!("Could not determine home directory for config path"))?
+        .to_string_lossy()
+        .into_owned();
     // Pass -f so that if the server isn't running yet, it starts with our config.
     // If the server is already running, -f is ignored by tmux.
     let mut cmd_args = vec![
-        "-L", TMUX_SOCKET,
-        "-f", &conf_path_str,
-        "new-session", "-d",
-        "-s", name,
-        "-c", cwd,
+        "-L",
+        TMUX_SOCKET,
+        "-f",
+        &conf_path_str,
+        "new-session",
+        "-d",
+        "-s",
+        name,
+        "-c",
+        cwd,
     ];
     cmd_args.extend(cmd);
-    let output = std::process::Command::new(tmux)
-        .args(&cmd_args)
-        .output()?;
+    let output = std::process::Command::new(tmux).args(&cmd_args).output()?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!("Failed to create session '{}': {}", name, stderr.trim());
@@ -213,9 +225,15 @@ pub fn poll_pane_buffer(tmux: &str, name: &str, lines: usize) -> String {
     let lines_str = format!("-{}", lines);
     let output = std::process::Command::new(tmux)
         .args([
-            "-L", TMUX_SOCKET,
-            "capture-pane", "-t", name,
-            "-p", "-e", "-S", &lines_str,
+            "-L",
+            TMUX_SOCKET,
+            "capture-pane",
+            "-t",
+            name,
+            "-p",
+            "-e",
+            "-S",
+            &lines_str,
         ])
         .output();
     match output {
@@ -231,6 +249,8 @@ pub enum ActivityState {
     Active,
     /// Claude is idle (waiting for user input or approval).
     Idle,
+    /// Claude is waiting for user input on a prompt (e.g., "Do you want to proceed?").
+    Waiting,
     /// State not yet determined (session just started or capture failed).
     Unknown,
 }
@@ -250,8 +270,18 @@ pub fn strip_ansi(input: &str) -> String {
                             break;
                         }
                     }
+                } else if next == ']' {
+                    // OSC sequence: ESC ] ... terminated by BEL or ST (ESC \)
+                    while let Some(c2) = chars.next() {
+                        if c2 == '\x07' {
+                            break;
+                        }
+                        if c2 == '\x1b' && chars.next() == Some('\\') {
+                            break;
+                        }
+                    }
                 }
-                // OSC or other sequences: just skip the next char
+                // Other sequences: just skip the next char
             }
         } else {
             out.push(c);
@@ -266,9 +296,14 @@ pub fn poll_pane_tail(tmux: &str, name: &str, lines: usize) -> String {
     let lines_str = format!("-{}", lines);
     let output = std::process::Command::new(tmux)
         .args([
-            "-L", TMUX_SOCKET,
-            "capture-pane", "-t", name,
-            "-p", "-S", &lines_str,
+            "-L",
+            TMUX_SOCKET,
+            "capture-pane",
+            "-t",
+            name,
+            "-p",
+            "-S",
+            &lines_str,
         ])
         .output();
     match output {
@@ -277,86 +312,83 @@ pub fn poll_pane_tail(tmux: &str, name: &str, lines: usize) -> String {
     }
 }
 
+/// Fixed strings that indicate a session is **waiting** for user input.
+/// Simple substring matching is sufficient here — no regex needed.
+static WAITING_PATTERNS: &[&str] = &[
+    "Do you want to proceed?",
+    "Enter to select",
+    "Yes, clear context",
+    "Yes, allow all edits during this session",
+];
+
+/// Regex patterns that indicate an **active** (working) session.
+/// Add new patterns here to extend detection without changing logic.
+static ACTIVE_PATTERNS: &[&LazyLock<Regex>] = &[
+    &PATTERN_ACTIVE_TIMER,
+    &PATTERN_MORE_TOOL_USES,
+    &PATTERN_TIP_INDICATOR,
+    &PATTERN_ACTIVE_THOUGHT,
+    &PATTERN_ACTIVE_THINKING,
+    &PATTERN_ACTIVE_SEARCH_PATTERN,
+    &PATTERN_ACTIVE_READING_FILE,
+];
+
+/// Matches Claude Code's active timer line using Unicode ellipsis (U+2026):
+/// e.g. `Thinking… (10m · 13.0k tokens)`, `Thinking… (1h 35m 22s · 42.3k tokens)`
+static PATTERN_ACTIVE_TIMER: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\w*\u{2026} \((\d+[smh]\s*)+·.*\d+.*tokens").unwrap());
+
+/// Matches the collapsed tool-use indicator shown while Claude is working:
+/// e.g. `+3 more tool uses (ctrl+o to expand)`
+static PATTERN_MORE_TOOL_USES: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\+\d more tool uses \(ctrl\+o to expand\)").unwrap());
+
+static PATTERN_TIP_INDICATOR: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"Tip: .*").unwrap());
+
+static PATTERN_ACTIVE_THOUGHT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\(thought for (?:\d+h\s*)?(?:\d+m\s*)?(?:\d+s)?\)").unwrap());
+
+static PATTERN_ACTIVE_THINKING: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\w*\u{2026} \((\d+[smh]\s*)+·.*thinking").unwrap());
+
+static PATTERN_ACTIVE_SEARCH_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"Searched\sfor\s\d+\spattern").unwrap());
+
+static PATTERN_ACTIVE_READING_FILE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"Reading\s\d+\sfile").unwrap());
+
 /// Detect whether a live session is active or idle based on its pane content.
 ///
-/// Claude Code's status indicators in the terminal:
-/// - **Active (working)**: animated `*` followed by `<Word>...`
-///   optionally with a timer like `(<time> ↓ <tokens>)`
-///   e.g. `* Thinking...` or `* Undulating... (8m 0s ↓ 13.0k tokens)`
-/// - **Done (idle)**: `* <Word> for <duration>`
-///   e.g. `* Brewed for 44s` or `* Simmered for 2m 30s · 15.2k tokens`
-///
-/// Scans lines **bottom-up** so the most recent signal wins.
+/// Strips ANSI escapes, then scans the last 8 non-empty lines **bottom-up**
+/// looking for any `ACTIVE_PATTERNS` match. If none match and the content
+/// is non-empty, the session is considered idle.
 pub fn detect_activity(content: &str) -> ActivityState {
     if content.trim().is_empty() {
         return ActivityState::Unknown;
     }
     let clean = strip_ansi(content);
-    let lines: Vec<&str> = clean.lines().collect();
-
-    // Scan bottom-up: the most recent signal is closest to the bottom
-    for line in lines.iter().rev() {
+    let mut checked = 0usize;
+    for line in clean.lines().rev() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
-
-        // Completion summary: `* <Word> for <duration>`
-        // e.g. "* Brewed for 44s", "Simmered for 2m 30s · 15.2k tokens"
-        if is_completion_summary(trimmed) {
-            return ActivityState::Idle;
+        for pat in WAITING_PATTERNS {
+            if trimmed.contains(pat) {
+                return ActivityState::Waiting;
+            }
         }
-
-        // Active spinner: line contains a word followed by "..."
-        // e.g. "* Thinking...", "* Undulating... (8m 0s ↓ 13.0k tokens)"
-        // The "..." (ellipsis) is the key active-work indicator
-        if is_spinner_line(trimmed) {
-            return ActivityState::Active;
+        for pat in ACTIVE_PATTERNS {
+            if pat.is_match(trimmed) {
+                return ActivityState::Active;
+            }
+        }
+        checked += 1;
+        if checked >= 8 {
+            break;
         }
     }
     ActivityState::Idle
-}
-
-/// Returns true if the line looks like a Claude Code completion summary.
-/// Pattern: contains ` for ` followed by a digit (duration).
-/// Examples: `* Brewed for 44s`, `Simmered for 2m 30s · 15.2k tokens`
-fn is_completion_summary(line: &str) -> bool {
-    if let Some(pos) = line.find(" for ") {
-        let after = &line[pos + 5..];
-        after.starts_with(|c: char| c.is_ascii_digit())
-    } else {
-        false
-    }
-}
-
-/// Returns true if the line looks like a Claude Code active spinner line.
-/// Pattern: starts with a non-alphanumeric char (spinner/asterisk), then a
-/// capitalized word followed by `...` (the ellipsis indicating ongoing work).
-/// Examples: `* Thinking...`, `✻ Undulating... (8m 0s ↓ 13.0k tokens)`
-fn is_spinner_line(line: &str) -> bool {
-    // Must contain "..." (the active ellipsis)
-    if !line.contains("...") {
-        return false;
-    }
-    // Skip leading non-alphanumeric chars (spinner symbol, *, whitespace)
-    let alpha_start = line.trim_start_matches(|c: char| !c.is_ascii_alphabetic());
-    if alpha_start.is_empty() {
-        return false;
-    }
-    // The first alpha char should be uppercase (Claude uses capitalized words like
-    // "Thinking", "Undulating", "Reflecting")
-    let first = alpha_start.chars().next().unwrap();
-    if !first.is_ascii_uppercase() {
-        return false;
-    }
-    // The word should be followed by "..."
-    if let Some(word_end) = alpha_start.find("...") {
-        // Everything between start and "..." should be a single word (alphabetic)
-        let word = &alpha_start[..word_end];
-        word.chars().all(|c| c.is_ascii_alphabetic())
-    } else {
-        false
-    }
 }
 
 /// Generate a unique session name of the form `<project>-A`, `<project>-B`, etc.,
@@ -414,84 +446,111 @@ mod tests {
     }
 
     #[test]
-    fn detect_activity_spinner_thinking() {
-        let content = "some output\n* Thinking...";
+    fn strip_ansi_removes_osc_bel_terminated() {
+        // OSC sequence terminated by BEL (e.g., setting terminal title)
+        let input = "\x1b]0;My Title\x07Hello";
+        assert_eq!(strip_ansi(input), "Hello");
+    }
+
+    #[test]
+    fn strip_ansi_removes_osc_st_terminated() {
+        // OSC sequence terminated by ST (ESC \)
+        let input = "\x1b]0;My Title\x1b\\Hello";
+        assert_eq!(strip_ansi(input), "Hello");
+    }
+
+    #[test]
+    fn detect_activity_active_timer_thinking() {
+        let content = "some output\nThinking\u{2026} (10m \u{00b7} 13.0k tokens)";
         assert_eq!(detect_activity(content), ActivityState::Active);
     }
 
     #[test]
-    fn detect_activity_spinner_with_timer() {
-        let content = "* Undulating... (8m 0s ↓ 13.0k tokens)";
+    fn detect_activity_active_timer_multipart() {
+        let content = "Thinking\u{2026} (8m 0s \u{00b7} 13.0k tokens)";
         assert_eq!(detect_activity(content), ActivityState::Active);
     }
 
     #[test]
-    fn detect_activity_spinner_reflecting() {
-        let content = "* Reflecting...";
+    fn detect_activity_active_timer_long_duration() {
+        let content = "Thinking\u{2026} (1h 35m 22s \u{00b7} 42.3k tokens)";
         assert_eq!(detect_activity(content), ActivityState::Active);
     }
 
     #[test]
-    fn detect_activity_spinner_no_word_after_is_idle() {
-        // "..." in prose should not trigger active
-        let content = "The tests passed... everything looks good.";
-        assert_eq!(detect_activity(content), ActivityState::Idle);
+    fn detect_activity_active_with_ansi() {
+        let content = "\x1b[32mThinking\u{2026}\x1b[0m (5m \u{00b7} 8.1k tokens)";
+        assert_eq!(detect_activity(content), ActivityState::Active);
     }
 
     #[test]
-    fn detect_activity_idle() {
-        let content = "> some prompt text\nclaude output here";
-        assert_eq!(detect_activity(content), ActivityState::Idle);
-    }
-
-    #[test]
-    fn detect_activity_empty() {
+    fn detect_activity_empty_is_unknown() {
         assert_eq!(detect_activity(""), ActivityState::Unknown);
         assert_eq!(detect_activity("   \n  "), ActivityState::Unknown);
     }
 
     #[test]
-    fn detect_activity_spinner_with_ansi() {
-        let content = "\x1b[32m*\x1b[0m Thinking...";
-        assert_eq!(detect_activity(content), ActivityState::Active);
+    fn detect_activity_plain_text_is_idle() {
+        let content = "some output\nclaude output here";
+        assert_eq!(detect_activity(content), ActivityState::Idle);
+    }
+
+    #[test]
+    fn detect_activity_ascii_dots_not_active() {
+        // ASCII "..." (three dots) should NOT match — Claude uses Unicode ellipsis
+        let content = "Thinking... (10m \u{00b7} 13.0k tokens)";
+        assert_eq!(detect_activity(content), ActivityState::Idle);
     }
 
     #[test]
     fn detect_activity_completion_summary_is_idle() {
-        let content = "Brewed for 2m 30s · 15.2k tokens";
+        let content = "Brewed for 2m 30s \u{00b7} 15.2k tokens";
         assert_eq!(detect_activity(content), ActivityState::Idle);
     }
 
     #[test]
-    fn detect_activity_completion_summary_short_is_idle() {
-        let content = "* Brewed for 44s";
-        assert_eq!(detect_activity(content), ActivityState::Idle);
-    }
-
-    #[test]
-    fn detect_activity_completion_summary_with_cost_is_idle() {
-        let content = "Simmered for 5m 12s · 42.3k tokens | $0.15";
-        assert_eq!(detect_activity(content), ActivityState::Idle);
-    }
-
-    #[test]
-    fn detect_activity_completion_below_spinner_is_idle() {
-        // Bottom-up scan: completion summary below a spinner line means idle
-        let content = "* Thinking...\nOutput here\n* Brewed for 44s";
-        assert_eq!(detect_activity(content), ActivityState::Idle);
-    }
-
-    #[test]
-    fn detect_activity_spinner_below_completion_is_active() {
-        // Bottom-up scan: spinner below a completion summary means active (new task)
-        let content = "* Brewed for 44s\nStarting new task\n* Thinking...";
+    fn detect_activity_active_below_idle_is_active() {
+        // Bottom-up scan: active timer below idle content means active
+        let content = "Brewed for 44s\nNew task\nThinking\u{2026} (2m \u{00b7} 5.0k tokens)";
         assert_eq!(detect_activity(content), ActivityState::Active);
     }
 
     #[test]
-    fn detect_activity_ellipsis_in_lowercase_prose_is_idle() {
-        // Lowercase word before "..." is not a spinner
-        let content = "loading...";
+    fn detect_activity_idle_below_active_is_idle() {
+        // Bottom-up scan: active timer earlier, but only non-matching lines at bottom
+        // The scan hits non-empty lines first, none match → Idle
+        let content = "Earlier active output\nDone output\nPrompt >";
         assert_eq!(detect_activity(content), ActivityState::Idle);
+    }
+
+    #[test]
+    fn detect_activity_prose_ellipsis_is_idle() {
+        let content = "The tests passed\u{2026} everything looks good.";
+        assert_eq!(detect_activity(content), ActivityState::Idle);
+    }
+
+    #[test]
+    fn detect_activity_more_tool_uses_is_active() {
+        let content = "some output\n+3 more tool uses (ctrl+o to expand)";
+        assert_eq!(detect_activity(content), ActivityState::Active);
+    }
+
+    #[test]
+    fn detect_activity_waiting_proceed_prompt() {
+        let content = "some output\nDo you want to proceed?";
+        assert_eq!(detect_activity(content), ActivityState::Waiting);
+    }
+
+    #[test]
+    fn detect_activity_waiting_with_ansi() {
+        let content = "\x1b[33mDo you want to proceed?\x1b[0m";
+        assert_eq!(detect_activity(content), ActivityState::Waiting);
+    }
+
+    #[test]
+    fn detect_activity_waiting_beats_active() {
+        // If both waiting and active patterns appear, waiting (checked first) wins
+        let content = "Thinking\u{2026} (2m \u{00b7} 5.0k tokens)\nDo you want to proceed?";
+        assert_eq!(detect_activity(content), ActivityState::Waiting);
     }
 }

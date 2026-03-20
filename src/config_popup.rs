@@ -1,6 +1,9 @@
 use crate::app::{App, AppMode};
 use crate::config::Config;
 use crossterm::event::KeyCode;
+
+/// Maximum row index in the config popup (0-based).
+pub const CONFIG_MAX_ROW: usize = 6;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
@@ -34,7 +37,9 @@ impl App {
                         }
                         _ => {}
                     }
-                    let _ = self.config.save();
+                    if let Err(e) = self.config.save() {
+                        self.status_error = Some(format!("Failed to save config: {e}"));
+                    }
                     self.config_editing = false;
                     self.config_path_input = tui_input::Input::default();
                 }
@@ -63,7 +68,7 @@ impl App {
                 self.mode = AppMode::Normal;
             }
             KeyCode::Char('j') | KeyCode::Down => {
-                if self.config_selected < 6 {
+                if self.config_selected < CONFIG_MAX_ROW {
                     self.config_selected += 1;
                 }
             }
@@ -235,7 +240,12 @@ pub fn draw_config_popup(frame: &mut Frame, app: &App) {
         },
         {
             let marker = if selected == 6 { "▶ " } else { "  " };
-            let style = if selected == 6 {
+            let marker_style = if selected == 6 {
+                Style::default().fg(ACCENT_BLUE).bg(HIGHLIGHT_BG)
+            } else {
+                Style::default().fg(ACCENT_BLUE)
+            };
+            let url_style = if selected == 6 {
                 Style::default()
                     .fg(ACCENT_BLUE)
                     .add_modifier(Modifier::UNDERLINED)
@@ -245,10 +255,10 @@ pub fn draw_config_popup(frame: &mut Frame, app: &App) {
                     .fg(ACCENT_BLUE)
                     .add_modifier(Modifier::UNDERLINED)
             };
-            Line::from(Span::styled(
-                format!("{}https://github.com/faulker/ccsm", marker),
-                style,
-            ))
+            Line::from(vec![
+                Span::styled(marker, marker_style),
+                Span::styled("https://github.com/faulker/ccsm", url_style),
+            ])
         },
     ];
 

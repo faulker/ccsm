@@ -108,6 +108,8 @@ pub struct App {
     pub preview_cache: HashMap<String, (SessionMeta, Vec<PreviewMessage>)>,
     /// Current vertical scroll offset in the preview pane (`u16::MAX` = scroll to bottom).
     pub preview_scroll: u16,
+    /// When true, the preview pane automatically follows new output (scrolls to bottom).
+    pub preview_auto_scroll: bool,
     /// Set to true when the user requests to exit the application.
     pub should_quit: bool,
     /// Populated when a session launch has been requested; consumed by the main loop.
@@ -181,7 +183,7 @@ pub struct App {
     pub duplicate_source: Option<DuplicateSource>,
     /// The cwd to restore if the user chooses to pick a different name (NamingSession source only).
     pub duplicate_cwd: Option<String>,
-    /// Currently selected row in the config popup (0..4).
+    /// Currently selected row in the config popup (0..=CONFIG_MAX_ROW).
     pub config_selected: usize,
     /// True when the `claude` binary cannot be found at startup.
     pub missing_claude: bool,
@@ -226,6 +228,7 @@ impl App {
             selected: 0,
             preview_cache: HashMap::new(),
             preview_scroll: u16::MAX,
+            preview_auto_scroll: true,
             should_quit: false,
             launch_session: None,
             filter_input: Input::default(),
@@ -288,9 +291,8 @@ impl App {
         app
     }
 
-    /// Spawn a background thread that loads custom titles for all sessions with data
-    /// and sends the result map to `self.names_receiver`.
-    fn spawn_load_session_names(&mut self) {
+    /// Spawn a background thread that loads custom titles for all sessions with data.
+    pub fn spawn_load_session_names(&mut self) {
         let sessions: Vec<(String, String)> = self
             .sessions
             .iter()
@@ -312,15 +314,17 @@ impl App {
         });
     }
 
-    /// Apply custom titles received from the background loader, then refresh the tree view.
+    /// Apply custom titles received from the background loader, then refresh all views.
     pub fn apply_session_names(&mut self, names: HashMap<String, String>) {
         for session in &mut self.sessions {
             if let Some(title) = names.get(&session.session_id) {
                 session.name = Some(title.clone());
             }
         }
+
         self.preview_cache.clear();
         self.recompute_tree();
+        self.recompute_flat_rows();
     }
 
     /// Replace the session list with a freshly loaded set, reset caches, and rebuild all views.
@@ -329,6 +333,7 @@ impl App {
         self.spawn_load_session_names();
         self.preview_cache.clear();
         self.preview_scroll = u16::MAX;
+        self.preview_auto_scroll = true;
         self.recompute_filter();
         self.recompute_tree();
         self.recompute_flat_rows();
@@ -719,14 +724,36 @@ impl App {
         }
     }
 
-    /// Returns the total number of currently running live tmux sessions.
-    pub fn total_running_count(&self) -> usize {
-        self.live_sessions.len()
+    /// Returns `(active_count, idle_count, waiting_count)` across all live sessions.
+    pub fn total_activity_counts(&self) -> (usize, usize, usize) {
+        let mut active = 0;
+        let mut idle = 0;
+        let mut waiting = 0;
+        for ls in &self.live_sessions {
+            match self.activity_states.get(&ls.tmux_name) {
+                Some(ActivityState::Idle) => idle += 1,
+                Some(ActivityState::Waiting) => waiting += 1,
+                _ => active += 1,
+            }
+        }
+        (active, idle, waiting)
     }
 
-    /// Returns the number of live sessions whose working directory matches `project`.
-    pub fn project_running_count(&self, project: &str) -> usize {
-        self.live_sessions.iter().filter(|ls| ls.cwd == project).count()
+    /// Returns `(active_count, idle_count, waiting_count)` for live sessions in the given project.
+    /// Only sessions with a confirmed `Idle` state count as idle; `Unknown` and
+    /// not-yet-polled sessions count as active (matching individual dot behavior).
+    pub fn project_activity_counts(&self, project: &str) -> (usize, usize, usize) {
+        let mut active = 0;
+        let mut idle = 0;
+        let mut waiting = 0;
+        for ls in self.live_sessions.iter().filter(|ls| ls.cwd == project) {
+            match self.activity_states.get(&ls.tmux_name) {
+                Some(ActivityState::Idle) => idle += 1,
+                Some(ActivityState::Waiting) => waiting += 1,
+                _ => active += 1,
+            }
+        }
+        (active, idle, waiting)
     }
 
     /// Return the preview data for the currently selected session, loading and caching it on
@@ -902,19 +929,21 @@ impl App {
         self.recompute_tree();
     }
 
-    /// Poll all live sessions for activity state, throttled to every ~2 seconds per session.
+    /// Poll all live sessions for activity state, throttled to every ~3 seconds per session.
     /// For the currently selected session, reuses the preview cache content.
-    pub fn poll_all_activity(&mut self) {
+    /// Returns true if any session's activity state changed.
+    pub fn poll_all_activity(&mut self) -> bool {
         let now = Instant::now();
         let selected_name = self.selected_live_index()
             .map(|i| self.live_sessions[i].tmux_name.clone());
+        let mut changed = false;
 
         for i in 0..self.live_sessions.len() {
             let name = self.live_sessions[i].tmux_name.clone();
 
-            // Throttle: skip if polled less than 2 seconds ago
+            // Throttle: skip if polled less than 3 seconds ago
             if let Some(last) = self.activity_last_poll.get(&name) {
-                if now.duration_since(*last).as_secs() < 2 {
+                if now.duration_since(*last).as_secs() < 3 {
                     continue;
                 }
             }
@@ -923,18 +952,19 @@ impl App {
                 // Reuse preview cache for selected session
                 self.live_preview_cache.get(&name).map(|(s, _)| s.clone()).unwrap_or_default()
             } else {
-                live::poll_pane_tail(self.config.tmux_bin(), &name, 20)
+                // 50 lines gives enough context for reliable activity detection
+                // (status indicators can be preceded by multi-line tool output)
+                live::poll_pane_tail(self.config.tmux_bin(), &name, 50)
             };
 
             let state = live::detect_activity(&content);
-            self.activity_states.insert(name.clone(), state);
+            let prev = self.activity_states.insert(name.clone(), state);
+            if prev != Some(state) {
+                changed = true;
+            }
             self.activity_last_poll.insert(name, now);
         }
-    }
-
-    /// Returns true if any live session is in the Active state.
-    pub fn has_any_active_session(&self) -> bool {
-        self.activity_states.values().any(|s| *s == ActivityState::Active)
+        changed
     }
 
 }
@@ -1879,5 +1909,54 @@ mod tests {
     #[test]
     fn truncate_path_multiple_trailing_slashes() {
         assert_eq!(truncate_path("/a/b/c//"), "b/c");
+    }
+
+    #[test]
+    fn preview_auto_scroll_defaults_to_true() {
+        let app = make_app(make_sessions(), None, Config::default());
+        assert!(app.preview_auto_scroll);
+        assert_eq!(app.preview_scroll, u16::MAX);
+    }
+
+    #[test]
+    fn reload_sessions_resets_auto_scroll() {
+        let mut app = make_app(make_sessions(), None, Config::default());
+        app.preview_auto_scroll = false;
+        app.preview_scroll = 42;
+        app.reload_sessions(make_sessions());
+        assert!(app.preview_auto_scroll);
+        assert_eq!(app.preview_scroll, u16::MAX);
+    }
+
+    #[test]
+    fn mouse_scroll_down_increments_preview_scroll() {
+        let mut app = make_app(make_sessions(), None, Config::default());
+        app.preview_scroll = 0;
+        // Simulate scroll down
+        app.preview_scroll = app.preview_scroll.saturating_add(3);
+        assert_eq!(app.preview_scroll, 3);
+        app.preview_scroll = app.preview_scroll.saturating_add(3);
+        assert_eq!(app.preview_scroll, 6);
+    }
+
+    #[test]
+    fn mouse_scroll_up_decrements_preview_scroll_and_disables_auto_scroll() {
+        let mut app = make_app(make_sessions(), None, Config::default());
+        app.preview_scroll = 10;
+        app.preview_auto_scroll = true;
+        // Simulate scroll up
+        app.preview_auto_scroll = false;
+        app.preview_scroll = app.preview_scroll.saturating_sub(3);
+        assert_eq!(app.preview_scroll, 7);
+        assert!(!app.preview_auto_scroll);
+    }
+
+    #[test]
+    fn mouse_scroll_up_saturates_at_zero() {
+        let mut app = make_app(make_sessions(), None, Config::default());
+        app.preview_scroll = 1;
+        app.preview_auto_scroll = false;
+        app.preview_scroll = app.preview_scroll.saturating_sub(3);
+        assert_eq!(app.preview_scroll, 0);
     }
 }

@@ -14,9 +14,33 @@ use ratatui::{
 
 use crate::live::ActivityState;
 use crate::theme::{
-    ACCENT_AMBER, ACCENT_BLUE, ACCENT_GREEN, ACCENT_GREEN_DIM, ACCENT_MAUVE, ACCENT_PEACH,
+    ACCENT_AMBER, ACCENT_BLUE, ACCENT_GREEN, ACCENT_MAUVE, ACCENT_PEACH, ACCENT_RED,
     ACCENT_TEAL, BG_SURFACE, FG_OVERLAY, FG_SUBTEXT, FG_TEXT, HIGHLIGHT_BG,
 };
+
+/// Build styled spans showing activity counts: `● <active> | ● <idle> [| ▶ <waiting>]`.
+/// Returns an empty vec when all counts are zero.
+fn activity_count_spans(active: usize, idle: usize, waiting: usize) -> Vec<Span<'static>> {
+    if active == 0 && idle == 0 && waiting == 0 {
+        return Vec::new();
+    }
+    let mut spans = vec![
+        Span::styled(
+            format!(" ● {}", active),
+            Style::default().fg(ACCENT_GREEN).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" |", Style::default().fg(FG_OVERLAY)),
+        Span::styled(format!(" ● {}", idle), Style::default().fg(ACCENT_AMBER)),
+    ];
+    if waiting > 0 {
+        spans.push(Span::styled(" |", Style::default().fg(FG_OVERLAY)));
+        spans.push(Span::styled(
+            format!(" ▶ {}", waiting),
+            Style::default().fg(ACCENT_RED).add_modifier(Modifier::BOLD),
+        ));
+    }
+    spans
+}
 
 /// Returns the dot character and style for a live session indicator based on its activity state.
 fn live_dot_style(app: &App, live_index: usize) -> (&'static str, Style) {
@@ -24,17 +48,13 @@ fn live_dot_style(app: &App, live_index: usize) -> (&'static str, Style) {
     let state = app.activity_states.get(name).copied().unwrap_or(ActivityState::Unknown);
     match state {
         ActivityState::Active => {
-            // Pulse: alternate between bright and dim green based on tick
-            let bright = (app.tick / 2) % 2 == 0;
-            let color = if bright { ACCENT_GREEN } else { ACCENT_GREEN_DIM };
-            let mut style = Style::default().fg(color);
-            if bright {
-                style = style.add_modifier(Modifier::BOLD);
-            }
-            ("●", style)
+            ("●", Style::default().fg(ACCENT_GREEN).add_modifier(Modifier::BOLD))
         }
         ActivityState::Idle => {
             ("●", Style::default().fg(ACCENT_AMBER))
+        }
+        ActivityState::Waiting => {
+            ("▶", Style::default().fg(ACCENT_RED).add_modifier(Modifier::BOLD))
         }
         ActivityState::Unknown => {
             ("●", Style::default().fg(ACCENT_GREEN))
@@ -43,28 +63,6 @@ fn live_dot_style(app: &App, live_index: usize) -> (&'static str, Style) {
 }
 
 /// Returns the dot character and style for the aggregate title bar indicator.
-fn aggregate_dot_style(app: &App) -> (&'static str, Style) {
-    if app.live_sessions.is_empty() {
-        return ("●", Style::default().fg(ACCENT_GREEN).add_modifier(Modifier::BOLD));
-    }
-    let has_active = app.has_any_active_session();
-    let all_known = app.activity_states.len() == app.live_sessions.len()
-        && app.activity_states.values().all(|s| *s != ActivityState::Unknown);
-    if has_active {
-        let bright = (app.tick / 2) % 2 == 0;
-        let color = if bright { ACCENT_GREEN } else { ACCENT_GREEN_DIM };
-        let mut style = Style::default().fg(color);
-        if bright {
-            style = style.add_modifier(Modifier::BOLD);
-        }
-        ("●", style)
-    } else if all_known {
-        ("●", Style::default().fg(ACCENT_AMBER).add_modifier(Modifier::BOLD))
-    } else {
-        ("●", Style::default().fg(ACCENT_GREEN).add_modifier(Modifier::BOLD))
-    }
-}
-
 /// Render the full TUI frame: session list, preview pane, info bar, status bar,
 /// and any active modal overlay (rename, update prompt, help, naming popup).
 pub fn draw(frame: &mut Frame, app: &mut App) {
@@ -90,7 +88,6 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                     session_count,
                     project,
                 } => {
-                    let running = app.project_running_count(project);
                     let arrow = if app.collapsed.contains(project) {
                         "▸"
                     } else {
@@ -117,12 +114,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                             Style::default().fg(ACCENT_PEACH).add_modifier(Modifier::BOLD),
                         ));
                     }
-                    if running > 0 {
-                        header_spans.push(Span::styled(
-                            format!(" ● {}", running),
-                            Style::default().fg(ACCENT_GREEN).add_modifier(Modifier::BOLD),
-                        ));
-                    }
+                    let (active, idle, waiting) = app.project_activity_counts(project);
+                    header_spans.extend(activity_count_spans(active, idle, waiting));
                     ListItem::new(Line::from(header_spans))
                 }
                 TreeRow::Session { session_index } => {
@@ -282,15 +275,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     };
 
     let title_style = Style::default().fg(ACCENT_BLUE).add_modifier(Modifier::BOLD);
-    let mode_style = Style::default().fg(ACCENT_GREEN).add_modifier(Modifier::BOLD);
-    let view_label = if app.tree_view { "[tree]" } else { "[flat]" };
 
-    let mut title_spans = vec![
-        Span::styled(" Sessions ", title_style),
-        Span::styled(view_label, title_style),
-    ];
-    title_spans.push(Span::styled(" ", title_style));
-    title_spans.push(Span::styled(app.display_mode.label(), mode_style));
+    let mut title_spans = vec![Span::styled(" Sessions ", title_style)];
     if !app.hide_empty {
         title_spans.push(Span::styled(" [showing empty]", title_style));
     }
@@ -300,15 +286,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if let Some(p) = &app.filter_path {
         title_spans.push(Span::styled(format!(" ({})", p), title_style));
     }
-    let running_count = app.total_running_count();
-    if running_count > 0 {
-        let (dot, dot_style) = aggregate_dot_style(app);
-        title_spans.push(Span::styled(format!(" {} ", dot), dot_style));
-        title_spans.push(Span::styled(
-            format!("{} running", running_count),
-            Style::default().fg(ACCENT_GREEN).add_modifier(Modifier::BOLD),
-        ));
-    }
+    let (active, idle, waiting) = app.total_activity_counts();
+    title_spans.extend(activity_count_spans(active, idle, waiting));
     if app.live_filter {
         title_spans.push(Span::styled(" [live only]", Style::default().fg(ACCENT_GREEN)));
     }
@@ -444,8 +423,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         estimate_wrapped_height(&preview_text, inner_width)
     };
     let max_scroll = (content_height as u16).saturating_sub(inner_height);
-    if app.preview_scroll > max_scroll {
+    if app.preview_auto_scroll && is_live_selected {
         app.preview_scroll = max_scroll;
+    } else if app.preview_scroll > max_scroll {
+        app.preview_scroll = max_scroll;
+        if is_live_selected {
+            app.preview_auto_scroll = true;
+        }
     }
 
     let mut preview_widget = Paragraph::new(preview_text)

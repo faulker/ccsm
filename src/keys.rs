@@ -1,6 +1,6 @@
 use crate::app::{App, AppMode, DuplicateSource, FlatRow, LaunchRequest, TreeRow};
 use crate::{data, live};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, ModifierKeyCode};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, ModifierKeyCode, MouseEventKind};
 
 /// Normalize a key event so that Shift+letter produces an uppercase `Char`.
 ///
@@ -73,6 +73,13 @@ impl App {
                                     eprintln!("Failed to rename tmux session: {}", String::from_utf8_lossy(&out.stderr).trim());
                                 }
                                 Ok(_) => {}
+                            }
+                            // Migrate activity state and poll timestamp to the new name
+                            if let Some(state) = self.activity_states.remove(&tmux_name) {
+                                self.activity_states.insert(new_name.clone(), state);
+                            }
+                            if let Some(ts) = self.activity_last_poll.remove(&tmux_name) {
+                                self.activity_last_poll.insert(new_name.clone(), ts);
                             }
                             self.live_sessions = live::discover_live_sessions(self.config.tmux_bin());
                             self.live_preview_cache.clear();
@@ -231,7 +238,23 @@ impl App {
     /// Tracks Shift state, delegates to modal handlers when a popup is open, and
     /// processes navigation, filter, and action keys in Normal mode.
     pub fn handle_event(&mut self) -> anyhow::Result<()> {
-        if let Event::Key(key) = event::read()? {
+        let event = event::read()?;
+
+        if let Event::Mouse(mouse) = event {
+            match mouse.kind {
+                MouseEventKind::ScrollDown => {
+                    self.preview_scroll = self.preview_scroll.saturating_add(3);
+                }
+                MouseEventKind::ScrollUp => {
+                    self.preview_auto_scroll = false;
+                    self.preview_scroll = self.preview_scroll.saturating_sub(3);
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
+
+        if let Event::Key(key) = event {
             // Track shift state for UI highlighting
             // Capture before updating — needed for terminals (e.g. Ghostty) that don't
             // populate KeyModifiers::SHIFT on Enter, so the pre-update value is used
@@ -317,6 +340,7 @@ impl App {
                         self.filter_input = tui_input::Input::default();
                         self.recompute_filter();
                         self.preview_scroll = u16::MAX;
+                        self.preview_auto_scroll = true;
                     }
                     KeyCode::Enter => {
                         self.filter_active = false;
@@ -326,16 +350,19 @@ impl App {
                         if count > 0 {
                             self.selected = (self.selected + 1).min(count - 1);
                             self.preview_scroll = u16::MAX;
+                            self.preview_auto_scroll = true;
                         }
                     }
                     KeyCode::Up => {
                         self.selected = self.selected.saturating_sub(1);
                         self.preview_scroll = u16::MAX;
+                        self.preview_auto_scroll = true;
                     }
                     _ => {
                         if self.filter_input.handle_event(&Event::Key(normalize_key(key))).is_some() {
                             self.recompute_filter();
                             self.preview_scroll = u16::MAX;
+                            self.preview_auto_scroll = true;
                         }
                     }
                 }
@@ -367,16 +394,19 @@ impl App {
                         self.selected =
                             (self.selected + 1).min(count - 1);
                         self.preview_scroll = u16::MAX;
+                        self.preview_auto_scroll = true;
                     }
                 }
                 (KeyCode::Char('k'), KeyModifiers::NONE) | (KeyCode::Up, KeyModifiers::NONE) => {
                     self.selected = self.selected.saturating_sub(1);
                     self.preview_scroll = u16::MAX;
+                    self.preview_auto_scroll = true;
                 }
                 (KeyCode::Char('J' | 'j'), KeyModifiers::SHIFT) | (KeyCode::Down, KeyModifiers::SHIFT) => {
                     self.preview_scroll = self.preview_scroll.saturating_add(3);
                 }
                 (KeyCode::Char('K' | 'k'), KeyModifiers::SHIFT) | (KeyCode::Up, KeyModifiers::SHIFT) => {
+                    self.preview_auto_scroll = false;
                     self.preview_scroll = self.preview_scroll.saturating_sub(3);
                 }
                 (KeyCode::Char('n'), KeyModifiers::NONE) => {
@@ -586,6 +616,7 @@ impl App {
                                 if matches!(self.tree_rows.get(i), Some(TreeRow::HistoryHeader { .. })) {
                                     self.selected = i;
                                     self.preview_scroll = u16::MAX;
+                                    self.preview_auto_scroll = true;
                                     break;
                                 }
                             }
@@ -596,6 +627,7 @@ impl App {
                                 if matches!(self.tree_rows.get(i), Some(TreeRow::RunningHeader { .. })) {
                                     self.selected = i;
                                     self.preview_scroll = u16::MAX;
+                                    self.preview_auto_scroll = true;
                                     break;
                                 }
                             }

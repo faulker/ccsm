@@ -396,9 +396,10 @@ mod tests {
         assert!(!Config::is_bin_available("/nonexistent/path/to/binary"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_is_bin_available_bare_name_sh() {
-        // `sh` should be available on any system
+        // `sh` should be available on Unix systems
         assert!(Config::is_bin_available("sh"));
     }
 }

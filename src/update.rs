@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::io::Read;
 
@@ -156,6 +157,15 @@ pub fn perform_update(info: &UpdateInfo) -> Result<()> {
         anyhow::bail!("Download exceeded maximum allowed size");
     }
 
+    // Verify download integrity via SHA256 checksum when available
+    match verify_checksum(info, &bytes) {
+        Ok(()) => {}
+        Err(ChecksumError::Mismatch(msg)) => anyhow::bail!("{msg}"),
+        Err(ChecksumError::NotAvailable) => {
+            // Checksums file not available — skip verification for older releases
+        }
+    }
+
     let temp_dir = tempfile::tempdir().context("Failed to create temp directory")?;
 
     let is_zip = info.download_url.split('?').next().unwrap_or("").ends_with(".zip");
@@ -178,27 +188,23 @@ pub fn perform_update(info: &UpdateInfo) -> Result<()> {
         let new_path = current_exe.with_extension("new");
         std::fs::copy(&new_binary, &new_path)
             .context("Failed to write new binary for Windows update")?;
-        let bat_path = current_exe.with_extension("bat");
+        let ps1_path = current_exe.with_extension("ps1");
         let pid = std::process::id();
-        // Escape % for batch variable expansion safety
-        let escaped_new = new_path.display().to_string().replace('%', "%%");
-        let escaped_cur = current_exe.display().to_string().replace('%', "%%");
+        // Use single-quoted PowerShell strings to avoid variable expansion issues
         let script = format!(
-            "@echo off\r\n\
-             :wait\r\n\
-             tasklist /fi \"pid eq {pid}\" 2>nul | find \"{pid}\" >nul\r\n\
-             if %errorlevel% == 0 (timeout /t 1 /nobreak >nul & goto wait)\r\n\
-             timeout /t 1 /nobreak >nul\r\n\
-             move /y \"{new}\" \"{cur}\" >nul\r\n\
-             del \"%~f0\"\r\n",
+            "while (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ Start-Sleep -Seconds 1 }}\r\n\
+             Start-Sleep -Seconds 1\r\n\
+             Move-Item -LiteralPath '{new}' -Destination '{cur}' -Force\r\n\
+             Remove-Item -LiteralPath $MyInvocation.MyCommand.Path -Force\r\n",
             pid = pid,
-            new = escaped_new,
-            cur = escaped_cur,
+            new = new_path.display(),
+            cur = current_exe.display(),
         );
-        std::fs::write(&bat_path, &script)
+        std::fs::write(&ps1_path, &script)
             .context("Failed to write Windows update helper script")?;
-        std::process::Command::new("cmd")
-            .args(["/c", "start", "/min", "", &bat_path.to_string_lossy()])
+        std::process::Command::new("powershell")
+            .args(["-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File",
+                   &ps1_path.to_string_lossy()])
             .spawn()
             .context("Failed to launch Windows update helper")?;
         return Ok(());
@@ -231,6 +237,62 @@ pub fn perform_update(info: &UpdateInfo) -> Result<()> {
         let _ = std::fs::remove_file(&backup);
     }
     // temp_dir is cleaned up automatically on drop
+
+    Ok(())
+}
+
+/// Typed error for checksum verification so callers can distinguish
+/// "checksums not available" from "hash mismatch" without string matching.
+enum ChecksumError {
+    /// The checksums file could not be fetched (older release, network issue, etc.).
+    NotAvailable,
+    /// The download's hash did not match the expected value.
+    Mismatch(String),
+}
+
+/// Fetch the `checksums-sha256.txt` file from the same release and verify that the
+/// downloaded archive matches the expected hash.
+fn verify_checksum(info: &UpdateInfo, bytes: &[u8]) -> std::result::Result<(), ChecksumError> {
+    let checksums_url = format!(
+        "https://github.com/faulker/ccsm/releases/download/{}/checksums-sha256.txt",
+        info.tag
+    );
+    let resp = ureq::get(&checksums_url)
+        .set("User-Agent", "ccsm-update-checker")
+        .timeout(std::time::Duration::from_secs(10))
+        .call()
+        .map_err(|_| ChecksumError::NotAvailable)?;
+
+    let body = resp
+        .into_string()
+        .map_err(|_| ChecksumError::NotAvailable)?;
+
+    // Determine the asset filename for this platform
+    let asset_name = info
+        .download_url
+        .split('/')
+        .next_back()
+        .and_then(|s| s.split('?').next())
+        .ok_or_else(|| ChecksumError::NotAvailable)?;
+
+    // Find matching line: "<hex_hash>  <filename>" (sha256sum format uses two spaces)
+    let expected_hash = body
+        .lines()
+        .find_map(|line| {
+            let mut parts = line.splitn(2, char::is_whitespace);
+            let hash = parts.next()?;
+            let name = parts.next()?.trim();
+            if name == asset_name { Some(hash.to_string()) } else { None }
+        })
+        .ok_or_else(|| ChecksumError::NotAvailable)?;
+
+    let actual_hash = format!("{:x}", Sha256::digest(bytes));
+
+    if actual_hash != expected_hash {
+        return Err(ChecksumError::Mismatch(format!(
+            "Download integrity checksum mismatch: expected {expected_hash}, got {actual_hash}"
+        )));
+    }
 
     Ok(())
 }
@@ -445,6 +507,18 @@ mod tests {
         }
         extract_tar_gz(&buf, dir.path()).unwrap();
         assert!(dir.path().join("testfile").exists());
+    }
+
+    #[test]
+    fn test_sha256_digest_format() {
+        // verify_checksum requires a network call so we can't unit-test the full flow,
+        // but we can verify the SHA256 formatting works correctly.
+        let data = b"test binary content";
+        let hash = format!("{:x}", Sha256::digest(data));
+        assert_eq!(hash.len(), 64); // SHA256 hex is always 64 chars
+        // Different data should produce different hash
+        let other_hash = format!("{:x}", Sha256::digest(b"different content"));
+        assert_ne!(hash, other_hash);
     }
 
     #[test]

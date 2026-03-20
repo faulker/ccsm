@@ -11,7 +11,7 @@ mod update;
 use anyhow::Result;
 use app::App;
 use crossterm::{
-    event::{self, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags},
+    event::{self, EnableMouseCapture, DisableMouseCapture, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags},
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
 };
@@ -25,6 +25,7 @@ use std::path::PathBuf;
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
     terminal::enable_raw_mode()?;
     io::stdout().execute(EnterAlternateScreen)?;
+    io::stdout().execute(EnableMouseCapture)?;
     let _ = io::stdout().execute(PushKeyboardEnhancementFlags(
         KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
             | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
@@ -38,6 +39,7 @@ fn setup_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
 /// Pop keyboard enhancement flags, disable raw mode, and leave the alternate screen.
 fn restore_terminal() -> Result<()> {
     let _ = io::stdout().execute(PopKeyboardEnhancementFlags);
+    io::stdout().execute(DisableMouseCapture)?;
     terminal::disable_raw_mode()?;
     io::stdout().execute(LeaveAlternateScreen)?;
     Ok(())
@@ -94,10 +96,9 @@ fn run_app(
             app.needs_redraw = false;
         }
 
-        let has_live = app.selected_live_index().is_some();
-        let has_active = app.has_any_active_session();
-        let poll_timeout = if has_live || has_active {
-            std::time::Duration::from_millis(250)
+        let has_live_sessions = !app.live_sessions.is_empty();
+        let poll_timeout = if has_live_sessions {
+            std::time::Duration::from_millis(500)
         } else {
             std::time::Duration::from_millis(1000)
         };
@@ -105,10 +106,12 @@ fn run_app(
         if event::poll(poll_timeout)? {
             app.needs_redraw = true;
             app.handle_event()?;
-        } else {
-            app.poll_all_activity();
-            if has_live || has_active {
-                // Periodic redraw so the live preview pane and pulse animation stay fresh
+        } else if has_live_sessions {
+            let activity_changed = app.poll_all_activity();
+            // Only redraw when activity state changed or pulse animation boundary crossed
+            let prev_pulse = ((app.tick.wrapping_sub(1)) / 2) % 2;
+            let curr_pulse = (app.tick / 2) % 2;
+            if activity_changed || prev_pulse != curr_pulse {
                 app.needs_redraw = true;
             }
         }
@@ -133,6 +136,11 @@ fn run_app(
                 app.apply_session_names(names);
                 app.needs_redraw = true;
             }
+        }
+
+        // Periodically re-check session names on disk (~every 30 ticks)
+        if app.tick % 30 == 0 && app.names_receiver.is_none() {
+            app.spawn_load_session_names();
         }
 
         if app.should_quit {
@@ -274,8 +282,13 @@ fn main() -> Result<()> {
 
         #[cfg(windows)]
         {
-            std::process::Command::new(&exe).args(&args).spawn()?;
-            std::process::exit(0);
+            match std::process::Command::new(&exe).args(&args).spawn() {
+                Ok(_) => std::process::exit(0),
+                Err(e) => {
+                    eprintln!("Failed to restart: {e}");
+                    std::process::exit(1);
+                }
+            }
         }
     }
 
