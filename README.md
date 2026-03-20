@@ -207,7 +207,7 @@ Settings are persisted to `~/.config/ccsm/config.json` and automatically saved w
 |---|---|---|
 | `tree_view` | `true` / `false` | Start in tree or flat view |
 | `display_mode` | `"name"`, `"short_dir"`, `"full_dir"` | How project groups are labeled in tree view |
-| `hide_empty` | `true` / `false` | Whether to hide sessions with no data file |
+| `hide_empty` | `true` / `false` | Whether to hide sessions with no data file or exit-only sessions |
 | `group_chains` | `true` / `false` | Whether to group chained (parent → child) sessions |
 | `live_filter` | `true` / `false` | Whether to show only running live sessions |
 | `favorites` | Array of paths | Project directories pinned to the top of the list |
@@ -215,7 +215,7 @@ Settings are persisted to `~/.config/ccsm/config.json` and automatically saved w
 
 ## How It Works
 
-1. Reads `~/.claude/history.jsonl` to build a list of sessions with project paths and timestamps
+1. Reads `~/.claude/history.jsonl` to build a list of sessions with project paths and timestamps; exit-only sessions (where the user immediately typed `/exit`) are treated as empty
 2. On selection, loads the session file from `~/.claude/projects/{path}/{sessionId}.jsonl`
 3. Extracts session metadata (working directory, git branch) and displays it in an info bar
 4. Filters to user/assistant messages and displays the last 20 turns as a preview

@@ -59,6 +59,22 @@ struct SlugLine {
     slug: Option<String>,
 }
 
+/// Minimal deserialization target for exit-only detection.
+#[derive(Deserialize)]
+struct MetaLine {
+    #[serde(rename = "type")]
+    entry_type: Option<String>,
+    #[serde(rename = "isMeta")]
+    is_meta: Option<bool>,
+    message: Option<MetaMessage>,
+}
+
+/// Message payload for exit-only detection.
+#[derive(Deserialize)]
+struct MetaMessage {
+    content: Option<String>,
+}
+
 /// One line from `~/.claude/history.jsonl`, capturing session identity and timing.
 #[derive(Deserialize)]
 struct HistoryEntry {
@@ -236,8 +252,11 @@ pub fn load_sessions(filter_path: Option<&str>) -> Result<Vec<SessionInfo>> {
     let mut result: Vec<SessionInfo> = sessions.into_values().collect();
     for session in &mut result {
         if let Some(path) = session_file_path(&session.project, &session.session_id) {
-            session.has_data = true;
-            session.slug = read_slug(&path);
+            let (slug, exit_only) = read_session_meta(&path);
+            if !exit_only {
+                session.has_data = true;
+                session.slug = slug;
+            }
         }
     }
     result.sort_by(|a, b| b.last_timestamp.cmp(&a.last_timestamp));
@@ -266,30 +285,79 @@ fn session_file_path(project: &str, session_id: &str) -> Option<PathBuf> {
     }
 }
 
-/// Read at most the first 10 lines of a session JSONL and return the first non-empty `slug` found.
-fn read_slug(path: &Path) -> Option<String> {
-    let file = File::open(path).ok()?;
+/// Read at most the first 20 lines of a session JSONL and return `(slug, exit_only)`.
+///
+/// `exit_only` is true when the session contains no assistant messages and the only
+/// user message is the `/exit` command — these sessions should be treated as empty.
+fn read_session_meta(path: &Path) -> (Option<String>, bool) {
+    let file = match File::open(path).ok() {
+        Some(f) => f,
+        None => return (None, false),
+    };
     let reader = BufReader::new(file);
+    let mut slug: Option<String> = None;
+    let mut has_assistant = false;
+    let mut has_non_exit_user = false;
+    let mut has_any_user = false;
+
     for (i, line) in reader.lines().enumerate() {
-        if i >= 10 {
+        if i >= 20 {
             break;
         }
         let line = match line {
             Ok(l) => l,
             Err(_) => continue,
         };
-        if !line.contains("\"slug\"") {
-            continue;
-        }
-        if let Ok(entry) = serde_json::from_str::<SlugLine>(&line) {
-            if let Some(slug) = entry.slug {
-                if !slug.is_empty() {
-                    return Some(slug);
+
+        // Slug detection (existing logic)
+        if slug.is_none() && line.contains("\"slug\"") {
+            if let Ok(entry) = serde_json::from_str::<SlugLine>(&line) {
+                if let Some(s) = entry.slug {
+                    if !s.is_empty() {
+                        slug = Some(s);
+                    }
                 }
             }
         }
+
+        // Exit-only detection: parse the line to check message types
+        if let Ok(meta) = serde_json::from_str::<MetaLine>(&line) {
+            match meta.entry_type.as_deref() {
+                Some("assistant") => {
+                    has_assistant = true;
+                }
+                Some("user") => {
+                    if meta.is_meta.unwrap_or(false) {
+                        continue;
+                    }
+                    let content = meta.message.and_then(|m| m.content);
+                    if let Some(ref text) = content {
+                        if text.contains("local-command-stdout") || text.contains("local-command-caveat") {
+                            continue;
+                        }
+                    }
+                    has_any_user = true;
+                    if let Some(ref text) = content {
+                        let stripped = strip_xml_tags(text);
+                        // Check if every non-empty line is just /exit or exit
+                        let is_exit = stripped.lines().all(|l| {
+                            let t = l.trim();
+                            t.is_empty() || t == "/exit" || t == "exit"
+                        });
+                        if !is_exit {
+                            has_non_exit_user = true;
+                        }
+                    } else {
+                        has_non_exit_user = true;
+                    }
+                }
+                _ => {}
+            }
+        }
     }
-    None
+
+    let exit_only = has_any_user && !has_assistant && !has_non_exit_user;
+    (slug, exit_only)
 }
 
 /// Format a millisecond timestamp as a short local date string (e.g. `"Jan 02 15:04"`).
@@ -613,7 +681,7 @@ mod tests {
     }
 
     #[test]
-    fn test_read_slug_finds_slug() {
+    fn test_read_session_meta_finds_slug() {
         use std::io::Write;
         let dir = std::env::temp_dir().join("ccsm_test_slug");
         let _ = std::fs::create_dir_all(&dir);
@@ -623,14 +691,15 @@ mod tests {
         writeln!(f, r#"{{"type":"system","slug":"happy-flying-penguin","content":"init"}}"#).unwrap();
         writeln!(f, r#"{{"type":"user","message":{{"role":"user","content":"hello"}}}}"#).unwrap();
 
-        let slug = read_slug(&path);
+        let (slug, exit_only) = read_session_meta(&path);
         assert_eq!(slug, Some("happy-flying-penguin".to_string()));
+        assert!(!exit_only);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn test_read_slug_missing_returns_none() {
+    fn test_read_session_meta_missing_slug_returns_none() {
         use std::io::Write;
         let dir = std::env::temp_dir().join("ccsm_test_slug2");
         let _ = std::fs::create_dir_all(&dir);
@@ -639,29 +708,86 @@ mod tests {
         let mut f = std::fs::File::create(&path).unwrap();
         writeln!(f, r#"{{"type":"user","message":{{"role":"user","content":"hello"}}}}"#).unwrap();
 
-        let slug = read_slug(&path);
+        let (slug, exit_only) = read_session_meta(&path);
         assert_eq!(slug, None);
+        assert!(!exit_only);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn test_read_slug_only_checks_first_10_lines() {
+    fn test_read_session_meta_only_checks_first_20_lines() {
         use std::io::Write;
         let dir = std::env::temp_dir().join("ccsm_test_slug3");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("late_slug.jsonl");
 
         let mut f = std::fs::File::create(&path).unwrap();
-        // 10 lines without slug
-        for _ in 0..10 {
+        // 20 lines without slug
+        for _ in 0..20 {
             writeln!(f, r#"{{"type":"user","message":{{"role":"user","content":"x"}}}}"#).unwrap();
         }
-        // slug on line 11 (index 10) — should not be found
+        // slug on line 21 (index 20) — should not be found
         writeln!(f, r#"{{"type":"system","slug":"late-slug","content":"init"}}"#).unwrap();
 
-        let slug = read_slug(&path);
+        let (slug, _) = read_session_meta(&path);
         assert_eq!(slug, None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_read_session_meta_exit_only_session() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join("ccsm_test_exit_only");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("exit_only.jsonl");
+
+        // Matches real exit-only session structure: system line, meta user messages,
+        // file-history-snapshot, /exit command, and local-command-stdout "Bye!"
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, r#"{{"type":"system","subtype":"bridge_status","content":"init","isMeta":false}}"#).unwrap();
+        writeln!(f, r#"{{"type":"file-history-snapshot","data":{{}}}}"#).unwrap();
+        writeln!(f, r#"{{"type":"user","message":{{"role":"user","content":"<local-command-caveat>Caveat</local-command-caveat>"}},"isMeta":true}}"#).unwrap();
+        writeln!(f, r#"{{"type":"user","message":{{"role":"user","content":"<command-name>/exit</command-name>\n<command-message>exit</command-message>"}}}}"#).unwrap();
+        writeln!(f, r#"{{"type":"user","message":{{"role":"user","content":"<local-command-stdout>Bye!</local-command-stdout>"}}}}"#).unwrap();
+
+        let (_, exit_only) = read_session_meta(&path);
+        assert!(exit_only, "Session with only /exit user message should be exit_only");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_read_session_meta_real_conversation_not_exit_only() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join("ccsm_test_not_exit_only");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("real_convo.jsonl");
+
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, r#"{{"type":"file-history-snapshot","data":{{}}}}"#).unwrap();
+        writeln!(f, r#"{{"type":"user","message":{{"role":"user","content":"hello world"}}}}"#).unwrap();
+        writeln!(f, r#"{{"type":"assistant","message":{{"role":"assistant","content":"Hi! How can I help?"}}}}"#).unwrap();
+
+        let (_, exit_only) = read_session_meta(&path);
+        assert!(!exit_only, "Session with real conversation should not be exit_only");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_read_session_meta_no_user_messages_not_exit_only() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join("ccsm_test_no_user");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("no_user.jsonl");
+
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, r#"{{"type":"file-history-snapshot","data":{{}}}}"#).unwrap();
+
+        let (_, exit_only) = read_session_meta(&path);
+        assert!(!exit_only, "Session with no user messages should not be exit_only");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

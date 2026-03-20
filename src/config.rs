@@ -125,11 +125,13 @@ impl Config {
         if Path::new(bin).is_absolute() {
             Path::new(bin).exists()
         } else {
-            std::process::Command::new("sh")
-                .args(["-c", &format!("command -v {}", bin)])
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false)
+            // Run the binary directly with --version to avoid shell injection.
+            std::process::Command::new(bin)
+                .arg("--version")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok()
         }
     }
 

@@ -211,6 +211,7 @@ impl App {
         let group_chains = config.group_chains;
         let live_filter = config.live_filter;
         let favorites = config.favorites.clone();
+        let live_sessions = live::discover_live_sessions(config.tmux_bin());
         let mut app = Self {
             sessions,
             selected: 0,
@@ -241,7 +242,7 @@ impl App {
             names_receiver: None,
             should_restart: false,
             needs_redraw: true,
-            live_sessions: live::discover_live_sessions(),
+            live_sessions,
             live_filter,
             naming_input: Input::default(),
             naming_placeholder: String::new(),
@@ -810,7 +811,7 @@ impl App {
             .map(|(_, last)| now.duration_since(*last).as_secs() >= 1)
             .unwrap_or(true);
         if should_refresh {
-            let output = live::poll_pane_buffer(&name, 100);
+            let output = live::poll_pane_buffer(self.config.tmux_bin(), &name, 100);
             self.live_preview_cache.insert(name.clone(), (output, now));
         }
         self.live_preview_cache.get(&name).map(|(s, _)| s.clone()).unwrap_or_default()
@@ -878,7 +879,7 @@ impl App {
     /// Re-query the ccsm tmux server for live sessions, clear the live preview cache,
     /// and rebuild both flat and tree views.
     pub fn reload_live_sessions(&mut self) {
-        self.live_sessions = live::discover_live_sessions();
+        self.live_sessions = live::discover_live_sessions(self.config.tmux_bin());
         self.live_preview_cache.clear();
         self.recompute_flat_rows();
         self.recompute_tree();
@@ -1602,9 +1603,15 @@ mod tests {
         app.config_selected = 2;
         assert_eq!(app.config_selected, 2);
 
-        // Can't go above 2
-        if app.config_selected < 2 { app.config_selected += 1; }
-        assert_eq!(app.config_selected, 2);
+        // Navigate to all items
+        app.config_selected = 3;
+        assert_eq!(app.config_selected, 3);
+        app.config_selected = 4;
+        assert_eq!(app.config_selected, 4);
+
+        // Can't go above 4
+        if app.config_selected < 4 { app.config_selected += 1; }
+        assert_eq!(app.config_selected, 4);
     }
 
     #[test]

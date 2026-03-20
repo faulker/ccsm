@@ -63,8 +63,8 @@ impl App {
                                 }
                                 self.preview_cache.clear();
                             }
-                            let tmux = crate::config::Config::load().tmux_bin().to_string();
-                            match std::process::Command::new(&tmux)
+                            let tmux = self.config.tmux_bin();
+                            match std::process::Command::new(tmux)
                                 .args(["-L", live::TMUX_SOCKET, "rename-session", "-t", &tmux_name, &new_name])
                                 .output()
                             {
@@ -74,7 +74,7 @@ impl App {
                                 }
                                 Ok(_) => {}
                             }
-                            self.live_sessions = live::discover_live_sessions();
+                            self.live_sessions = live::discover_live_sessions(self.config.tmux_bin());
                             self.live_preview_cache.clear();
                             self.recompute_flat_rows();
                             self.recompute_tree();
@@ -351,6 +351,7 @@ impl App {
                     self.filter_active = true;
                 }
                 (KeyCode::Char('o'), KeyModifiers::NONE) => {
+                    self.config_selected = 0;
                     self.mode = AppMode::Config;
                 }
                 (KeyCode::Char('j'), KeyModifiers::NONE) | (KeyCode::Down, KeyModifiers::NONE) => {
@@ -400,10 +401,10 @@ impl App {
                 (KeyCode::Char('x'), KeyModifiers::NONE) => {
                     if let Some(idx) = self.selected_live_index() {
                         let name = self.live_sessions[idx].tmux_name.clone();
-                        if let Err(e) = live::stop_live_session(&name) {
+                        if let Err(e) = live::stop_live_session(self.config.tmux_bin(), &name) {
                             eprintln!("Failed to stop session: {e}");
                         }
-                        self.live_sessions = live::discover_live_sessions();
+                        self.live_sessions = live::discover_live_sessions(self.config.tmux_bin());
                         self.live_preview_cache.remove(&name);
                         self.recompute_flat_rows();
                         self.recompute_tree();

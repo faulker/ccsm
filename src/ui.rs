@@ -12,17 +12,10 @@ use ratatui::{
     Frame,
 };
 
-// Catppuccin Mocha-inspired palette
-const BG_SURFACE: Color = Color::Rgb(30, 30, 46);
-const FG_TEXT: Color = Color::Rgb(205, 214, 244);
-const FG_SUBTEXT: Color = Color::Rgb(147, 153, 178);
-const FG_OVERLAY: Color = Color::Rgb(88, 91, 112);
-const ACCENT_BLUE: Color = Color::Rgb(137, 180, 250);
-const ACCENT_GREEN: Color = Color::Rgb(166, 218, 149);
-const ACCENT_MAUVE: Color = Color::Rgb(203, 166, 247);
-const ACCENT_PEACH: Color = Color::Rgb(250, 179, 135);
-const ACCENT_TEAL: Color = Color::Rgb(148, 226, 213);
-const HIGHLIGHT_BG: Color = Color::Rgb(69, 71, 90);
+use crate::theme::{
+    ACCENT_BLUE, ACCENT_GREEN, ACCENT_MAUVE, ACCENT_PEACH, ACCENT_TEAL, BG_SURFACE, FG_OVERLAY,
+    FG_SUBTEXT, FG_TEXT, HIGHLIGHT_BG,
+};
 
 /// Render the full TUI frame: session list, preview pane, info bar, status bar,
 /// and any active modal overlay (rename, update prompt, help, naming popup).

@@ -3,21 +3,16 @@ use crate::config::Config;
 use crossterm::event::KeyCode;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear, Paragraph},
     Frame,
 };
 
-// Re-use the same palette constants as ui.rs
-const BG_SURFACE: Color = Color::Rgb(30, 30, 46);
-const FG_TEXT: Color = Color::Rgb(205, 214, 244);
-const FG_SUBTEXT: Color = Color::Rgb(147, 153, 178);
-const ACCENT_BLUE: Color = Color::Rgb(137, 180, 250);
-const ACCENT_PEACH: Color = Color::Rgb(250, 179, 135);
-const ACCENT_GREEN: Color = Color::Rgb(166, 218, 149);
-const ACCENT_RED: Color = Color::Rgb(243, 139, 168);
-const HIGHLIGHT_BG: Color = Color::Rgb(69, 71, 90);
+use crate::theme::{
+    ACCENT_BLUE, ACCENT_GREEN, ACCENT_PEACH, ACCENT_RED, BG_SURFACE, FG_SUBTEXT, FG_TEXT,
+    HIGHLIGHT_BG,
+};
 
 impl App {
     /// Handle a key event while the config popup is open.

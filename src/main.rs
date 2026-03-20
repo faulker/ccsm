@@ -4,6 +4,7 @@ mod config_popup;
 mod data;
 mod keys;
 mod live;
+mod theme;
 mod ui;
 mod update;
 
@@ -133,18 +134,19 @@ fn run_app(
 
         if let Some(req) = app.launch_session.take() {
             restore_terminal()?;
+            let cfg = config::Config::load();
+            let tmux = cfg.tmux_bin().to_string();
+            let claude = cfg.claude_bin().to_string();
             match req {
                 app::LaunchRequest::Resume { session_id, cwd } => {
                     let dir = if std::path::Path::new(&cwd).exists() { &cwd } else { "." };
-                    let live_sessions = live::discover_live_sessions();
+                    let live_sessions = live::discover_live_sessions(&tmux);
                     let tmux_name = live::generate_auto_name(dir, &live_sessions);
-                    let claude = config::Config::load().claude_bin().to_string();
-                    live::start_live_session(&tmux_name, dir, &[&claude, "--resume", &session_id])?;
-                    live::attach_to_session(&tmux_name)?;
+                    live::start_live_session(&tmux, &tmux_name, dir, &[&claude, "--resume", &session_id])?;
+                    live::attach_to_session(&tmux, &tmux_name)?;
                 }
                 app::LaunchRequest::Direct { session_id, cwd } => {
                     let dir = if std::path::Path::new(&cwd).exists() { &cwd } else { "." };
-                    let claude = config::Config::load().claude_bin().to_string();
                     std::process::Command::new(&claude)
                         .arg("--resume")
                         .arg(&session_id)
@@ -152,16 +154,14 @@ fn run_app(
                         .status()?;
                 }
                 app::LaunchRequest::AttachLive { tmux_name } => {
-                    live::attach_to_session(&tmux_name)?;
+                    live::attach_to_session(&tmux, &tmux_name)?;
                 }
                 app::LaunchRequest::NewLive { name, cwd } => {
-                    let claude = config::Config::load().claude_bin().to_string();
-                    live::start_live_session(&name, &cwd, &[&claude, "--name", &name])?;
-                    live::attach_to_session(&name)?;
+                    live::start_live_session(&tmux, &name, &cwd, &[&claude, "--name", &name])?;
+                    live::attach_to_session(&tmux, &name)?;
                 }
                 app::LaunchRequest::NewDirect { cwd } => {
                     let dir = if std::path::Path::new(&cwd).exists() { &cwd } else { "." };
-                    let claude = config::Config::load().claude_bin().to_string();
                     std::process::Command::new(&claude)
                         .current_dir(dir)
                         .status()?;
@@ -214,23 +214,25 @@ fn main() -> Result<()> {
     });
 
     if spawn_session {
+        let cfg = config::Config::load();
+        let tmux = cfg.tmux_bin().to_string();
         let cwd = std::env::current_dir()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|_| ".".to_string());
-        let live_sessions = live::discover_live_sessions();
+        let live_sessions = live::discover_live_sessions(&tmux);
         let tmux_name = live::generate_auto_name(&cwd, &live_sessions);
         let exe = std::env::current_exe()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|_| "ccsm".to_string());
-        let claude = config::Config::load().claude_bin().to_string();
+        let claude = cfg.claude_bin().to_string();
         let shell_cmd = format!("{}; exec {}", claude, exe);
-        live::start_live_session(&tmux_name, &cwd, &["sh", "-c", &shell_cmd])?;
-        live::switch_to_session(&tmux_name)?;
+        live::start_live_session(&tmux, &tmux_name, &cwd, &["sh", "-c", &shell_cmd])?;
+        live::switch_to_session(&tmux, &tmux_name)?;
         return Ok(());
     }
 
     let sessions = data::load_sessions(filter_path.as_deref())?;
-    if sessions.is_empty() && !live::is_server_running() {
+    if sessions.is_empty() && !live::is_server_running(&config::Config::load().tmux_bin().to_string()) {
         if filter_path.is_some() {
             eprintln!("No Claude Code sessions found for the specified path");
         } else {
