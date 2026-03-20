@@ -108,6 +108,41 @@ Use `--spawn` from within a live tmux session to create a new session and switch
 ccsm --spawn
 ```
 
+## Quick Start
+
+### Resume a past session
+
+1. Run `ccsm` to open the session browser
+2. Navigate with `j`/`k` (or arrow keys) — sessions are grouped by project
+3. Press `→` or `Enter` on a project header to expand it and see individual sessions
+4. The right pane shows a scrollable preview of the selected conversation
+5. Press `Enter` to resume the session in tmux, or `Shift+Enter` to resume directly in your terminal
+
+### Start a new live session
+
+**From the TUI:**
+
+1. Select any project in the list
+2. Press `n` to start a new tmux-backed session in that project's directory
+3. Type a name (or accept the auto-generated one) and press `Enter`
+
+**From the command line:**
+
+```sh
+ccsm --new    # skip the TUI — start a session in the current directory immediately
+```
+
+### Switch between live sessions and detach
+
+Once you're attached to a live session inside tmux:
+
+- `Ctrl+n` — switch to the next live session
+- `Ctrl+p` — switch to the previous live session
+- `Ctrl+l` — spawn a new session and switch to it
+- `Ctrl+\` — detach and return to the ccsm session browser
+
+Back in the TUI, live sessions appear at the top of the list with activity indicators: **●** green (active), **●** amber (idle), **▶** red (waiting for input). Press `Enter` to re-attach to any of them.
+
 ## Key Bindings
 
 | Key | Action |
