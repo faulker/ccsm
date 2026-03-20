@@ -79,7 +79,7 @@ jobs:
         run: |
           set -e
           VERSION="${NEW_TAG#v}"
-          sed -i "s/^version = \".*\"/version = \"${VERSION}\"/" Cargo.toml
+          sed -i '0,/^version = ".*"/s//version = "'"${VERSION}"'"/' Cargo.toml
           cargo generate-lockfile
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -92,6 +92,10 @@ jobs:
           NEW_TAG: ${{ steps.bump.outputs.new_tag }}
         run: |
           set -e
+          if git rev-parse "$NEW_TAG" >/dev/null 2>&1; then
+            echo "Tag $NEW_TAG already exists, skipping creation"
+            exit 0
+          fi
           git tag "$NEW_TAG"
           git push origin "$NEW_TAG"
 
@@ -141,9 +145,9 @@ jobs:
         run: |
           VERSION="${RELEASE_TAG#v}"
           if [[ "$OSTYPE" == "darwin"* ]]; then
-            sed -i '' -e "s/^version = \".*\"/version = \"${VERSION}\"/" Cargo.toml
+            sed -i '' -e '0,/^version = ".*"/s//version = "'"${VERSION}"'"/' Cargo.toml
           else
-            sed -i -e "s/^version = \".*\"/version = \"${VERSION}\"/" Cargo.toml
+            sed -i -e '0,/^version = ".*"/s//version = "'"${VERSION}"'"/' Cargo.toml
           fi
 
       - name: Set version in Cargo.toml (Windows)
@@ -151,7 +155,9 @@ jobs:
         shell: pwsh
         run: |
           $version = $env:RELEASE_TAG -replace '^v', ''
-          (Get-Content Cargo.toml) -replace '^version = ".*"', "version = `"$version`"" | Set-Content Cargo.toml
+          $content = Get-Content Cargo.toml -Raw
+          $content = $content -replace '(?m)(^\[package\][\s\S]*?^version\s*=\s*)"[^"]*"', "`$1`"$version`""
+          Set-Content Cargo.toml $content
 
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}

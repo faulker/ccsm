@@ -87,12 +87,16 @@ fn run_app(
     }
 
     loop {
+        app.tick = app.tick.wrapping_add(1);
+
         if app.needs_redraw {
             terminal.draw(|frame| ui::draw(frame, &mut app))?;
             app.needs_redraw = false;
         }
 
-        let poll_timeout = if app.selected_live_index().is_some() {
+        let has_live = app.selected_live_index().is_some();
+        let has_active = app.has_any_active_session();
+        let poll_timeout = if has_live || has_active {
             std::time::Duration::from_millis(250)
         } else {
             std::time::Duration::from_millis(1000)
@@ -101,9 +105,12 @@ fn run_app(
         if event::poll(poll_timeout)? {
             app.needs_redraw = true;
             app.handle_event()?;
-        } else if app.selected_live_index().is_some() {
-            // Periodic redraw so the live preview pane stays fresh
-            app.needs_redraw = true;
+        } else {
+            app.poll_all_activity();
+            if has_live || has_active {
+                // Periodic redraw so the live preview pane and pulse animation stay fresh
+                app.needs_redraw = true;
+            }
         }
 
         // Check for background update result
@@ -221,12 +228,8 @@ fn main() -> Result<()> {
             .unwrap_or_else(|_| ".".to_string());
         let live_sessions = live::discover_live_sessions(&tmux);
         let tmux_name = live::generate_auto_name(&cwd, &live_sessions);
-        let exe = std::env::current_exe()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|_| "ccsm".to_string());
         let claude = cfg.claude_bin().to_string();
-        let shell_cmd = format!("{}; exec {}", claude, exe);
-        live::start_live_session(&tmux, &tmux_name, &cwd, &["sh", "-c", &shell_cmd])?;
+        live::start_live_session(&tmux, &tmux_name, &cwd, &[&claude])?;
         live::switch_to_session(&tmux, &tmux_name)?;
         return Ok(());
     }

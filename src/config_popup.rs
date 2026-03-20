@@ -10,8 +10,8 @@ use ratatui::{
 };
 
 use crate::theme::{
-    ACCENT_BLUE, ACCENT_GREEN, ACCENT_PEACH, ACCENT_RED, BG_SURFACE, FG_SUBTEXT, FG_TEXT,
-    HIGHLIGHT_BG,
+    ACCENT_BLUE, ACCENT_GREEN, ACCENT_MAUVE, ACCENT_PEACH, ACCENT_RED, BG_SURFACE, FG_SUBTEXT,
+    FG_TEXT, HIGHLIGHT_BG,
 };
 
 impl App {
@@ -63,7 +63,7 @@ impl App {
                 self.mode = AppMode::Normal;
             }
             KeyCode::Char('j') | KeyCode::Down => {
-                if self.config_selected < 4 {
+                if self.config_selected < 6 {
                     self.config_selected += 1;
                 }
             }
@@ -103,6 +103,9 @@ impl App {
                         let current = self.config.tmux_path.clone().unwrap_or_default();
                         self.config_path_input = tui_input::Input::from(current);
                     }
+                    6 => {
+                        open_url("https://github.com/faulker/ccsm");
+                    }
                     _ => {}
                 }
             }
@@ -139,7 +142,7 @@ impl App {
 /// Render the config popup with toggleable options and editable path fields.
 pub fn draw_config_popup(frame: &mut Frame, app: &App) {
     let area = centered_rect(50, 30, frame.area());
-    let area = Rect { height: 11.min(area.height), ..area };
+    let area = Rect { height: 15.min(area.height), ..area };
     frame.render_widget(Clear, area);
 
     let selected = app.config_selected;
@@ -220,9 +223,40 @@ pub fn draw_config_popup(frame: &mut Frame, app: &App) {
         },
     ];
 
+    let about_items: Vec<Line> = vec![
+        {
+            let marker = if selected == 5 { "▶ " } else { "  " };
+            let style = if selected == 5 {
+                Style::default().fg(ACCENT_MAUVE).bg(HIGHLIGHT_BG)
+            } else {
+                Style::default().fg(ACCENT_MAUVE)
+            };
+            Line::from(Span::styled(format!("{}Developed by Winter Faulk", marker), style))
+        },
+        {
+            let marker = if selected == 6 { "▶ " } else { "  " };
+            let style = if selected == 6 {
+                Style::default()
+                    .fg(ACCENT_BLUE)
+                    .add_modifier(Modifier::UNDERLINED)
+                    .bg(HIGHLIGHT_BG)
+            } else {
+                Style::default()
+                    .fg(ACCENT_BLUE)
+                    .add_modifier(Modifier::UNDERLINED)
+            };
+            Line::from(Span::styled(
+                format!("{}https://github.com/faulker/ccsm", marker),
+                style,
+            ))
+        },
+    ];
+
     let mut content: Vec<Line> = Vec::new();
     content.push(Line::from(""));
     content.extend(items);
+    content.push(Line::from(""));
+    content.extend(about_items);
     content.push(Line::from(""));
     if app.config_editing {
         content.push(Line::from(vec![
@@ -231,6 +265,13 @@ pub fn draw_config_popup(frame: &mut Frame, app: &App) {
             Span::styled("Esc", key_style),
             Span::styled(" cancel  ", hint_style),
             Span::styled("(empty = default)", hint_style),
+        ]));
+    } else if selected == 6 {
+        content.push(Line::from(vec![
+            Span::styled("  Enter", key_style),
+            Span::styled(" open in browser  ", hint_style),
+            Span::styled("j/k", key_style),
+            Span::styled(" navigate", hint_style),
         ]));
     } else {
         content.push(Line::from(vec![
@@ -305,6 +346,20 @@ pub fn draw_missing_deps_popup(frame: &mut Frame, app: &App) {
             .style(Style::default().bg(BG_SURFACE)),
     );
     frame.render_widget(popup, area);
+}
+
+/// Open a URL in the default browser.
+fn open_url(url: &str) {
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg(url).spawn();
+
+    #[cfg(target_os = "linux")]
+    let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+
+    #[cfg(target_os = "windows")]
+    let _ = std::process::Command::new("cmd")
+        .args(["/c", "start", url])
+        .spawn();
 }
 
 /// Compute a centered `Rect` that is `percent_x`% wide and `percent_y`% tall within `area`.

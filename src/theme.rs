@@ -12,4 +12,6 @@ pub const ACCENT_MAUVE: Color = Color::Rgb(203, 166, 247);
 pub const ACCENT_PEACH: Color = Color::Rgb(250, 179, 135);
 pub const ACCENT_RED: Color = Color::Rgb(243, 139, 168);
 pub const ACCENT_TEAL: Color = Color::Rgb(148, 226, 213);
+pub const ACCENT_AMBER: Color = Color::Rgb(249, 226, 175);
+pub const ACCENT_GREEN_DIM: Color = Color::Rgb(116, 168, 99);
 pub const HIGHLIGHT_BG: Color = Color::Rgb(69, 71, 90);

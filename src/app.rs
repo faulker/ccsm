@@ -1,6 +1,6 @@
 use crate::config::{Config, DisplayMode};
 use crate::data::{self, PreviewMessage, SessionInfo, SessionMeta};
-use crate::live::{self, LiveSession};
+use crate::live::{self, ActivityState, LiveSession};
 use crate::update;
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
@@ -191,15 +191,24 @@ pub struct App {
     pub config_editing: bool,
     /// Input state for the path text field in the config popup.
     pub config_path_input: Input,
+    /// Per-session activity state (Active, Idle, Unknown).
+    pub activity_states: HashMap<String, ActivityState>,
+    /// Per-session timestamp of last activity poll, for throttling.
+    pub activity_last_poll: HashMap<String, Instant>,
+    /// Monotonic tick counter, incremented each redraw to drive pulse animation.
+    pub tick: u64,
+    /// Last error message to display in the status bar.
+    pub status_error: Option<String>,
 }
 
 /// Truncate a path to its last 2 components (e.g. "/Users/sane/Dev/ccsm" -> "Dev/ccsm").
 fn truncate_path(path: &str) -> String {
-    let parts: Vec<&str> = path.rsplitn(3, '/').collect();
+    let trimmed = path.trim_end_matches('/');
+    let parts: Vec<&str> = trimmed.rsplitn(3, '/').collect();
     if parts.len() >= 2 {
         format!("{}/{}", parts[1], parts[0])
     } else {
-        path.to_string()
+        trimmed.to_string()
     }
 }
 
@@ -258,6 +267,10 @@ impl App {
             missing_tmux: false,
             config_editing: false,
             config_path_input: Input::default(),
+            activity_states: HashMap::new(),
+            activity_last_poll: HashMap::new(),
+            tick: 0,
+            status_error: None,
         };
 
         // Check for required binaries
@@ -334,7 +347,7 @@ impl App {
         self.config.favorites = self.favorites.clone();
         // claude_path and tmux_path are saved directly on config when edited
         if let Err(e) = self.config.save() {
-            eprintln!("Failed to save config: {e}");
+            self.status_error = Some(format!("Failed to save config: {e}"));
         }
     }
 
@@ -881,8 +894,47 @@ impl App {
     pub fn reload_live_sessions(&mut self) {
         self.live_sessions = live::discover_live_sessions(self.config.tmux_bin());
         self.live_preview_cache.clear();
+        // Prune stale entries from activity maps
+        let valid_names: HashSet<String> = self.live_sessions.iter().map(|ls| ls.tmux_name.clone()).collect();
+        self.activity_states.retain(|k, _| valid_names.contains(k));
+        self.activity_last_poll.retain(|k, _| valid_names.contains(k));
         self.recompute_flat_rows();
         self.recompute_tree();
+    }
+
+    /// Poll all live sessions for activity state, throttled to every ~2 seconds per session.
+    /// For the currently selected session, reuses the preview cache content.
+    pub fn poll_all_activity(&mut self) {
+        let now = Instant::now();
+        let selected_name = self.selected_live_index()
+            .map(|i| self.live_sessions[i].tmux_name.clone());
+
+        for i in 0..self.live_sessions.len() {
+            let name = self.live_sessions[i].tmux_name.clone();
+
+            // Throttle: skip if polled less than 2 seconds ago
+            if let Some(last) = self.activity_last_poll.get(&name) {
+                if now.duration_since(*last).as_secs() < 2 {
+                    continue;
+                }
+            }
+
+            let content = if selected_name.as_deref() == Some(&name) {
+                // Reuse preview cache for selected session
+                self.live_preview_cache.get(&name).map(|(s, _)| s.clone()).unwrap_or_default()
+            } else {
+                live::poll_pane_tail(self.config.tmux_bin(), &name, 20)
+            };
+
+            let state = live::detect_activity(&content);
+            self.activity_states.insert(name.clone(), state);
+            self.activity_last_poll.insert(name, now);
+        }
+    }
+
+    /// Returns true if any live session is in the Active state.
+    pub fn has_any_active_session(&self) -> bool {
+        self.activity_states.values().any(|s| *s == ActivityState::Active)
     }
 
 }
@@ -1603,15 +1655,19 @@ mod tests {
         app.config_selected = 2;
         assert_eq!(app.config_selected, 2);
 
-        // Navigate to all items
+        // Navigate to all items including about section
         app.config_selected = 3;
         assert_eq!(app.config_selected, 3);
         app.config_selected = 4;
         assert_eq!(app.config_selected, 4);
+        app.config_selected = 5;
+        assert_eq!(app.config_selected, 5);
+        app.config_selected = 6;
+        assert_eq!(app.config_selected, 6);
 
-        // Can't go above 4
-        if app.config_selected < 4 { app.config_selected += 1; }
-        assert_eq!(app.config_selected, 4);
+        // Can't go above 6
+        if app.config_selected < 6 { app.config_selected += 1; }
+        assert_eq!(app.config_selected, 6);
     }
 
     #[test]
@@ -1803,5 +1859,25 @@ mod tests {
 
         assert_eq!(app.filtered_indices, vec![0]);
         assert!(app.chain_map.is_empty());
+    }
+
+    #[test]
+    fn truncate_path_trailing_slash() {
+        assert_eq!(truncate_path("/Users/sane/Dev/"), "sane/Dev");
+    }
+
+    #[test]
+    fn truncate_path_normal() {
+        assert_eq!(truncate_path("/Users/sane/Dev/ccsm"), "Dev/ccsm");
+    }
+
+    #[test]
+    fn truncate_path_single_component() {
+        assert_eq!(truncate_path("foo"), "foo");
+    }
+
+    #[test]
+    fn truncate_path_multiple_trailing_slashes() {
+        assert_eq!(truncate_path("/a/b/c//"), "b/c");
     }
 }

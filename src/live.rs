@@ -224,6 +224,141 @@ pub fn poll_pane_buffer(tmux: &str, name: &str, lines: usize) -> String {
     }
 }
 
+/// Activity state of a live session, determined by examining pane content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivityState {
+    /// Claude is actively working (running a tool or thinking).
+    Active,
+    /// Claude is idle (waiting for user input or approval).
+    Idle,
+    /// State not yet determined (session just started or capture failed).
+    Unknown,
+}
+
+/// Strip ANSI escape sequences from a string for cleaner keyword matching.
+pub fn strip_ansi(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            // Skip CSI sequence: ESC [ ... <letter>
+            if let Some(next) = chars.next() {
+                if next == '[' {
+                    // Consume until we hit a letter (ASCII 0x40-0x7E)
+                    for c2 in chars.by_ref() {
+                        if c2.is_ascii_alphabetic() || c2 == '~' {
+                            break;
+                        }
+                    }
+                }
+                // OSC or other sequences: just skip the next char
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Capture only the last `lines` lines from a pane, without ANSI escape codes.
+/// Lightweight alternative to `poll_pane_buffer` for non-selected sessions.
+pub fn poll_pane_tail(tmux: &str, name: &str, lines: usize) -> String {
+    let lines_str = format!("-{}", lines);
+    let output = std::process::Command::new(tmux)
+        .args([
+            "-L", TMUX_SOCKET,
+            "capture-pane", "-t", name,
+            "-p", "-S", &lines_str,
+        ])
+        .output();
+    match output {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+        _ => String::new(),
+    }
+}
+
+/// Detect whether a live session is active or idle based on its pane content.
+///
+/// Claude Code's status indicators in the terminal:
+/// - **Active (working)**: animated `*` followed by `<Word>...`
+///   optionally with a timer like `(<time> ↓ <tokens>)`
+///   e.g. `* Thinking...` or `* Undulating... (8m 0s ↓ 13.0k tokens)`
+/// - **Done (idle)**: `* <Word> for <duration>`
+///   e.g. `* Brewed for 44s` or `* Simmered for 2m 30s · 15.2k tokens`
+///
+/// Scans lines **bottom-up** so the most recent signal wins.
+pub fn detect_activity(content: &str) -> ActivityState {
+    if content.trim().is_empty() {
+        return ActivityState::Unknown;
+    }
+    let clean = strip_ansi(content);
+    let lines: Vec<&str> = clean.lines().collect();
+
+    // Scan bottom-up: the most recent signal is closest to the bottom
+    for line in lines.iter().rev() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        // Completion summary: `* <Word> for <duration>`
+        // e.g. "* Brewed for 44s", "Simmered for 2m 30s · 15.2k tokens"
+        if is_completion_summary(trimmed) {
+            return ActivityState::Idle;
+        }
+
+        // Active spinner: line contains a word followed by "..."
+        // e.g. "* Thinking...", "* Undulating... (8m 0s ↓ 13.0k tokens)"
+        // The "..." (ellipsis) is the key active-work indicator
+        if is_spinner_line(trimmed) {
+            return ActivityState::Active;
+        }
+    }
+    ActivityState::Idle
+}
+
+/// Returns true if the line looks like a Claude Code completion summary.
+/// Pattern: contains ` for ` followed by a digit (duration).
+/// Examples: `* Brewed for 44s`, `Simmered for 2m 30s · 15.2k tokens`
+fn is_completion_summary(line: &str) -> bool {
+    if let Some(pos) = line.find(" for ") {
+        let after = &line[pos + 5..];
+        after.starts_with(|c: char| c.is_ascii_digit())
+    } else {
+        false
+    }
+}
+
+/// Returns true if the line looks like a Claude Code active spinner line.
+/// Pattern: starts with a non-alphanumeric char (spinner/asterisk), then a
+/// capitalized word followed by `...` (the ellipsis indicating ongoing work).
+/// Examples: `* Thinking...`, `✻ Undulating... (8m 0s ↓ 13.0k tokens)`
+fn is_spinner_line(line: &str) -> bool {
+    // Must contain "..." (the active ellipsis)
+    if !line.contains("...") {
+        return false;
+    }
+    // Skip leading non-alphanumeric chars (spinner symbol, *, whitespace)
+    let alpha_start = line.trim_start_matches(|c: char| !c.is_ascii_alphabetic());
+    if alpha_start.is_empty() {
+        return false;
+    }
+    // The first alpha char should be uppercase (Claude uses capitalized words like
+    // "Thinking", "Undulating", "Reflecting")
+    let first = alpha_start.chars().next().unwrap();
+    if !first.is_ascii_uppercase() {
+        return false;
+    }
+    // The word should be followed by "..."
+    if let Some(word_end) = alpha_start.find("...") {
+        // Everything between start and "..." should be a single word (alphabetic)
+        let word = &alpha_start[..word_end];
+        word.chars().all(|c| c.is_ascii_alphabetic())
+    } else {
+        false
+    }
+}
+
 /// Generate a unique session name of the form `<project>-A`, `<project>-B`, etc.,
 /// skipping letters already used by sessions in `existing`. Falls back to numeric
 /// suffixes starting at 27 once all 26 letters are taken.
@@ -259,5 +394,104 @@ pub fn generate_auto_name(cwd: &str, existing: &[LiveSession]) -> String {
             return format!("{}{}", prefix, suffix);
         }
         n += 1;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strip_ansi_removes_csi_sequences() {
+        let input = "\x1b[32mHello\x1b[0m World";
+        assert_eq!(strip_ansi(input), "Hello World");
+    }
+
+    #[test]
+    fn strip_ansi_preserves_plain_text() {
+        let input = "no escape codes here";
+        assert_eq!(strip_ansi(input), input);
+    }
+
+    #[test]
+    fn detect_activity_spinner_thinking() {
+        let content = "some output\n* Thinking...";
+        assert_eq!(detect_activity(content), ActivityState::Active);
+    }
+
+    #[test]
+    fn detect_activity_spinner_with_timer() {
+        let content = "* Undulating... (8m 0s ↓ 13.0k tokens)";
+        assert_eq!(detect_activity(content), ActivityState::Active);
+    }
+
+    #[test]
+    fn detect_activity_spinner_reflecting() {
+        let content = "* Reflecting...";
+        assert_eq!(detect_activity(content), ActivityState::Active);
+    }
+
+    #[test]
+    fn detect_activity_spinner_no_word_after_is_idle() {
+        // "..." in prose should not trigger active
+        let content = "The tests passed... everything looks good.";
+        assert_eq!(detect_activity(content), ActivityState::Idle);
+    }
+
+    #[test]
+    fn detect_activity_idle() {
+        let content = "> some prompt text\nclaude output here";
+        assert_eq!(detect_activity(content), ActivityState::Idle);
+    }
+
+    #[test]
+    fn detect_activity_empty() {
+        assert_eq!(detect_activity(""), ActivityState::Unknown);
+        assert_eq!(detect_activity("   \n  "), ActivityState::Unknown);
+    }
+
+    #[test]
+    fn detect_activity_spinner_with_ansi() {
+        let content = "\x1b[32m*\x1b[0m Thinking...";
+        assert_eq!(detect_activity(content), ActivityState::Active);
+    }
+
+    #[test]
+    fn detect_activity_completion_summary_is_idle() {
+        let content = "Brewed for 2m 30s · 15.2k tokens";
+        assert_eq!(detect_activity(content), ActivityState::Idle);
+    }
+
+    #[test]
+    fn detect_activity_completion_summary_short_is_idle() {
+        let content = "* Brewed for 44s";
+        assert_eq!(detect_activity(content), ActivityState::Idle);
+    }
+
+    #[test]
+    fn detect_activity_completion_summary_with_cost_is_idle() {
+        let content = "Simmered for 5m 12s · 42.3k tokens | $0.15";
+        assert_eq!(detect_activity(content), ActivityState::Idle);
+    }
+
+    #[test]
+    fn detect_activity_completion_below_spinner_is_idle() {
+        // Bottom-up scan: completion summary below a spinner line means idle
+        let content = "* Thinking...\nOutput here\n* Brewed for 44s";
+        assert_eq!(detect_activity(content), ActivityState::Idle);
+    }
+
+    #[test]
+    fn detect_activity_spinner_below_completion_is_active() {
+        // Bottom-up scan: spinner below a completion summary means active (new task)
+        let content = "* Brewed for 44s\nStarting new task\n* Thinking...";
+        assert_eq!(detect_activity(content), ActivityState::Active);
+    }
+
+    #[test]
+    fn detect_activity_ellipsis_in_lowercase_prose_is_idle() {
+        // Lowercase word before "..." is not a spinner
+        let content = "loading...";
+        assert_eq!(detect_activity(content), ActivityState::Idle);
     }
 }

@@ -180,6 +180,9 @@ pub fn perform_update(info: &UpdateInfo) -> Result<()> {
             .context("Failed to write new binary for Windows update")?;
         let bat_path = current_exe.with_extension("bat");
         let pid = std::process::id();
+        // Escape % for batch variable expansion safety
+        let escaped_new = new_path.display().to_string().replace('%', "%%");
+        let escaped_cur = current_exe.display().to_string().replace('%', "%%");
         let script = format!(
             "@echo off\r\n\
              :wait\r\n\
@@ -189,8 +192,8 @@ pub fn perform_update(info: &UpdateInfo) -> Result<()> {
              move /y \"{new}\" \"{cur}\" >nul\r\n\
              del \"%~f0\"\r\n",
             pid = pid,
-            new = new_path.display(),
-            cur = current_exe.display(),
+            new = escaped_new,
+            cur = escaped_cur,
         );
         std::fs::write(&bat_path, &script)
             .context("Failed to write Windows update helper script")?;
@@ -266,6 +269,9 @@ fn extract_zip(bytes: &[u8], dest: &std::path::Path) -> Result<()> {
 
     for i in 0..archive.len() {
         let mut file = archive.by_index(i).context("Failed to read zip entry")?;
+        if file.is_symlink() {
+            anyhow::bail!("Zip contains a symlink, which is not allowed");
+        }
         let Some(path) = file.enclosed_name() else {
             anyhow::bail!("Zip contains potentially malicious path");
         };

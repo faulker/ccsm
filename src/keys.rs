@@ -148,7 +148,14 @@ impl App {
                     .chars()
                     .map(|c| if c == '.' || c == ':' || c.is_whitespace() { '-' } else { c })
                     .collect();
-                let name = if name.is_empty() { self.naming_placeholder.clone() } else { name };
+                let name = if name.is_empty() {
+                    self.naming_placeholder
+                        .chars()
+                        .map(|c| if c == '.' || c == ':' || c.is_whitespace() { '-' } else { c })
+                        .collect()
+                } else {
+                    name
+                };
                 // Check for a duplicate before consuming state
                 if self.live_sessions.iter().any(|ls| ls.tmux_name == name) {
                     self.duplicate_name = Some(name);
