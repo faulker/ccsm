@@ -987,3 +987,64 @@ fn mouse_scroll_up_saturates_at_zero() {
     app.preview_scroll = app.preview_scroll.saturating_sub(3);
     assert_eq!(app.preview_scroll, 0);
 }
+
+#[test]
+fn naming_dangerous_defaults_to_false() {
+    let app = make_app(make_sessions(), None, Config::default());
+    assert!(!app.naming_dangerous);
+}
+
+#[test]
+fn naming_dangerous_produces_correct_launch_request() {
+    let mut app = make_app(make_sessions(), None, Config::default());
+    // Simulate what pressing D does: set dangerous flag and enter naming mode
+    app.naming_dangerous = true;
+    app.mode = AppMode::NamingSession;
+    app.naming_cwd = Some("/tmp".into());
+    app.naming_placeholder = "test-session".into();
+
+    // Simulate what pressing Enter in naming mode does (inline the logic)
+    let name = app.naming_placeholder.clone();
+    let cwd = app.naming_cwd.take().unwrap_or_else(|| ".".to_string());
+    app.mode = AppMode::Normal;
+    if app.naming_dangerous {
+        app.naming_dangerous = false;
+        app.launch_session = Some(LaunchRequest::NewLiveDangerous { name: name.clone(), cwd: cwd.clone() });
+    } else {
+        app.launch_session = Some(LaunchRequest::NewLive { name: name.clone(), cwd: cwd.clone() });
+    }
+
+    assert!(!app.naming_dangerous, "naming_dangerous should be reset after confirm");
+    match &app.launch_session {
+        Some(LaunchRequest::NewLiveDangerous { name, .. }) => {
+            assert_eq!(name, "test-session");
+        }
+        other => panic!("Expected NewLiveDangerous, got {:?}", other),
+    }
+}
+
+#[test]
+fn naming_non_dangerous_produces_new_live() {
+    let mut app = make_app(make_sessions(), None, Config::default());
+    app.naming_dangerous = false;
+    app.mode = AppMode::NamingSession;
+    app.naming_cwd = Some("/tmp".into());
+    app.naming_placeholder = "test-session".into();
+
+    let name = app.naming_placeholder.clone();
+    let cwd = app.naming_cwd.take().unwrap_or_else(|| ".".to_string());
+    app.mode = AppMode::Normal;
+    if app.naming_dangerous {
+        app.naming_dangerous = false;
+        app.launch_session = Some(LaunchRequest::NewLiveDangerous { name, cwd });
+    } else {
+        app.launch_session = Some(LaunchRequest::NewLive { name, cwd });
+    }
+
+    match &app.launch_session {
+        Some(LaunchRequest::NewLive { name, .. }) => {
+            assert_eq!(name, "test-session");
+        }
+        other => panic!("Expected NewLive, got {:?}", other),
+    }
+}

@@ -7,14 +7,14 @@ use ratatui::{
 };
 
 use crate::theme::{
-    ACCENT_BLUE, ACCENT_GREEN, ACCENT_MAUVE, ACCENT_PEACH, BG_SURFACE, FG_OVERLAY, FG_SUBTEXT,
-    FG_TEXT,
+    ACCENT_BLUE, ACCENT_GREEN, ACCENT_MAUVE, ACCENT_PEACH, ACCENT_RED, BG_SURFACE, FG_OVERLAY,
+    FG_SUBTEXT, FG_TEXT,
 };
 
 use super::util::centered_rect;
 
 /// Render the centered popup for naming a new live session, showing a placeholder when the buffer is empty.
-pub fn draw_naming_popup(frame: &mut Frame, input: &tui_input::Input, placeholder: &str) {
+pub fn draw_naming_popup(frame: &mut Frame, input: &tui_input::Input, placeholder: &str, dangerous: bool) {
     let area = centered_rect(40, 3, frame.area());
     let area = if area.height < 3 {
         Rect { height: 3, ..area }
@@ -49,15 +49,21 @@ pub fn draw_naming_popup(frame: &mut Frame, input: &tui_input::Input, placeholde
         Line::from(content_line)
     };
 
+    let (title, border_color) = if dangerous {
+        (" New Session ⚠ skip-permissions (Esc to cancel) ", ACCENT_RED)
+    } else {
+        (" New Session (Esc to cancel) ", ACCENT_PEACH)
+    };
+
     let popup = Paragraph::new(content).block(
         Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(ACCENT_PEACH))
+            .border_style(Style::default().fg(border_color))
             .title(Span::styled(
-                " New Session (Esc to cancel) ",
+                title,
                 Style::default()
-                    .fg(ACCENT_PEACH)
+                    .fg(border_color)
                     .add_modifier(Modifier::BOLD),
             ))
             .style(Style::default().bg(BG_SURFACE)),
@@ -270,6 +276,10 @@ pub fn render_help_popup(frame: &mut Frame, area: Rect) {
         Line::from(vec![
             Span::styled("  Shift+N         ", key),
             Span::styled("Open direct claude session (no tmux)", desc),
+        ]),
+        Line::from(vec![
+            Span::styled("  Shift+D         ", key),
+            Span::styled("New live session with --dangerously-skip-permissions", desc),
         ]),
         Line::from(vec![
             Span::styled("  x               ", key),

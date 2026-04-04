@@ -231,7 +231,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     // NamingSession overlay (centered popup)
     if app.mode == AppMode::NamingSession {
-        draw_naming_popup(frame, &app.naming_input, &app.naming_placeholder);
+        draw_naming_popup(frame, &app.naming_input, &app.naming_placeholder, app.naming_dangerous);
     }
 
     // Config popup

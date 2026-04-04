@@ -143,6 +143,7 @@ impl App {
                 self.mode = AppMode::Normal;
                 self.naming_input = tui_input::Input::default();
                 self.naming_cwd = None;
+                self.naming_dangerous = false;
             }
             KeyCode::Enter => {
                 let raw = if self.naming_input.value().is_empty() {
@@ -174,7 +175,12 @@ impl App {
                 let cwd = self.naming_cwd.take().unwrap_or_else(|| ".".to_string());
                 self.mode = AppMode::Normal;
                 self.naming_input = tui_input::Input::default();
-                self.launch_session = Some(LaunchRequest::NewLive { name, cwd });
+                if self.naming_dangerous {
+                    self.naming_dangerous = false;
+                    self.launch_session = Some(LaunchRequest::NewLiveDangerous { name, cwd });
+                } else {
+                    self.launch_session = Some(LaunchRequest::NewLive { name, cwd });
+                }
             }
             _ => {
                 self.naming_input.handle_event(&Event::Key(normalize_key(key)));
@@ -485,6 +491,22 @@ impl App {
                         .filter(|p| std::path::Path::new(p).exists())
                         .unwrap_or_else(|| ".".to_string());
                     self.launch_session = Some(LaunchRequest::NewDirect { cwd });
+                }
+                (KeyCode::Char('D' | 'd'), KeyModifiers::SHIFT) => {
+                    if let Some(cwd) = self.selected_cwd() {
+                        let path = std::path::Path::new(&cwd);
+                        let dir = if path.exists() {
+                            cwd
+                        } else {
+                            ".".to_string()
+                        };
+                        let placeholder = live::generate_auto_name(&dir, &self.live_sessions);
+                        self.naming_placeholder = placeholder;
+                        self.naming_cwd = Some(dir);
+                        self.naming_input = tui_input::Input::default();
+                        self.naming_dangerous = true;
+                        self.mode = AppMode::NamingSession;
+                    }
                 }
                 (KeyCode::Enter, _) if (key.modifiers.contains(KeyModifiers::SHIFT) || prev_shift_active) && self.is_historical_selected() => {
                     // Shift+Enter: open historical session directly (no tmux)

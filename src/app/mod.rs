@@ -60,6 +60,8 @@ pub enum LaunchRequest {
     AttachLive { tmux_name: String },
     /// Create and attach to a new live tmux session running claude.
     NewLive { name: String, cwd: String },
+    /// Create and attach to a new live tmux session running claude with --dangerously-skip-permissions.
+    NewLiveDangerous { name: String, cwd: String },
     /// Start a new claude session directly in the foreground (no tmux).
     NewDirect { cwd: String },
 }
@@ -211,6 +213,8 @@ pub struct App {
     pub activity_last_poll: HashMap<String, Instant>,
     /// Monotonic tick counter, incremented each redraw to drive pulse animation.
     pub tick: u64,
+    /// When true, the naming popup is for a --dangerously-skip-permissions session.
+    pub naming_dangerous: bool,
     /// Last error message to display in the status bar.
     pub status_error: Option<String>,
 }
@@ -285,6 +289,7 @@ impl App {
             activity_states: HashMap::new(),
             activity_last_poll: HashMap::new(),
             tick: 0,
+            naming_dangerous: false,
             status_error: None,
         };
 

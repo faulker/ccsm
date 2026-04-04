@@ -175,6 +175,10 @@ fn run_app(
                     live::start_live_session(&tmux, &name, &cwd, &[&claude, "--name", &name])?;
                     live::attach_to_session(&tmux, &name)?;
                 }
+                app::LaunchRequest::NewLiveDangerous { name, cwd } => {
+                    live::start_live_session(&tmux, &name, &cwd, &[&claude, "--dangerously-skip-permissions", "--name", &name])?;
+                    live::attach_to_session(&tmux, &name)?;
+                }
                 app::LaunchRequest::NewDirect { cwd } => {
                     let dir = if std::path::Path::new(&cwd).exists() { &cwd } else { "." };
                     std::process::Command::new(&claude)

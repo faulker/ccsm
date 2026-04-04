@@ -192,6 +192,10 @@ pub fn render_status_bar(frame: &mut Frame, app: &App, bar_area: Rect) {
             ),
         ]));
         hints.push(Line::from(vec![
+            Span::styled("D", shift_key_style),
+            Span::styled(" new dangerous", shift_hint_style),
+        ]));
+        hints.push(Line::from(vec![
             Span::styled("l", shift_key_style),
             Span::styled(" live filter", shift_hint_style),
         ]));
