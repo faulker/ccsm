@@ -24,6 +24,12 @@ use tui_input::Input;
 /// piling up.
 const PENDING_LAUNCH_MAX_ATTEMPTS: u8 = 2;
 
+/// Higher attempt cap for `AttachLive` launches. The tmux session we attached
+/// to may run an idle Claude session that only becomes visible in Claude's
+/// history once the user types something in it, which can take many reload
+/// cycles; we still cap eventually so a missing/non-Claude tmux doesn't leak.
+const PENDING_LAUNCH_ATTACH_LIVE_MAX_ATTEMPTS: u8 = 20;
+
 /// Time window (milliseconds) used to match a CCSM launch without a known
 /// session_id (NewLive/NewDirect/AttachLive) against a freshly observed Claude
 /// session. Generous because clock skew and slow startup both eat into it.
@@ -469,16 +475,25 @@ impl App {
                     }
                 };
                 let window_start = launch.launched_at - PENDING_LAUNCH_MATCH_WINDOW_MS;
+                // AttachLive targets a session that was created before we
+                // attached, so its first_timestamp is in the past and its
+                // last_timestamp may be too if the user attached and detached
+                // without typing. Match on cwd alone for AttachLive; require a
+                // recent first_timestamp for brand-new sessions; require any
+                // recent activity (last_timestamp) for the others.
+                let is_attach_live = launch.origin == CcsmOrigin::AttachLive;
                 self.sessions
                     .iter()
                     .enumerate()
                     .filter(|(_, s)| s.project == cwd)
-                    .filter(|(_, s)| s.last_timestamp >= window_start)
                     .filter(|(_, s)| !matched_ids.contains(&s.session_id))
                     .filter(|(_, s)| {
-                        // For brand-new sessions we expect first_timestamp to
-                        // also be after we launched; for AttachLive the first
-                        // timestamp predates us, which is fine.
+                        if is_attach_live {
+                            return true;
+                        }
+                        if s.last_timestamp < window_start {
+                            return false;
+                        }
                         match launch.origin {
                             CcsmOrigin::NewLive
                             | CcsmOrigin::NewLiveDangerous
@@ -497,7 +512,15 @@ impl App {
                 }
                 None => {
                     launch.attempts += 1;
-                    if launch.attempts < PENDING_LAUNCH_MAX_ATTEMPTS {
+                    // AttachLive may match an idle session that only shows up
+                    // after the user does something in it, so we let it keep
+                    // retrying across many reload cycles.
+                    let cap = if launch.origin == CcsmOrigin::AttachLive {
+                        PENDING_LAUNCH_ATTACH_LIVE_MAX_ATTEMPTS
+                    } else {
+                        PENDING_LAUNCH_MAX_ATTEMPTS
+                    };
+                    if launch.attempts < cap {
                         still_pending.push(launch);
                     }
                 }

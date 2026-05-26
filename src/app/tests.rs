@@ -1267,6 +1267,93 @@ mod ccsm_history_tests {
     }
 
     #[test]
+    fn attach_live_matches_idle_session_outside_recency_window() {
+        with_temp_dir(|| {
+            // Pretend the user is attaching to a tmux session whose Claude
+            // session has been idle for ages (last_timestamp far in the past).
+            let mut app = make_app(vec![], None, Config::default());
+            app.live_sessions = vec![crate::live::LiveSession {
+                tmux_name: "tmux-a".into(),
+                display_name: "tmux-a".into(),
+                cwd: "/test/idle".into(),
+                project_name: "idle".into(),
+            }];
+            app.record_launch(&LaunchRequest::AttachLive {
+                tmux_name: "tmux-a".into(),
+            });
+            // Session's last activity is far older than the 60s match window
+            // — a strict recency filter would skip it.
+            let stale = chrono::Utc::now().timestamp_millis() - 24 * 60 * 60 * 1000;
+            let updated = vec![SessionInfo {
+                session_id: "idle-sess".into(),
+                project: "/test/idle".into(),
+                project_name: "idle".into(),
+                first_timestamp: stale - 1000,
+                last_timestamp: stale,
+                entry_count: 4,
+                has_data: true,
+                name: None,
+                slug: None,
+                ccsm_owned: false,
+            }];
+            app.reload_sessions(updated);
+            assert!(app.ccsm_owned_ids.contains("idle-sess"));
+            assert!(app.pending_launches.is_empty(), "should have matched");
+        });
+    }
+
+    #[test]
+    fn attach_live_retries_outlast_normal_cap() {
+        with_temp_dir(|| {
+            let mut app = make_app(vec![], None, Config::default());
+            app.live_sessions = vec![crate::live::LiveSession {
+                tmux_name: "tmux-b".into(),
+                display_name: "tmux-b".into(),
+                cwd: "/test/empty".into(),
+                project_name: "empty".into(),
+            }];
+            app.record_launch(&LaunchRequest::AttachLive {
+                tmux_name: "tmux-b".into(),
+            });
+            // Burn through the *normal* cap with no matches — AttachLive must
+            // still be queued thanks to its higher cap.
+            for _ in 0..PENDING_LAUNCH_MAX_ATTEMPTS {
+                app.reload_sessions(vec![]);
+            }
+            assert_eq!(app.pending_launches.len(), 1);
+            assert_eq!(app.pending_launches[0].origin, CcsmOrigin::AttachLive);
+        });
+    }
+
+    #[test]
+    fn new_live_still_enforces_recency_filter() {
+        // Regression guard: relaxing recency must remain AttachLive-specific
+        // so that NewLive can't accidentally claim an unrelated stale session.
+        with_temp_dir(|| {
+            let mut app = make_app(vec![], None, Config::default());
+            app.record_launch(&LaunchRequest::NewLive {
+                name: "fresh".into(),
+                cwd: "/test/sharedcwd".into(),
+            });
+            let stale = chrono::Utc::now().timestamp_millis() - 24 * 60 * 60 * 1000;
+            let updated = vec![SessionInfo {
+                session_id: "old-unrelated".into(),
+                project: "/test/sharedcwd".into(),
+                project_name: "sharedcwd".into(),
+                first_timestamp: stale - 1000,
+                last_timestamp: stale,
+                entry_count: 4,
+                has_data: true,
+                name: None,
+                slug: None,
+                ccsm_owned: false,
+            }];
+            app.reload_sessions(updated);
+            assert!(!app.ccsm_owned_ids.contains("old-unrelated"));
+        });
+    }
+
+    #[test]
     fn ccsm_history_path_respects_env_override() {
         with_temp_dir(|| {
             let p = ccsm_history_path().unwrap();
