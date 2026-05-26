@@ -1,0 +1,71 @@
+# .github/workflows/review-router.yml
+name: Review Router
+
+on:
+  pull_request_review:
+    types: [submitted]
+
+jobs:
+  route:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+
+    steps:
+      - name: Check CodeRabbit verdict
+        id: check
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const { data: reviews } = await github.rest.pulls.listReviews({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.payload.pull_request.number,
+            });
+
+            const cr = reviews
+              .filter(r => r.user.login.toLowerCase().includes('coderabbitai'))
+              .sort((a, b) => new Date(b.submitted_at) - new Date(a.submitted_at))[0];
+
+            if (!cr) return;
+
+            core.setOutput('state', cr.state);
+            core.setOutput('pr_number', context.payload.pull_request.number);
+            core.setOutput('pr_branch', context.payload.pull_request.head.ref);
+
+      - name: Trigger auto-fix
+        if: steps.check.outputs.state == 'CHANGES_REQUESTED'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            // Fire a repository_dispatch to kick off the fix workflow
+            await github.rest.repos.createDispatchEvent({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              event_type: 'autofix-requested',
+              client_payload: {
+                pr_number: '${{ steps.check.outputs.pr_number }}',
+                pr_branch: '${{ steps.check.outputs.pr_branch }}',
+              }
+            });
+
+      - name: Auto-merge if approved
+        if: steps.check.outputs.state == 'APPROVED'
+        run: gh pr merge ${{ steps.check.outputs.pr_number }} --squash --auto
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Label for human review
+        if: steps.check.outputs.state == 'COMMENTED'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: ${{ steps.check.outputs.pr_number }},
+              labels: ['needs-human-review']
+            });
