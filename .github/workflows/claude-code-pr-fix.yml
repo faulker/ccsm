@@ -1,0 +1,86 @@
+# .github/workflows/autofix.yml
+name: Claude Code Auto-Fix
+
+on:
+  repository_dispatch:
+    types: [autofix-requested]
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.client_payload.pr_branch }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Fetch CodeRabbit review comments
+        id: comments
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const { data: comments } = await github.rest.pulls.listReviewComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: ${{ github.event.client_payload.pr_number }},
+            });
+
+            const crComments = comments
+              .filter(c => c.user.login.toLowerCase().includes('coderabbitai'))
+              .map(c => `File: ${c.path} (line ${c.line})\n${c.body}`)
+              .join('\n\n---\n\n');
+
+            // Write to a file so Claude can read it
+            const fs = require('fs');
+            fs.writeFileSync('/tmp/review-comments.txt', crComments);
+            console.log(`Found ${comments.filter(c => c.user.login.toLowerCase().includes('coderabbitai')).length} CodeRabbit comments`);
+
+      - name: Run Claude Code auto-fix
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            You are fixing issues identified in a code review.
+            
+            Read the file at /tmp/review-comments.txt. It contains CodeRabbit's review comments
+            in the format "File: <path> (line <n>)\n<comment>".
+            
+            For each comment:
+            1. Open the referenced file
+            2. Understand the issue being raised
+            3. Apply the fix if it is clear and safe (bug fixes, type errors, style, missing error handling)
+            4. Skip anything that requires understanding business requirements or is ambiguous
+            
+            After fixing, run any available tests to verify nothing is broken.
+            Do not commit - the workflow will handle that.
+          claude_args: |
+            --allowedTools Edit,Read,Write,Bash
+            --max-turns 20
+
+      - name: Commit and push fixes
+        run: |
+          git config user.name "claude-autofix[bot]"
+          git config user.email "claude-autofix[bot]@users.noreply.github.com"
+          git add -A
+          git diff --staged --quiet || git commit -m "fix: apply CodeRabbit suggestions [skip ci]"
+          git push
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Comment on PR
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: ${{ github.event.client_payload.pr_number }},
+              body: '🤖 Claude Code attempted to auto-fix CodeRabbit\'s suggestions. Please review the new commits before merging.'
+            });
