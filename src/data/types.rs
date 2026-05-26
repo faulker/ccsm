@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Summary record for one Claude session, built from `~/.claude/history.jsonl`.
 #[derive(Debug, Clone)]
@@ -21,6 +21,10 @@ pub struct SessionInfo {
     pub name: Option<String>,
     /// Optional slug read from the session JSONL, used to group chained sessions.
     pub slug: Option<String>,
+    /// True when CCSM has a snapshot of this session in its own history file
+    /// (`~/.local/share/ccsm/sessions.jsonl`). Lets the row stay visible and the
+    /// preview fall back to the snapshot once Claude cleans its own data up.
+    pub ccsm_owned: bool,
 }
 
 /// Metadata extracted from a session JSONL file used to populate the details bar.
@@ -39,7 +43,7 @@ pub struct SessionMeta {
 }
 
 /// A single conversation turn shown in the preview pane.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PreviewMessage {
     /// Role of the speaker: `"user"`, `"assistant"`, or `"system"`.
     pub role: String,

@@ -1,3 +1,4 @@
+use super::ccsm_history::{append_ccsm_record, test_lock, CcsmOrigin, CcsmSessionRecord};
 use super::history::{read_session_meta, strip_xml_tags};
 use super::io::project_to_dir_name;
 use super::preview::{load_chain_preview, load_preview};
@@ -230,6 +231,7 @@ fn make_session_info(id: &str, first_ts: i64, last_ts: i64, slug: Option<&str>) 
         has_data: false,
         name: None,
         slug: slug.map(|s| s.to_string()),
+        ccsm_owned: false,
     }
 }
 
@@ -250,4 +252,74 @@ fn test_load_chain_preview_orders_by_first_timestamp() {
     );
     // session_id should be the most recent (s3)
     assert_eq!(meta.session_id.as_deref(), Some("session-ccc"));
+}
+
+fn with_temp_ccsm_dir<F: FnOnce()>(f: F) {
+    let _g = test_lock();
+    let prev = std::env::var_os("CCSM_HISTORY_DIR");
+    let dir = std::env::temp_dir().join(format!(
+        "ccsm-data-test-{}-{:?}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::env::set_var("CCSM_HISTORY_DIR", &dir);
+    f();
+    let _ = std::fs::remove_dir_all(&dir);
+    match prev {
+        Some(p) => std::env::set_var("CCSM_HISTORY_DIR", p),
+        None => std::env::remove_var("CCSM_HISTORY_DIR"),
+    }
+}
+
+#[test]
+fn test_load_preview_falls_back_to_ccsm_cache_when_claude_missing() {
+    with_temp_ccsm_dir(|| {
+        let record = CcsmSessionRecord {
+            session_id: "ghost-1".into(),
+            project: "/nonexistent/ghost".into(),
+            project_name: "ghost".into(),
+            first_timestamp: 1000,
+            last_timestamp: 2000,
+            entry_count: 2,
+            name: Some("My Ghost".into()),
+            slug: None,
+            cwd: Some("/nonexistent/ghost".into()),
+            git_branch: Some("main".into()),
+            ccsm_launched_at: 1500,
+            ccsm_origin: CcsmOrigin::NewLive,
+            preview_messages: vec![
+                PreviewMessage {
+                    role: "user".into(),
+                    text: "remembered question".into(),
+                },
+                PreviewMessage {
+                    role: "assistant".into(),
+                    text: "remembered answer".into(),
+                },
+            ],
+            preview_cached_at: 2000,
+        };
+        append_ccsm_record(&record).unwrap();
+
+        let (meta, msgs) = load_preview("/nonexistent/ghost", "ghost-1");
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].text, "remembered question");
+        assert_eq!(msgs[1].text, "remembered answer");
+        assert_eq!(meta.cwd.as_deref(), Some("/nonexistent/ghost"));
+        assert_eq!(meta.git_branch.as_deref(), Some("main"));
+        assert_eq!(meta.session_name.as_deref(), Some("My Ghost"));
+    });
+}
+
+#[test]
+fn test_load_preview_without_cache_falls_back_to_placeholder() {
+    with_temp_ccsm_dir(|| {
+        let (_meta, msgs) = load_preview("/totally/missing", "no-such-id");
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].role, "system");
+    });
 }

@@ -4,6 +4,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
+use super::ccsm_history::load_ccsm_records;
 use super::io::session_file_path;
 use super::types::*;
 
@@ -126,6 +127,7 @@ pub fn load_sessions(filter_path: Option<&str>) -> Result<Vec<SessionInfo>> {
                 has_data: false,
                 name: None,
                 slug: None,
+                ccsm_owned: false,
             });
     }
 
@@ -139,6 +141,44 @@ pub fn load_sessions(filter_path: Option<&str>) -> Result<Vec<SessionInfo>> {
             }
         }
     }
+
+    // Merge CCSM-owned records. For sessions still in Claude's history, just
+    // flag them as owned. For sessions Claude has cleaned up, synthesize a row
+    // from the snapshot so it stays visible (with has_data=false, but the
+    // preview pane and hide-empty filter both special-case ccsm_owned).
+    let ccsm_records = load_ccsm_records();
+    if !ccsm_records.is_empty() {
+        let known_ids: std::collections::HashSet<String> =
+            result.iter().map(|s| s.session_id.clone()).collect();
+        for session in result.iter_mut() {
+            if ccsm_records.contains_key(&session.session_id) {
+                session.ccsm_owned = true;
+            }
+        }
+        for (id, record) in ccsm_records.iter() {
+            if known_ids.contains(id) {
+                continue;
+            }
+            if let Some(fp) = filter_path {
+                if !record.project.starts_with(fp) {
+                    continue;
+                }
+            }
+            result.push(SessionInfo {
+                session_id: record.session_id.clone(),
+                project: record.project.clone(),
+                project_name: record.project_name.clone(),
+                first_timestamp: record.first_timestamp,
+                last_timestamp: record.last_timestamp,
+                entry_count: record.entry_count,
+                has_data: false,
+                name: record.name.clone(),
+                slug: record.slug.clone(),
+                ccsm_owned: true,
+            });
+        }
+    }
+
     result.sort_by(|a, b| b.last_timestamp.cmp(&a.last_timestamp));
 
     Ok(result)

@@ -24,6 +24,7 @@ fn make_sessions() -> Vec<SessionInfo> {
             has_data: true,
             name: None,
             slug: None,
+            ccsm_owned: false,
         },
         SessionInfo {
             session_id: "s2".into(),
@@ -35,6 +36,7 @@ fn make_sessions() -> Vec<SessionInfo> {
             has_data: true,
             name: None,
             slug: None,
+            ccsm_owned: false,
         },
         SessionInfo {
             session_id: "s3".into(),
@@ -46,6 +48,7 @@ fn make_sessions() -> Vec<SessionInfo> {
             has_data: true,
             name: None,
             slug: None,
+            ccsm_owned: false,
         },
     ]
 }
@@ -198,6 +201,7 @@ fn make_sessions_with_shared_projects() -> Vec<SessionInfo> {
             has_data: true,
             name: None,
             slug: None,
+            ccsm_owned: false,
         },
         SessionInfo {
             session_id: "s2".into(),
@@ -209,6 +213,7 @@ fn make_sessions_with_shared_projects() -> Vec<SessionInfo> {
             has_data: true,
             name: None,
             slug: None,
+            ccsm_owned: false,
         },
         SessionInfo {
             session_id: "s3".into(),
@@ -220,6 +225,7 @@ fn make_sessions_with_shared_projects() -> Vec<SessionInfo> {
             has_data: true,
             name: None,
             slug: None,
+            ccsm_owned: false,
         },
         SessionInfo {
             session_id: "s4".into(),
@@ -231,6 +237,7 @@ fn make_sessions_with_shared_projects() -> Vec<SessionInfo> {
             has_data: true,
             name: None,
             slug: None,
+            ccsm_owned: false,
         },
     ]
 }
@@ -345,6 +352,7 @@ fn make_sessions_with_projects() -> Vec<SessionInfo> {
             has_data: true,
             name: None,
             slug: None,
+            ccsm_owned: false,
         },
         SessionInfo {
             session_id: "s2".into(),
@@ -356,6 +364,7 @@ fn make_sessions_with_projects() -> Vec<SessionInfo> {
             has_data: true,
             name: None,
             slug: None,
+            ccsm_owned: false,
         },
         SessionInfo {
             session_id: "s3".into(),
@@ -367,6 +376,7 @@ fn make_sessions_with_projects() -> Vec<SessionInfo> {
             has_data: true,
             name: None,
             slug: None,
+            ccsm_owned: false,
         },
         SessionInfo {
             session_id: "s4".into(),
@@ -378,6 +388,7 @@ fn make_sessions_with_projects() -> Vec<SessionInfo> {
             has_data: true,
             name: None,
             slug: None,
+            ccsm_owned: false,
         },
     ]
 }
@@ -509,6 +520,7 @@ fn test_reload_sessions_updates_list() {
         has_data: true,
         name: None,
         slug: None,
+        ccsm_owned: false,
     });
 
     app.reload_sessions(updated);
@@ -532,6 +544,7 @@ fn make_sessions_mixed_data() -> Vec<SessionInfo> {
             has_data: true,
             name: None,
             slug: None,
+            ccsm_owned: false,
         },
         SessionInfo {
             session_id: "s2".into(),
@@ -543,6 +556,7 @@ fn make_sessions_mixed_data() -> Vec<SessionInfo> {
             has_data: false,
             name: None,
             slug: None,
+            ccsm_owned: false,
         },
         SessionInfo {
             session_id: "s3".into(),
@@ -554,6 +568,7 @@ fn make_sessions_mixed_data() -> Vec<SessionInfo> {
             has_data: true,
             name: None,
             slug: None,
+            ccsm_owned: false,
         },
     ]
 }
@@ -826,6 +841,7 @@ fn make_chained_sessions() -> Vec<SessionInfo> {
             has_data: true,
             name: None,
             slug: Some("cool-flying-cat".into()),
+            ccsm_owned: false,
         },
         SessionInfo {
             session_id: "chain-b".into(),
@@ -837,6 +853,7 @@ fn make_chained_sessions() -> Vec<SessionInfo> {
             has_data: true,
             name: None,
             slug: Some("cool-flying-cat".into()),
+            ccsm_owned: false,
         },
         // Standalone session without a slug
         SessionInfo {
@@ -849,6 +866,7 @@ fn make_chained_sessions() -> Vec<SessionInfo> {
             has_data: true,
             name: None,
             slug: None,
+            ccsm_owned: false,
         },
     ]
 }
@@ -909,6 +927,7 @@ fn test_single_slug_session_not_chained() {
         has_data: true,
         name: None,
         slug: Some("lone-slug".into()),
+        ccsm_owned: false,
     }];
     let mut app = make_app(sessions, None, Config::default());
     app.tree_view = false;
@@ -1046,5 +1065,213 @@ fn naming_non_dangerous_produces_new_live() {
             assert_eq!(name, "test-session");
         }
         other => panic!("Expected NewLive, got {:?}", other),
+    }
+}
+
+mod ccsm_history_tests {
+    use super::*;
+    use crate::data::{
+        append_ccsm_record, ccsm_history_path, load_ccsm_records, CcsmOrigin, CcsmSessionRecord,
+    };
+
+    fn with_temp_dir<F: FnOnce()>(f: F) {
+        let _g = crate::data::ccsm_history::test_lock();
+        let prev = std::env::var_os("CCSM_HISTORY_DIR");
+        let dir = std::env::temp_dir().join(format!(
+            "ccsm-history-test-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("CCSM_HISTORY_DIR", &dir);
+        f();
+        let _ = std::fs::remove_dir_all(&dir);
+        match prev {
+            Some(p) => std::env::set_var("CCSM_HISTORY_DIR", p),
+            None => std::env::remove_var("CCSM_HISTORY_DIR"),
+        }
+    }
+
+    fn record(session_id: &str, project: &str, last_ts: i64, entry_count: usize) -> CcsmSessionRecord {
+        CcsmSessionRecord {
+            session_id: session_id.into(),
+            project: project.into(),
+            project_name: project.rsplit('/').next().unwrap_or(project).into(),
+            first_timestamp: last_ts - 1000,
+            last_timestamp: last_ts,
+            entry_count,
+            name: None,
+            slug: None,
+            cwd: Some(project.into()),
+            git_branch: None,
+            ccsm_launched_at: last_ts,
+            ccsm_origin: CcsmOrigin::NewLive,
+            preview_messages: vec![PreviewMessage {
+                role: "user".into(),
+                text: "hello".into(),
+            }],
+            preview_cached_at: last_ts,
+        }
+    }
+
+    #[test]
+    fn append_and_load_roundtrip() {
+        with_temp_dir(|| {
+            let r1 = record("sess-a", "/test/alpha", 1000, 3);
+            append_ccsm_record(&r1).unwrap();
+            let loaded = load_ccsm_records();
+            let got = loaded.get("sess-a").expect("record should be present");
+            assert_eq!(got.entry_count, 3);
+            assert_eq!(got.preview_messages.len(), 1);
+        });
+    }
+
+    #[test]
+    fn last_write_wins_per_session_id() {
+        with_temp_dir(|| {
+            append_ccsm_record(&record("sess-a", "/test/alpha", 1000, 3)).unwrap();
+            append_ccsm_record(&record("sess-a", "/test/alpha", 2000, 7)).unwrap();
+            let loaded = load_ccsm_records();
+            let got = loaded.get("sess-a").unwrap();
+            assert_eq!(got.last_timestamp, 2000);
+            assert_eq!(got.entry_count, 7);
+        });
+    }
+
+    #[test]
+    fn load_sessions_merges_orphaned_owned_record() {
+        with_temp_dir(|| {
+            append_ccsm_record(&record("orphan-1", "/test/ghost", 5000, 4)).unwrap();
+            // Claude history file isn't present in this test; load_sessions
+            // returns whatever orphans are in CCSM history.
+            let sessions = data::load_sessions(None).unwrap();
+            let orphan = sessions
+                .iter()
+                .find(|s| s.session_id == "orphan-1")
+                .expect("orphan should be merged in");
+            assert!(orphan.ccsm_owned);
+            assert!(!orphan.has_data);
+        });
+    }
+
+    #[test]
+    fn hide_empty_keeps_owned_orphans_visible() {
+        with_temp_dir(|| {
+            let mut sessions = vec![
+                SessionInfo {
+                    session_id: "real".into(),
+                    project: "/test/alpha".into(),
+                    project_name: "alpha".into(),
+                    first_timestamp: 1000,
+                    last_timestamp: 2000,
+                    entry_count: 5,
+                    has_data: true,
+                    name: None,
+                    slug: None,
+                    ccsm_owned: false,
+                },
+                SessionInfo {
+                    session_id: "owned-orphan".into(),
+                    project: "/test/beta".into(),
+                    project_name: "beta".into(),
+                    first_timestamp: 500,
+                    last_timestamp: 1500,
+                    entry_count: 2,
+                    has_data: false,
+                    name: None,
+                    slug: None,
+                    ccsm_owned: true,
+                },
+            ];
+            sessions.sort_by(|a, b| b.last_timestamp.cmp(&a.last_timestamp));
+            let mut app = make_app(sessions, None, Config::default());
+            app.tree_view = false;
+            app.hide_empty = true;
+            app.recompute_filter();
+            // Both should still be visible: real has data, owned-orphan is ccsm_owned.
+            assert_eq!(app.filtered_indices.len(), 2);
+        });
+    }
+
+    #[test]
+    fn record_launch_with_known_session_id_snapshots_on_reload() {
+        with_temp_dir(|| {
+            let mut app = make_app(vec![], None, Config::default());
+            app.record_launch(&LaunchRequest::Resume {
+                session_id: "match-me".into(),
+                cwd: "/test/proj".into(),
+            });
+            assert_eq!(app.pending_launches.len(), 1);
+            let updated = vec![SessionInfo {
+                session_id: "match-me".into(),
+                project: "/test/proj".into(),
+                project_name: "proj".into(),
+                first_timestamp: 100,
+                last_timestamp: 200,
+                entry_count: 1,
+                has_data: true,
+                name: None,
+                slug: None,
+                ccsm_owned: false,
+            }];
+            app.reload_sessions(updated);
+            assert!(app.pending_launches.is_empty(), "should be drained");
+            assert!(app.ccsm_owned_ids.contains("match-me"));
+            assert!(load_ccsm_records().contains_key("match-me"));
+        });
+    }
+
+    #[test]
+    fn record_launch_without_session_id_matches_by_cwd_and_time() {
+        with_temp_dir(|| {
+            let mut app = make_app(vec![], None, Config::default());
+            app.record_launch(&LaunchRequest::NewLive {
+                name: "tmp".into(),
+                cwd: "/test/newproj".into(),
+            });
+            let now = chrono::Utc::now().timestamp_millis();
+            let updated = vec![SessionInfo {
+                session_id: "freshly-born".into(),
+                project: "/test/newproj".into(),
+                project_name: "newproj".into(),
+                first_timestamp: now,
+                last_timestamp: now,
+                entry_count: 1,
+                has_data: true,
+                name: None,
+                slug: None,
+                ccsm_owned: false,
+            }];
+            app.reload_sessions(updated);
+            assert!(app.ccsm_owned_ids.contains("freshly-born"));
+        });
+    }
+
+    #[test]
+    fn pending_launch_expires_after_max_attempts() {
+        with_temp_dir(|| {
+            let mut app = make_app(vec![], None, Config::default());
+            app.record_launch(&LaunchRequest::NewLive {
+                name: "tmp".into(),
+                cwd: "/never/matches".into(),
+            });
+            // Two unmatched reloads should drop the pending launch.
+            for _ in 0..PENDING_LAUNCH_MAX_ATTEMPTS {
+                app.reload_sessions(vec![]);
+            }
+            assert!(app.pending_launches.is_empty());
+        });
+    }
+
+    #[test]
+    fn ccsm_history_path_respects_env_override() {
+        with_temp_dir(|| {
+            let p = ccsm_history_path().unwrap();
+            assert!(p.ends_with("sessions.jsonl"));
+            assert!(p.starts_with(std::env::var("CCSM_HISTORY_DIR").unwrap()));
+        });
     }
 }

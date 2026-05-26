@@ -177,9 +177,9 @@ impl App {
                 self.naming_input = tui_input::Input::default();
                 if self.naming_dangerous {
                     self.naming_dangerous = false;
-                    self.launch_session = Some(LaunchRequest::NewLiveDangerous { name, cwd });
+                    self.issue_launch(LaunchRequest::NewLiveDangerous { name, cwd });
                 } else {
-                    self.launch_session = Some(LaunchRequest::NewLive { name, cwd });
+                    self.issue_launch(LaunchRequest::NewLive { name, cwd });
                 }
             }
             _ => {
@@ -202,7 +202,7 @@ impl App {
 
         match key.code {
             KeyCode::Char('o') | KeyCode::Enter => {
-                self.launch_session = Some(LaunchRequest::AttachLive { tmux_name: name });
+                self.issue_launch(LaunchRequest::AttachLive { tmux_name: name });
                 self.duplicate_name = None;
                 self.duplicate_source = None;
                 self.duplicate_cwd = None;
@@ -490,7 +490,7 @@ impl App {
                         .selected_cwd()
                         .filter(|p| std::path::Path::new(p).exists())
                         .unwrap_or_else(|| ".".to_string());
-                    self.launch_session = Some(LaunchRequest::NewDirect { cwd });
+                    self.issue_launch(LaunchRequest::NewDirect { cwd });
                 }
                 (KeyCode::Char('D' | 'd'), KeyModifiers::SHIFT) => {
                     if let Some(cwd) = self.selected_cwd() {
@@ -516,14 +516,14 @@ impl App {
                         {
                             let session_id = self.resume_session_id_for(session_index).to_string();
                             let cwd = self.sessions[session_index].project.clone();
-                            self.launch_session = Some(LaunchRequest::Direct { session_id, cwd });
+                            self.issue_launch(LaunchRequest::Direct { session_id, cwd });
                         }
                     } else if let Some(FlatRow::HistoryItem { session_index }) =
                         self.flat_rows.get(self.selected).cloned()
                     {
                         let session_id = self.resume_session_id_for(session_index).to_string();
                         let cwd = self.sessions[session_index].project.clone();
-                        self.launch_session = Some(LaunchRequest::Direct { session_id, cwd });
+                        self.issue_launch(LaunchRequest::Direct { session_id, cwd });
                     }
                 }
                 (KeyCode::Enter, _) => {
@@ -540,11 +540,11 @@ impl App {
                             Some(TreeRow::Session { session_index }) => {
                                 let session_id = self.resume_session_id_for(session_index).to_string();
                                 let cwd = self.sessions[session_index].project.clone();
-                                self.launch_session = Some(LaunchRequest::Resume { session_id, cwd });
+                                self.issue_launch(LaunchRequest::Resume { session_id, cwd });
                             }
                             Some(TreeRow::LiveItem { live_index }) => {
                                 let name = self.live_sessions[live_index].tmux_name.clone();
-                                self.launch_session = Some(LaunchRequest::AttachLive { tmux_name: name });
+                                self.issue_launch(LaunchRequest::AttachLive { tmux_name: name });
                             }
                             Some(TreeRow::RunningHeader { project, .. }) => {
                                 let key = format!("running:{}", project);
@@ -570,12 +570,12 @@ impl App {
                         match self.flat_rows.get(self.selected).cloned() {
                             Some(FlatRow::LiveItem { live_index }) => {
                                 let name = self.live_sessions[live_index].tmux_name.clone();
-                                self.launch_session = Some(LaunchRequest::AttachLive { tmux_name: name });
+                                self.issue_launch(LaunchRequest::AttachLive { tmux_name: name });
                             }
                             Some(FlatRow::HistoryItem { session_index }) => {
                                 let session_id = self.resume_session_id_for(session_index).to_string();
                                 let cwd = self.sessions[session_index].project.clone();
-                                self.launch_session = Some(LaunchRequest::Resume { session_id, cwd });
+                                self.issue_launch(LaunchRequest::Resume { session_id, cwd });
                             }
                             _ => {}
                         }

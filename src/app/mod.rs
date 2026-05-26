@@ -11,12 +11,34 @@ mod tree;
 mod tests;
 
 use crate::config::{Config, DisplayMode};
-use crate::data::{self, PreviewMessage, SessionInfo, SessionMeta};
+use crate::data::{self, CcsmOrigin, CcsmSessionRecord, PreviewMessage, SessionInfo, SessionMeta};
 use crate::live::{self, ActivityState, LiveSession};
 use crate::update;
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 use tui_input::Input;
+
+/// Maximum number of `reload_sessions()` cycles a pending launch waits to be
+/// matched against a real Claude session before it is dropped. Sessions that
+/// never wrote any history (e.g. the user exited immediately) shouldn't keep
+/// piling up.
+const PENDING_LAUNCH_MAX_ATTEMPTS: u8 = 2;
+
+/// Time window (milliseconds) used to match a CCSM launch without a known
+/// session_id (NewLive/NewDirect/AttachLive) against a freshly observed Claude
+/// session. Generous because clock skew and slow startup both eat into it.
+const PENDING_LAUNCH_MATCH_WINDOW_MS: i64 = 60_000;
+
+/// A session launch we've issued and want to record into CCSM's history once
+/// we can identify the resulting Claude session_id.
+#[derive(Debug, Clone)]
+pub struct PendingLaunch {
+    pub origin: CcsmOrigin,
+    pub cwd: Option<String>,
+    pub launched_at: i64,
+    pub known_session_id: Option<String>,
+    pub attempts: u8,
+}
 
 /// One visible row in the tree-view session list.
 #[derive(Debug, Clone, PartialEq)]
@@ -217,6 +239,14 @@ pub struct App {
     pub naming_dangerous: bool,
     /// Last error message to display in the status bar.
     pub status_error: Option<String>,
+    /// Session IDs CCSM has previously recorded into its own history file.
+    /// Used to decide which sessions to re-snapshot on each reload and which
+    /// orphaned (Claude-cleaned-up) sessions belong to CCSM.
+    pub ccsm_owned_ids: HashSet<String>,
+    /// Launches CCSM has issued that haven't yet been matched to a Claude
+    /// session in the history. NewLive/NewDirect/AttachLive start without a
+    /// known session_id and get resolved by cwd + launched_at on a later reload.
+    pub pending_launches: Vec<PendingLaunch>,
 }
 
 /// Truncate a path to its last 2 components (e.g. "/Users/sane/Dev/ccsm" -> "Dev/ccsm").
@@ -239,6 +269,11 @@ impl App {
         let live_filter = config.live_filter;
         let favorites = config.favorites.clone();
         let live_sessions = live::discover_live_sessions(config.tmux_bin());
+        let ccsm_owned_ids: HashSet<String> = sessions
+            .iter()
+            .filter(|s| s.ccsm_owned)
+            .map(|s| s.session_id.clone())
+            .collect();
         let mut app = Self {
             sessions,
             selected: 0,
@@ -291,6 +326,8 @@ impl App {
             tick: 0,
             naming_dangerous: false,
             status_error: None,
+            ccsm_owned_ids,
+            pending_launches: Vec::new(),
         };
 
         // Check for required binaries
@@ -347,6 +384,7 @@ impl App {
     /// Replace the session list with a freshly loaded set, reset caches, and rebuild all views.
     pub fn reload_sessions(&mut self, sessions: Vec<SessionInfo>) {
         self.sessions = sessions;
+        self.reconcile_pending_launches_and_snapshot();
         self.spawn_load_session_names();
         self.preview_cache.clear();
         self.preview_scroll = u16::MAX;
@@ -356,6 +394,167 @@ impl App {
         self.recompute_flat_rows();
         if self.selected >= self.visible_item_count() {
             self.selected = self.visible_item_count().saturating_sub(1);
+        }
+    }
+
+    /// Stage a launch for the main loop to execute after the terminal is torn
+    /// down, and queue a pending entry so the resulting session gets snapshotted
+    /// into CCSM's history on the next reload.
+    pub fn issue_launch(&mut self, req: LaunchRequest) {
+        self.record_launch(&req);
+        self.launch_session = Some(req);
+    }
+
+    /// Record that we're about to issue this launch so the next reload can
+    /// snapshot the resulting session into CCSM's own history. Resume/Direct
+    /// already know the session_id; new/attach launches have to be matched on
+    /// cwd + timestamp once the session shows up in Claude's history.
+    pub fn record_launch(&mut self, req: &LaunchRequest) {
+        let launched_at = chrono::Utc::now().timestamp_millis();
+        let (origin, cwd, known_session_id) = match req {
+            LaunchRequest::Resume { session_id, cwd } => {
+                (CcsmOrigin::Resume, Some(cwd.clone()), Some(session_id.clone()))
+            }
+            LaunchRequest::Direct { session_id, cwd } => {
+                (CcsmOrigin::Direct, Some(cwd.clone()), Some(session_id.clone()))
+            }
+            LaunchRequest::AttachLive { tmux_name } => {
+                let cwd = self
+                    .live_sessions
+                    .iter()
+                    .find(|ls| ls.tmux_name == *tmux_name)
+                    .map(|ls| ls.cwd.clone());
+                (CcsmOrigin::AttachLive, cwd, None)
+            }
+            LaunchRequest::NewLive { cwd, .. } => {
+                (CcsmOrigin::NewLive, Some(cwd.clone()), None)
+            }
+            LaunchRequest::NewLiveDangerous { cwd, .. } => {
+                (CcsmOrigin::NewLiveDangerous, Some(cwd.clone()), None)
+            }
+            LaunchRequest::NewDirect { cwd } => {
+                (CcsmOrigin::NewDirect, Some(cwd.clone()), None)
+            }
+        };
+        self.pending_launches.push(PendingLaunch {
+            origin,
+            cwd,
+            launched_at,
+            known_session_id,
+            attempts: 0,
+        });
+    }
+
+    /// Match outstanding launches to freshly loaded Claude sessions, snapshot
+    /// every CCSM-owned session whose state has changed since the last write,
+    /// and flag those sessions in `self.sessions` so downstream code knows
+    /// they're backed by a CCSM record.
+    fn reconcile_pending_launches_and_snapshot(&mut self) {
+        let stored = data::load_ccsm_records();
+
+        let pending = std::mem::take(&mut self.pending_launches);
+        let mut still_pending: Vec<PendingLaunch> = Vec::new();
+        let mut to_snapshot: Vec<(usize, CcsmOrigin, i64)> = Vec::new();
+        let mut matched_ids: HashSet<String> = HashSet::new();
+
+        for mut launch in pending {
+            let matched_idx = if let Some(ref id) = launch.known_session_id {
+                self.sessions.iter().position(|s| &s.session_id == id)
+            } else {
+                let cwd = match &launch.cwd {
+                    Some(c) => c.clone(),
+                    None => {
+                        // Nothing to match on; drop.
+                        continue;
+                    }
+                };
+                let window_start = launch.launched_at - PENDING_LAUNCH_MATCH_WINDOW_MS;
+                self.sessions
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, s)| s.project == cwd)
+                    .filter(|(_, s)| s.last_timestamp >= window_start)
+                    .filter(|(_, s)| !matched_ids.contains(&s.session_id))
+                    .filter(|(_, s)| {
+                        // For brand-new sessions we expect first_timestamp to
+                        // also be after we launched; for AttachLive the first
+                        // timestamp predates us, which is fine.
+                        match launch.origin {
+                            CcsmOrigin::NewLive
+                            | CcsmOrigin::NewLiveDangerous
+                            | CcsmOrigin::NewDirect => s.first_timestamp >= window_start,
+                            _ => true,
+                        }
+                    })
+                    .max_by_key(|(_, s)| s.last_timestamp)
+                    .map(|(i, _)| i)
+            };
+
+            match matched_idx {
+                Some(idx) => {
+                    matched_ids.insert(self.sessions[idx].session_id.clone());
+                    to_snapshot.push((idx, launch.origin, launch.launched_at));
+                }
+                None => {
+                    launch.attempts += 1;
+                    if launch.attempts < PENDING_LAUNCH_MAX_ATTEMPTS {
+                        still_pending.push(launch);
+                    }
+                }
+            }
+        }
+        self.pending_launches = still_pending;
+
+        // Snapshot any session that needs writing: just-matched launches and
+        // existing owned sessions whose signature changed.
+        let mut snapshot_now: HashMap<usize, (CcsmOrigin, i64)> = HashMap::new();
+        for (idx, origin, launched_at) in to_snapshot {
+            snapshot_now.insert(idx, (origin, launched_at));
+        }
+        for (idx, session) in self.sessions.iter().enumerate() {
+            if !session.ccsm_owned && !self.ccsm_owned_ids.contains(&session.session_id) {
+                continue;
+            }
+            if snapshot_now.contains_key(&idx) {
+                continue;
+            }
+            // Skip if the on-disk record's signature already matches.
+            if let Some(rec) = stored.get(&session.session_id) {
+                if rec.last_timestamp == session.last_timestamp
+                    && rec.entry_count == session.entry_count
+                    && rec.name == session.name
+                {
+                    continue;
+                }
+                snapshot_now.insert(idx, (rec.ccsm_origin, rec.ccsm_launched_at));
+            }
+        }
+
+        for (idx, (origin, launched_at)) in snapshot_now {
+            let session = &self.sessions[idx];
+            let (meta, messages) = data::load_preview(&session.project, &session.session_id);
+            let record = CcsmSessionRecord {
+                session_id: session.session_id.clone(),
+                project: session.project.clone(),
+                project_name: session.project_name.clone(),
+                first_timestamp: session.first_timestamp,
+                last_timestamp: session.last_timestamp,
+                entry_count: session.entry_count,
+                name: session.name.clone(),
+                slug: session.slug.clone(),
+                cwd: meta.cwd,
+                git_branch: meta.git_branch,
+                ccsm_launched_at: launched_at,
+                ccsm_origin: origin,
+                preview_messages: messages,
+                preview_cached_at: chrono::Utc::now().timestamp_millis(),
+            };
+            if let Err(e) = data::append_ccsm_record(&record) {
+                self.status_error = Some(format!("Failed to write ccsm history: {e}"));
+            } else {
+                self.ccsm_owned_ids.insert(record.session_id.clone());
+                self.sessions[idx].ccsm_owned = true;
+            }
         }
     }
 

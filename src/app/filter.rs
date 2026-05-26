@@ -7,14 +7,18 @@ impl App {
         let query = self.filter_input.value().to_lowercase();
         let initial_indices: Vec<usize> = if query.is_empty() {
             (0..self.sessions.len())
-                .filter(|&i| !self.hide_empty || self.sessions[i].has_data)
+                .filter(|&i| {
+                    !self.hide_empty
+                        || self.sessions[i].has_data
+                        || self.sessions[i].ccsm_owned
+                })
                 .collect()
         } else {
             self.sessions
                 .iter()
                 .enumerate()
                 .filter(|(_, s)| {
-                    (!self.hide_empty || s.has_data)
+                    (!self.hide_empty || s.has_data || s.ccsm_owned)
                         && (s.project_name.to_lowercase().contains(&query)
                             || s.project.to_lowercase().contains(&query))
                 })

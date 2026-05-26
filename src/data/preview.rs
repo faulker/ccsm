@@ -1,27 +1,52 @@
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 
+use super::ccsm_history::load_ccsm_records;
 use super::history::strip_xml_tags;
 use super::io::{format_session_boundary_date, session_file_path};
 use super::types::*;
+
+/// Build a (meta, messages) tuple from a CCSM-owned snapshot. Returned when
+/// Claude's per-session JSONL no longer exists but we still have a cache.
+fn restored_from_ccsm(session_id: &str) -> Option<(SessionMeta, Vec<PreviewMessage>)> {
+    let record = load_ccsm_records().remove(session_id)?;
+    let meta = SessionMeta {
+        session_id: Some(session_id.to_string()),
+        cwd: record.cwd.clone(),
+        git_branch: record.git_branch.clone(),
+        session_name: record.name.clone(),
+        ..SessionMeta::default()
+    };
+    Some((meta, record.preview_messages))
+}
 
 /// Load all messages from a session JSONL without any turn cap.
 /// Returns (meta, all_messages).
 fn load_session_messages(project: &str, session_id: &str) -> (SessionMeta, Vec<PreviewMessage>) {
     let path = match session_file_path(project, session_id) {
         Some(p) => p,
-        None => return (SessionMeta::default(), vec![PreviewMessage {
-            role: "system".to_string(),
-            text: "No session data available".to_string(),
-        }]),
+        None => {
+            if let Some(restored) = restored_from_ccsm(session_id) {
+                return restored;
+            }
+            return (SessionMeta::default(), vec![PreviewMessage {
+                role: "system".to_string(),
+                text: "No session data available".to_string(),
+            }]);
+        }
     };
 
     let file = match File::open(&path) {
         Ok(f) => f,
-        Err(_) => return (SessionMeta::default(), vec![PreviewMessage {
-            role: "system".to_string(),
-            text: "Failed to read session file".to_string(),
-        }]),
+        Err(_) => {
+            if let Some(restored) = restored_from_ccsm(session_id) {
+                return restored;
+            }
+            return (SessionMeta::default(), vec![PreviewMessage {
+                role: "system".to_string(),
+                text: "Failed to read session file".to_string(),
+            }]);
+        }
     };
 
     let reader = BufReader::new(file);

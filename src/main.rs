@@ -70,7 +70,7 @@ fn run_app(
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|_| ".".to_string());
         let name = live::generate_auto_name(&cwd, &app.live_sessions);
-        app.launch_session = Some(app::LaunchRequest::NewLive { name, cwd });
+        app.issue_launch(app::LaunchRequest::NewLive { name, cwd });
     }
 
     // Always spawn background update check (non-blocking)

@@ -267,6 +267,7 @@ Settings are persisted to `~/.config/ccsm/config.json` and automatically saved w
 10. With `--new`, skips the TUI, creates a live tmux session in the current directory, attaches immediately, and re-execs ccsm when Claude exits
 11. If the user accepts an update, the TUI suspends, downloads the new binary, verifies the SHA256 checksum against the release's `checksums-sha256.txt`, replaces the current executable, and automatically restarts
 12. After Claude exits, the TUI resumes and reloads the session list
+13. Sessions launched from CCSM (resume, attach, or new) are snapshotted to `~/.local/share/ccsm/sessions.jsonl` (override with `CCSM_HISTORY_DIR`). The snapshot includes metadata and a preview cache, so those rows stay browsable after Claude cleans up its own history
 
 ## Dependencies
 
