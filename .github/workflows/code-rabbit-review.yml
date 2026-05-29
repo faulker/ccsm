@@ -9,6 +9,7 @@ jobs:
   route:
     runs-on: ubuntu-latest
     permissions:
+      contents: write
       pull-requests: write
 
     steps:
@@ -38,7 +39,7 @@ jobs:
         if: steps.check.outputs.state == 'CHANGES_REQUESTED' || steps.check.outputs.state == 'COMMENTED'
         uses: actions/github-script@v7
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+          github-token: ${{ secrets.AUTOFIX_PAT }}
           script: |
             // Fire a repository_dispatch to kick off the fix workflow
             await github.rest.repos.createDispatchEvent({
