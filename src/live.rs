@@ -394,10 +394,30 @@ pub fn detect_activity(content: &str) -> ActivityState {
 /// Generate a unique session name of the form `<project>-A`, `<project>-B`, etc.,
 /// skipping letters already used by sessions in `existing`. Falls back to numeric
 /// suffixes starting at 27 once all 26 letters are taken.
+/// Make a string safe to use as a tmux session name.
+///
+/// tmux forbids `.` and `:` in session names, and treats a leading `.` in a
+/// target as a pane reference — so a project folder like `.claude` would create
+/// a session that can never be attached, captured, or killed by name. Replace
+/// the illegal characters with `-` and trim leading/trailing `-` (falling back
+/// to `"session"` if nothing usable remains).
+fn sanitize_session_name(name: &str) -> String {
+    let replaced: String = name
+        .chars()
+        .map(|c| if c == '.' || c == ':' { '-' } else { c })
+        .collect();
+    let trimmed = replaced.trim_matches('-');
+    if trimmed.is_empty() {
+        "session".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 pub fn generate_auto_name(cwd: &str, existing: &[LiveSession]) -> String {
     let project = std::path::Path::new(cwd)
         .file_name()
-        .map(|n| n.to_string_lossy().to_string())
+        .map(|n| sanitize_session_name(&n.to_string_lossy()))
         .unwrap_or_else(|| "session".to_string());
 
     let prefix = format!("{}-", project);
@@ -432,6 +452,33 @@ pub fn generate_auto_name(cwd: &str, existing: &[LiveSession]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sanitize_session_name_strips_leading_dot() {
+        // Dot-folders like `.claude` must not produce a leading `.` — tmux
+        // parses that as a pane target and the session becomes unreachable.
+        assert_eq!(sanitize_session_name(".claude"), "claude");
+        assert_eq!(sanitize_session_name(".kanbots"), "kanbots");
+    }
+
+    #[test]
+    fn sanitize_session_name_replaces_illegal_chars() {
+        assert_eq!(sanitize_session_name("v1.2.3"), "v1-2-3");
+        assert_eq!(sanitize_session_name("a:b"), "a-b");
+    }
+
+    #[test]
+    fn sanitize_session_name_falls_back_when_empty() {
+        assert_eq!(sanitize_session_name("."), "session");
+        assert_eq!(sanitize_session_name("..."), "session");
+    }
+
+    #[test]
+    fn generate_auto_name_sanitizes_dot_folder() {
+        let name = generate_auto_name("/Users/sane/.claude", &[]);
+        assert_eq!(name, "claude-A");
+        assert!(!name.contains('.'), "tmux session name must not contain a dot");
+    }
 
     #[test]
     fn strip_ansi_removes_csi_sequences() {
