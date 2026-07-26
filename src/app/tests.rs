@@ -990,64 +990,129 @@ fn mouse_scroll_up_saturates_at_zero() {
 }
 
 #[test]
-fn naming_dangerous_defaults_to_false() {
+fn naming_mode_defaults_to_plain() {
     let app = make_app(make_sessions(), None, Config::default());
-    assert!(!app.naming_dangerous);
+    assert_eq!(app.naming_mode, NewSessionMode::Plain);
 }
 
-#[test]
-fn naming_dangerous_produces_correct_launch_request() {
-    let mut app = make_app(make_sessions(), None, Config::default());
-    // Simulate what pressing D does: set dangerous flag and enter naming mode
-    app.naming_dangerous = true;
+/// Drive the real naming popup: set up the launch mode, then press Enter.
+fn confirm_naming(app: &mut App, mode: NewSessionMode) {
+    app.naming_mode = mode;
     app.mode = AppMode::NamingSession;
     app.naming_cwd = Some("/tmp".into());
     app.naming_placeholder = "test-session".into();
-
-    // Simulate what pressing Enter in naming mode does (inline the logic)
-    let name = app.naming_placeholder.clone();
-    let cwd = app.naming_cwd.take().unwrap_or_else(|| ".".to_string());
-    app.mode = AppMode::Normal;
-    if app.naming_dangerous {
-        app.naming_dangerous = false;
-        app.launch_session = Some(LaunchRequest::NewLiveDangerous { name: name.clone(), cwd: cwd.clone() });
-    } else {
-        app.launch_session = Some(LaunchRequest::NewLive { name: name.clone(), cwd: cwd.clone() });
-    }
-
-    assert!(!app.naming_dangerous, "naming_dangerous should be reset after confirm");
-    match &app.launch_session {
-        Some(LaunchRequest::NewLiveDangerous { name, .. }) => {
-            assert_eq!(name, "test-session");
-        }
-        other => panic!("Expected NewLiveDangerous, got {:?}", other),
-    }
+    app.naming_input = tui_input::Input::default();
+    app.handle_naming_event(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Enter,
+        crossterm::event::KeyModifiers::NONE,
+    ));
 }
 
 #[test]
-fn naming_non_dangerous_produces_new_live() {
+fn naming_carries_the_dangerous_flag_into_the_launch_request() {
     let mut app = make_app(make_sessions(), None, Config::default());
-    app.naming_dangerous = false;
-    app.mode = AppMode::NamingSession;
-    app.naming_cwd = Some("/tmp".into());
-    app.naming_placeholder = "test-session".into();
+    confirm_naming(&mut app, NewSessionMode::Dangerous);
 
-    let name = app.naming_placeholder.clone();
-    let cwd = app.naming_cwd.take().unwrap_or_else(|| ".".to_string());
-    app.mode = AppMode::Normal;
-    if app.naming_dangerous {
-        app.naming_dangerous = false;
-        app.launch_session = Some(LaunchRequest::NewLiveDangerous { name, cwd });
-    } else {
-        app.launch_session = Some(LaunchRequest::NewLive { name, cwd });
-    }
-
+    assert_eq!(
+        app.naming_mode,
+        NewSessionMode::Plain,
+        "naming_mode should reset after confirm"
+    );
     match &app.launch_session {
-        Some(LaunchRequest::NewLive { name, .. }) => {
+        Some(LaunchRequest::NewLive { name, dangerous, worktree, .. }) => {
             assert_eq!(name, "test-session");
+            assert!(dangerous);
+            assert!(!worktree);
         }
         other => panic!("Expected NewLive, got {:?}", other),
     }
+}
+
+#[test]
+fn naming_carries_the_worktree_flag_into_the_launch_request() {
+    let mut app = make_app(make_sessions(), None, Config::default());
+    confirm_naming(&mut app, NewSessionMode::Worktree);
+
+    assert_eq!(
+        app.naming_mode,
+        NewSessionMode::Plain,
+        "naming_mode should reset after confirm"
+    );
+    match &app.launch_session {
+        Some(LaunchRequest::NewLive { worktree, dangerous, .. }) => {
+            assert!(worktree);
+            assert!(!dangerous);
+        }
+        other => panic!("Expected NewLive, got {:?}", other),
+    }
+}
+
+#[test]
+fn naming_plain_session_sets_neither_flag() {
+    let mut app = make_app(make_sessions(), None, Config::default());
+    confirm_naming(&mut app, NewSessionMode::Plain);
+
+    match &app.launch_session {
+        Some(LaunchRequest::NewLive { name, dangerous, worktree, .. }) => {
+            assert_eq!(name, "test-session");
+            assert!(!dangerous);
+            assert!(!worktree);
+        }
+        other => panic!("Expected NewLive, got {:?}", other),
+    }
+}
+
+#[test]
+fn open_naming_popup_refuses_a_worktree_outside_a_git_repo() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_string_lossy().to_string();
+    // Point every session at the (non-repo) temp dir so whichever row the
+    // selection lands on resolves to it.
+    let mut sessions = make_sessions();
+    for session in &mut sessions {
+        session.project = path.clone();
+        session.project_name = "tmp".into();
+    }
+    let mut app = make_app(sessions, None, Config::default());
+
+    assert!(!app.open_naming_popup(NewSessionMode::Worktree));
+    assert_eq!(app.mode, AppMode::Normal);
+    assert!(app.status_error.is_some());
+}
+
+// --- Job form model picker ---
+
+#[test]
+fn cycling_the_model_walks_the_discovered_list_and_wraps() {
+    let mut app = make_app(make_sessions(), None, Config::default());
+    let first = app.model_options[0].value.clone();
+    let second = app.model_options[1].value.clone();
+    let last = app.model_options[app.model_options.len() - 1].value.clone();
+
+    app.job_form_model = first.clone();
+    app.cycle_job_form_model(true);
+    assert_eq!(app.job_form_model, second);
+
+    app.job_form_model = first.clone();
+    app.cycle_job_form_model(false);
+    assert_eq!(app.job_form_model, last);
+}
+
+#[test]
+fn cycling_from_a_hand_typed_model_rejoins_the_list() {
+    let mut app = make_app(make_sessions(), None, Config::default());
+    app.job_form_model = "some-unlisted-model".to_string();
+    app.cycle_job_form_model(true);
+    assert_eq!(app.job_form_model, app.model_options[1].value);
+}
+
+#[test]
+fn cycling_is_a_no_op_when_no_models_were_discovered() {
+    let mut app = make_app(make_sessions(), None, Config::default());
+    app.model_options.clear();
+    app.job_form_model = "opus".to_string();
+    app.cycle_job_form_model(true);
+    assert_eq!(app.job_form_model, "opus");
 }
 
 // --- Directory picker (DirBrowser) ---
@@ -1441,6 +1506,85 @@ fn jobs_navigation_clamps_at_both_ends() {
 }
 
 // ---------------------------------------------------------------------
+// Attaching to sessions that are no longer running
+// ---------------------------------------------------------------------
+
+#[test]
+fn attaching_to_a_missing_session_reports_instead_of_launching() {
+    let mut app = make_app(vec![], None, Config::default());
+    app.request_attach("ccsm-test-definitely-not-running".to_string());
+
+    assert!(
+        app.launch_session.is_none(),
+        "a dead session must never reach the launch path, which aborts the app on failure"
+    );
+    let err = app.status_error.expect("the user must be told why nothing happened");
+    assert!(err.contains("ccsm-test-definitely-not-running"), "got: {err}");
+}
+
+#[test]
+fn attaching_to_a_missing_session_prunes_it_from_the_live_list() {
+    let mut app = make_app(vec![], None, Config::default());
+    app.live_sessions = vec![make_live("ccsm-test-ghost", "/tmp", None)];
+    app.request_attach("ccsm-test-ghost".to_string());
+
+    assert!(
+        !app.live_sessions.iter().any(|s| s.tmux_name == "ccsm-test-ghost"),
+        "the stale row must not survive a failed attach"
+    );
+}
+
+#[test]
+fn enter_on_a_job_with_no_session_reports_instead_of_launching() {
+    // Isolate schedule.json: handle_jobs_tab_event polls it, and a real one on
+    // disk would replace the job seeded below.
+    let _guard = crate::config::test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("CCSM_CONFIG_DIR", dir.path());
+
+    let mut app = make_app(vec![], None, Config::default());
+    // Every Job field has a serde default, so this is a queued job with no tmux_name.
+    let job: crate::schedule::Job =
+        serde_json::from_str(r#"{"id":"job-1","name":"queued-job","cwd":"/tmp"}"#).unwrap();
+    app.jobs = vec![job];
+    app.jobs_selected = 0;
+    app.main_tab = MainTab::Jobs;
+    app.handle_jobs_tab_event(key(crossterm::event::KeyCode::Enter));
+
+    assert!(app.launch_session.is_none());
+    assert!(app.status_error.is_some(), "a job with no tmux session must say so");
+
+    std::env::remove_var("CCSM_CONFIG_DIR");
+}
+
+#[test]
+fn polling_live_sessions_drops_ones_that_are_gone() {
+    let mut app = make_app(vec![], None, Config::default());
+    app.live_sessions = vec![make_live("ccsm-test-vanished", "/tmp", Some("job-1"))];
+    app.live_preview_cache
+        .insert("ccsm-test-vanished".to_string(), (String::new(), std::time::Instant::now()));
+    app.activity_states
+        .insert("ccsm-test-vanished".to_string(), crate::live::ActivityState::Idle);
+    app.recompute_flat_rows();
+
+    assert!(app.poll_live_sessions(), "a session that no longer exists is a change");
+    assert!(
+        !app.live_sessions.iter().any(|s| s.tmux_name == "ccsm-test-vanished"),
+        "a stopped session must stop being listed as running"
+    );
+    assert!(!app.live_preview_cache.contains_key("ccsm-test-vanished"));
+    assert!(!app.activity_states.contains_key("ccsm-test-vanished"));
+}
+
+#[test]
+fn polling_live_sessions_reports_no_change_when_nothing_moved() {
+    let mut app = make_app(vec![], None, Config::default());
+    // Sync to whatever tmux actually reports, then confirm a second poll is a no-op.
+    app.poll_live_sessions();
+    assert!(!app.poll_live_sessions(), "an unchanged set must not force a redraw");
+}
+
+// ---------------------------------------------------------------------
 // Path pickers: browsing and manual entry for every path field
 // ---------------------------------------------------------------------
 
@@ -1673,4 +1817,186 @@ fn enter_on_a_config_path_row_opens_the_file_picker() {
     assert_eq!(app.mode, AppMode::DirPicker);
     assert_eq!(app.dir_picker_target, PickerTarget::ConfigUsage);
     assert_eq!(app.dir_browser.as_ref().unwrap().kind, PickerKind::File);
+}
+
+// --- Config popup: default continue prompt ---
+
+/// Drive the config popup's continue-prompt row: select it, press Enter to
+/// start editing, replace the text, press Enter to commit.
+fn commit_continue_prompt(app: &mut App, text: &str) {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    app.mode = AppMode::Config;
+    app.config_selected = crate::config_popup::CONTINUE_PROMPT_ROW;
+    app.handle_config_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(app.config_editing, "Enter should start editing the field");
+    app.config_path_input = tui_input::Input::from(text.to_string());
+    app.handle_config_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(!app.config_editing);
+}
+
+#[test]
+fn continue_prompt_row_edits_the_configured_default() {
+    let _guard = crate::config::test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("CCSM_CONFIG_DIR", dir.path());
+
+    let mut app = make_app(vec![], None, Config::default());
+    assert_eq!(app.config.continue_prompt, "Continue where you left off.");
+    commit_continue_prompt(&mut app, "Keep going.");
+    assert_eq!(app.config.continue_prompt, "Keep going.");
+
+    std::env::remove_var("CCSM_CONFIG_DIR");
+}
+
+#[test]
+fn clearing_the_continue_prompt_restores_the_built_in_default() {
+    // An empty value would paste nothing and leave a paused job stuck, so the
+    // field falls back rather than storing "".
+    let _guard = crate::config::test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("CCSM_CONFIG_DIR", dir.path());
+
+    let mut app = make_app(vec![], None, Config::default());
+    commit_continue_prompt(&mut app, "Keep going.");
+    commit_continue_prompt(&mut app, "   ");
+    assert_eq!(app.config.continue_prompt, Config::default().continue_prompt);
+    assert!(!app.config.continue_prompt.is_empty());
+
+    std::env::remove_var("CCSM_CONFIG_DIR");
+}
+
+
+// --- Keymap refactor ---
+
+/// Press one key through the real Normal-mode dispatcher.
+fn press(app: &mut App, code: crossterm::event::KeyCode) {
+    press_mod(app, code, crossterm::event::KeyModifiers::NONE);
+}
+
+fn press_mod(
+    app: &mut App,
+    code: crossterm::event::KeyCode,
+    mods: crossterm::event::KeyModifiers,
+) {
+    app.dispatch_normal_key(crossterm::event::KeyEvent::new(code, mods));
+}
+
+#[test]
+fn esc_does_not_quit_the_app() {
+    let mut app = make_app(make_sessions(), None, Config::default());
+    press(&mut app, crossterm::event::KeyCode::Esc);
+    assert!(
+        !app.should_quit,
+        "Esc must back out, never quit — q and Ctrl+C quit"
+    );
+}
+
+#[test]
+fn esc_clears_an_active_filter() {
+    let mut app = make_app(make_sessions(), None, Config::default());
+    app.filter_input = tui_input::Input::from("proj".to_string());
+    app.recompute_filter();
+    press(&mut app, crossterm::event::KeyCode::Esc);
+    assert_eq!(app.filter_input.value(), "");
+    assert!(!app.should_quit);
+}
+
+#[test]
+fn q_still_quits() {
+    let mut app = make_app(make_sessions(), None, Config::default());
+    press(&mut app, crossterm::event::KeyCode::Char('q'));
+    assert!(app.should_quit);
+}
+
+#[test]
+fn space_toggles_favorite() {
+    let mut app = make_app(make_sessions(), None, Config::default());
+    let before = app.favorites.len();
+    press(&mut app, crossterm::event::KeyCode::Char(' '));
+    assert_ne!(app.favorites.len(), before, "Space should toggle a favorite");
+}
+
+#[test]
+fn v_cycles_the_view_mode() {
+    let mut app = make_app(make_sessions(), None, Config::default());
+    let before = app.tree_view;
+    let before_display = app.display_mode;
+    press(&mut app, crossterm::event::KeyCode::Char('v'));
+    assert!(
+        app.tree_view != before || app.display_mode != before_display,
+        "v should change the view"
+    );
+}
+
+#[test]
+fn x_asks_before_stopping_a_live_session() {
+    let mut app = make_app(make_sessions(), None, Config::default());
+    app.live_sessions = vec![make_live("sess", "/tmp", None)];
+    app.recompute_flat_rows();
+    app.recompute_tree();
+    // Land the cursor on the live row.
+    let live_row = (0..app.visible_item_count()).find(|&i| {
+        app.selected = i;
+        app.selected_live_index().is_some()
+    });
+    assert!(live_row.is_some(), "expected a live row to select");
+
+    press(&mut app, crossterm::event::KeyCode::Char('x'));
+    assert_eq!(
+        app.mode,
+        AppMode::StopSessionConfirm,
+        "x must confirm, matching the Jobs tab"
+    );
+    assert_eq!(app.stop_confirm_name.as_deref(), Some("sess"));
+}
+
+#[test]
+fn the_new_session_popup_cycles_launch_modes() {
+    let mut app = make_app(make_sessions(), None, Config::default());
+    // A non-repo cwd, so `worktree` must be skipped rather than offered.
+    let dir = tempfile::tempdir().unwrap();
+    app.naming_cwd = Some(dir.path().to_string_lossy().to_string());
+    app.naming_mode = NewSessionMode::Plain;
+
+    app.cycle_naming_mode(true);
+    assert_eq!(app.naming_mode, NewSessionMode::Dangerous);
+    app.cycle_naming_mode(true);
+    assert_eq!(
+        app.naming_mode,
+        NewSessionMode::Direct,
+        "worktree is unselectable outside a git repo"
+    );
+    app.cycle_naming_mode(true);
+    assert_eq!(app.naming_mode, NewSessionMode::Plain);
+}
+
+#[test]
+fn a_direct_new_session_ignores_the_name() {
+    let mut app = make_app(make_sessions(), None, Config::default());
+    app.mode = AppMode::NamingSession;
+    app.naming_mode = NewSessionMode::Direct;
+    app.naming_cwd = Some("/tmp".into());
+    app.naming_input = tui_input::Input::from("ignored".to_string());
+    app.handle_naming_event(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Enter,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    match &app.launch_session {
+        Some(LaunchRequest::NewDirect { cwd }) => assert_eq!(cwd, "/tmp"),
+        other => panic!("expected NewDirect, got {other:?}"),
+    }
+}
+
+#[test]
+fn the_help_overlay_scrolls_and_resets_per_page() {
+    let mut app = make_app(make_sessions(), None, Config::default());
+    app.open_help();
+    assert_eq!(app.help_scroll, 0);
+    let help_key = |c| crossterm::event::KeyEvent::new(c, crossterm::event::KeyModifiers::NONE);
+    app.handle_help_event(help_key(crossterm::event::KeyCode::Char('j')));
+    app.handle_help_event(help_key(crossterm::event::KeyCode::Char('j')));
+    assert_eq!(app.help_scroll, 2);
+    app.handle_help_event(help_key(crossterm::event::KeyCode::Tab));
+    assert_eq!(app.help_scroll, 0, "switching page resets the scroll");
+    assert_eq!(app.mode, AppMode::Help, "scrolling must not close help");
 }

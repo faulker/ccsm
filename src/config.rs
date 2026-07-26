@@ -112,6 +112,11 @@ pub struct Config {
     /// Give up relaunching a job after this many consecutive failures.
     #[serde(default = "default_max_restart_attempts")]
     pub max_restart_attempts: u32,
+    /// Mark a running job done once its pane has looked idle this long without
+    /// the agent ever emitting the completion marker. `0` disables the
+    /// fallback, leaving the marker as the only way a job finishes by itself.
+    #[serde(default = "default_idle_complete_seconds")]
+    pub idle_complete_seconds: u64,
 }
 
 impl Default for Config {
@@ -138,6 +143,7 @@ impl Default for Config {
             defer_while_attached: default_true(),
             continue_prompt: default_continue_prompt(),
             max_restart_attempts: default_max_restart_attempts(),
+            idle_complete_seconds: default_idle_complete_seconds(),
         }
     }
 }
@@ -180,6 +186,13 @@ fn default_continue_prompt() -> String {
 /// Serde default helper for `max_restart_attempts`.
 fn default_max_restart_attempts() -> u32 {
     5
+}
+
+/// Serde default helper for `idle_complete_seconds`: 15 minutes. Long enough
+/// that a slow tool call or a pattern `live::detect_activity` does not
+/// recognise cannot be mistaken for a finished job.
+fn default_idle_complete_seconds() -> u64 {
+    900
 }
 
 /// Root directory for all ccsm state files. `CCSM_CONFIG_DIR` overrides the

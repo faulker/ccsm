@@ -144,6 +144,29 @@ pub fn estimate_wrapped_height(text: &Text, width: usize) -> usize {
         .sum()
 }
 
+/// A centered rect that never resolves below `min_width` x `min_height`.
+///
+/// Percentage-only sizing collapses on small terminals: `centered_rect(46, 3,
+/// …)` yields a zero-height rect below roughly 34 rows, and the help and config
+/// popups lose a third of their content at 80x24. Clamping to the content
+/// minimum (and re-centering, so the popup cannot hang off an edge) is what
+/// makes every modal usable at 60x20.
+pub fn centered_rect_min(
+    percent_x: u16,
+    percent_y: u16,
+    min_width: u16,
+    min_height: u16,
+    area: Rect,
+) -> Rect {
+    let base = centered_rect(percent_x, percent_y, area);
+    let width = base.width.max(min_width).min(area.width);
+    let height = base.height.max(min_height).min(area.height);
+    // Re-center, then pull back inside `area` if the clamp pushed it out.
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    Rect { x, y, width, height }
+}
+
 /// Compute a centered `Rect` that is `percent_x`% wide and `percent_y`% tall within `area`.
 pub fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
     let popup_layout = Layout::default()
@@ -281,5 +304,31 @@ mod input_span_tests {
         let typed = Input::from("x".to_string());
         let spans = input_spans_with_placeholder(&typed, Style::default(), "auto-name");
         assert_eq!(spans[0].content, "x");
+    }
+
+    // --- Modal sizing on small terminals ---
+    use super::{centered_rect_min, Rect};
+
+    #[test]
+    fn centered_rect_min_never_collapses() {
+        // `centered_rect(46, 3, ...)` is zero-height below ~34 rows, which is
+        // what made every popup need its own ad-hoc clamp.
+        for (w, h) in [(60u16, 20u16), (80, 24), (100, 30), (120, 40)] {
+            let full = Rect { x: 0, y: 0, width: w, height: h };
+            let r = centered_rect_min(46, 3, 32, 4, full);
+            assert!(r.width >= 32, "{w}x{h}: width {}", r.width);
+            assert!(r.height >= 4, "{w}x{h}: height {}", r.height);
+            assert!(r.x + r.width <= w, "{w}x{h}: overflows right edge");
+            assert!(r.y + r.height <= h, "{w}x{h}: overflows bottom edge");
+        }
+    }
+
+    #[test]
+    fn centered_rect_min_stays_inside_a_tiny_area() {
+        let full = Rect { x: 0, y: 0, width: 20, height: 6 };
+        let r = centered_rect_min(70, 80, 44, 12, full);
+        assert!(r.width <= 20 && r.height <= 6, "must clamp to the area");
+        assert!(r.x + r.width <= 20);
+        assert!(r.y + r.height <= 6);
     }
 }

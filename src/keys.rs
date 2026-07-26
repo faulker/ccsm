@@ -1,4 +1,7 @@
-use crate::app::{App, AppMode, DuplicateSource, FlatRow, HelpTab, LaunchRequest, MainTab, TreeRow};
+use crate::app::{
+    App, AppMode, DuplicateSource, FlatRow, HelpTab, LaunchRequest, MainTab, NewSessionMode,
+    TreeRow,
+};
 use crate::{data, live};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, ModifierKeyCode, MouseEventKind};
 
@@ -134,7 +137,7 @@ impl App {
     ///
     /// Esc cancels, Enter confirms (using the placeholder if empty), all other
     /// editing keys are delegated to `naming_input` via `tui_input`.
-    fn handle_naming_event(&mut self, key: crossterm::event::KeyEvent) {
+    pub(crate) fn handle_naming_event(&mut self, key: crossterm::event::KeyEvent) {
         use crossterm::event::Event;
         use tui_input::backend::crossterm::EventHandler;
 
@@ -143,7 +146,21 @@ impl App {
                 self.mode = AppMode::Normal;
                 self.naming_input = tui_input::Input::default();
                 self.naming_cwd = None;
-                self.naming_dangerous = false;
+                self.naming_mode = NewSessionMode::Plain;
+            }
+            // Tab / Shift+Tab cycle the launch mode. Deliberately *not* the
+            // arrow keys: Left/Right belong to `tui_input` for moving the
+            // cursor within the name being typed.
+            KeyCode::Tab => self.cycle_naming_mode(true),
+            KeyCode::BackTab => self.cycle_naming_mode(false),
+            // A direct session never reaches tmux, so there is no name to take
+            // and no duplicate to check for.
+            KeyCode::Enter if self.naming_mode == NewSessionMode::Direct => {
+                let cwd = self.naming_cwd.take().unwrap_or_else(|| ".".to_string());
+                self.mode = AppMode::Normal;
+                self.naming_input = tui_input::Input::default();
+                self.naming_mode = NewSessionMode::Plain;
+                self.launch_session = Some(LaunchRequest::NewDirect { cwd });
             }
             KeyCode::Enter => {
                 let raw = if self.naming_input.value().is_empty() {
@@ -175,12 +192,13 @@ impl App {
                 let cwd = self.naming_cwd.take().unwrap_or_else(|| ".".to_string());
                 self.mode = AppMode::Normal;
                 self.naming_input = tui_input::Input::default();
-                if self.naming_dangerous {
-                    self.naming_dangerous = false;
-                    self.launch_session = Some(LaunchRequest::NewLiveDangerous { name, cwd });
-                } else {
-                    self.launch_session = Some(LaunchRequest::NewLive { name, cwd });
-                }
+                let mode = std::mem::replace(&mut self.naming_mode, NewSessionMode::Plain);
+                self.launch_session = Some(LaunchRequest::NewLive {
+                    name,
+                    cwd,
+                    dangerous: mode == NewSessionMode::Dangerous,
+                    worktree: mode == NewSessionMode::Worktree,
+                });
             }
             _ => {
                 self.naming_input.handle_event(&Event::Key(normalize_key(key)));
@@ -231,23 +249,45 @@ impl App {
             MainTab::Jobs => HelpTab::Jobs,
             MainTab::Sessions => HelpTab::Sessions,
         };
+        self.help_scroll = 0;
         self.mode = AppMode::Help;
     }
 
-    /// Handle a key event while the tabbed help overlay is open: Tab/arrows and
-    /// `h`/`l` switch pages, `1`..`3` jump to one, anything else closes it.
-    fn handle_help_event(&mut self, key: crossterm::event::KeyEvent) {
+    /// Handle a key event while the tabbed help overlay is open: Tab/`h`/`l`
+    /// switch pages, `1`..`3` jump to one, `j`/`k`/arrows/PgUp/PgDn scroll the
+    /// current page, and Esc/`?`/`q` close it.
+    ///
+    /// The help overlay is the fallback for every hint the status bar drops on
+    /// a narrow terminal, so it has to be scrollable: at 80x24 its content area
+    /// is 15 rows against a Sessions page of roughly 24 lines.
+    pub(crate) fn handle_help_event(&mut self, key: crossterm::event::KeyEvent) {
         match key.code {
             KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
                 self.help_tab = self.help_tab.next();
+                self.help_scroll = 0;
             }
             KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => {
                 self.help_tab = self.help_tab.prev();
+                self.help_scroll = 0;
             }
             KeyCode::Char(c @ '1'..='3') => {
                 let idx = c as usize - '1' as usize;
                 self.help_tab = HelpTab::ALL[idx];
+                self.help_scroll = 0;
             }
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.help_scroll = self.help_scroll.saturating_add(1);
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.help_scroll = self.help_scroll.saturating_sub(1);
+            }
+            KeyCode::PageDown => {
+                self.help_scroll = self.help_scroll.saturating_add(10);
+            }
+            KeyCode::PageUp => {
+                self.help_scroll = self.help_scroll.saturating_sub(10);
+            }
+            KeyCode::Home => self.help_scroll = 0,
             _ => self.mode = AppMode::Normal,
         }
     }
@@ -266,11 +306,12 @@ impl App {
 
         match key.code {
             KeyCode::Char('o') | KeyCode::Enter => {
-                self.launch_session = Some(LaunchRequest::AttachLive { tmux_name: name });
+                self.request_attach(name);
                 self.duplicate_name = None;
                 self.duplicate_source = None;
                 self.duplicate_cwd = None;
                 self.naming_input = tui_input::Input::default();
+                self.naming_mode = NewSessionMode::Plain;
                 self.rename_input = tui_input::Input::default();
                 self.rename_session_id = None;
                 self.mode = AppMode::Normal;
@@ -294,9 +335,29 @@ impl App {
                 self.duplicate_cwd = None;
                 self.naming_input = tui_input::Input::default();
                 self.naming_cwd = None;
+                self.naming_mode = NewSessionMode::Plain;
                 self.rename_input = tui_input::Input::default();
                 self.rename_session_id = None;
                 self.rename_project = None;
+                self.mode = AppMode::Normal;
+            }
+            _ => {}
+        }
+    }
+
+    /// Handle a key event while the stop-live-session confirmation is open.
+    ///
+    /// Uses the same `y`/`n`/Enter/Esc vocabulary as the job confirm and the
+    /// update prompt, so every confirmation in the app answers to the same keys.
+    fn handle_stop_confirm_event(&mut self, key: crossterm::event::KeyEvent) {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Enter => {
+                self.stop_confirm_name = None;
+                self.mode = AppMode::Normal;
+                self.stop_selected_live_session();
+            }
+            KeyCode::Char('n') | KeyCode::Esc => {
+                self.stop_confirm_name = None;
                 self.mode = AppMode::Normal;
             }
             _ => {}
@@ -353,6 +414,11 @@ impl App {
                 return Ok(());
             }
 
+            // A status-bar alert describes the action that just failed, so the
+            // next keypress supersedes it. Cleared before dispatch so a handler
+            // that raises a new alert for *this* key still wins.
+            self.status_error = None;
+
             if self.mode == AppMode::UpdatePrompt {
                 match key.code {
                     KeyCode::Char('y') => {
@@ -403,6 +469,11 @@ impl App {
 
             if self.mode == AppMode::DirPicker {
                 self.handle_dir_picker_event(key);
+                return Ok(());
+            }
+
+            if self.mode == AppMode::StopSessionConfirm {
+                self.handle_stop_confirm_event(key);
                 return Ok(());
             }
 
@@ -461,12 +532,47 @@ impl App {
                 return Ok(());
             }
 
+            self.dispatch_normal_key_with_shift(key, prev_shift_active);
+        }
+        Ok(())
+    }
+    /// Dispatch a key press in Normal mode on the Sessions tab.
+    ///
+    /// Split out of `handle_event` so it can be driven directly from tests:
+    /// `handle_event` blocks on `event::read()`, which makes the largest key
+    /// map in the app the only one that was untestable.
+    /// Dispatch a Normal-mode key with no prior Shift state held.
+    #[cfg(test)]
+    pub(crate) fn dispatch_normal_key(&mut self, key: crossterm::event::KeyEvent) {
+        self.dispatch_normal_key_with_shift(key, false);
+    }
+
+    /// `prev_shift_active` is the Shift flag as it stood *before* this event
+    /// updated it, which some terminals (Ghostty) need for Shift+Enter: they
+    /// do not set `KeyModifiers::SHIFT` on Enter itself.
+    pub(crate) fn dispatch_normal_key_with_shift(
+        &mut self,
+        key: crossterm::event::KeyEvent,
+        prev_shift_active: bool,
+    ) {
             match (key.code, key.modifiers) {
-                (KeyCode::Char('q'), _) | (KeyCode::Esc, _) => {
+                (KeyCode::Char('q'), _) => {
                     self.should_quit = true;
                 }
                 (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                     self.should_quit = true;
+                }
+                // Esc never quits. Every modal in the app treats Esc as
+                // "back out", so an Esc pressed one time too many while
+                // dismissing a popup must not take the whole app down. It
+                // clears an active filter, and is otherwise inert.
+                (KeyCode::Esc, _) => {
+                    if !self.filter_input.value().is_empty() {
+                        self.filter_input = tui_input::Input::default();
+                        self.recompute_filter();
+                        self.preview_scroll = u16::MAX;
+                        self.preview_auto_scroll = true;
+                    }
                 }
                 // '?' is Shift+/ on US keyboards; some terminals send Char('?') and
                 // others send Char('/') with SHIFT — handle both before the '/' filter.
@@ -508,30 +614,24 @@ impl App {
                     self.preview_scroll = self.preview_scroll.saturating_sub(3);
                 }
                 (KeyCode::Char('n'), KeyModifiers::NONE) => {
-                    if let Some(cwd) = self.selected_cwd() {
-                        let path = std::path::Path::new(&cwd);
-                        let dir = if path.exists() {
-                            cwd
-                        } else {
-                            ".".to_string()
-                        };
-                        let placeholder = live::generate_auto_name(&dir, &self.live_sessions);
-                        self.naming_placeholder = placeholder;
-                        self.naming_cwd = Some(dir);
-                        self.naming_input = tui_input::Input::default();
-                        self.mode = AppMode::NamingSession;
-                    }
+                    self.open_naming_popup(NewSessionMode::Plain);
                 }
-                (KeyCode::Char('f'), KeyModifiers::NONE) => {
+                // Space is the toggle key in both tabs (favorite here,
+                // auto-resume on Jobs), which frees `f` from meaning two
+                // unrelated things depending on which tab is open.
+                (KeyCode::Char(' '), _) => {
                     self.toggle_favorite();
                     self.recompute_flat_rows();
                     self.recompute_tree();
                 }
+                (KeyCode::Char('v'), KeyModifiers::NONE) => {
+                    self.cycle_view_forward();
+                    self.recompute_flat_rows();
+                    self.recompute_tree();
+                    self.save_config();
+                }
                 (KeyCode::Char('b'), KeyModifiers::NONE) => {
                     self.open_dir_picker();
-                }
-                (KeyCode::Char('w'), KeyModifiers::NONE) => {
-                    self.open_jobs_tab();
                 }
                 (KeyCode::Char('m'), KeyModifiers::NONE) => {
                     self.job_form_from_selection();
@@ -542,8 +642,13 @@ impl App {
                     self.recompute_tree();
                     self.save_config();
                 }
+                // Confirmed, to match `x` on the Jobs tab. Stopping a session
+                // is not recoverable, so both tabs ask first.
                 (KeyCode::Char('x'), KeyModifiers::NONE) => {
-                    self.stop_selected_live_session();
+                    if let Some(idx) = self.selected_live_index() {
+                        self.stop_confirm_name = Some(self.live_sessions[idx].display_name.clone());
+                        self.mode = AppMode::StopSessionConfirm;
+                    }
                 }
                 (KeyCode::Char('r'), KeyModifiers::NONE) => {
                     // Check if a live session is selected first
@@ -553,7 +658,7 @@ impl App {
                         self.rename_session_id = Some(session.tmux_name.clone());
                         self.rename_project = None;
                         self.mode = AppMode::Renaming;
-                        return Ok(());
+                        return;
                     }
                     if let Some(idx) = self.selected_session_index() {
                         // For chains, always rename the most recent session
@@ -577,29 +682,10 @@ impl App {
                         self.mode = AppMode::Renaming;
                     }
                 }
-                (KeyCode::Char('N' | 'n'), KeyModifiers::SHIFT) => {
-                    let cwd = self
-                        .selected_cwd()
-                        .filter(|p| std::path::Path::new(p).exists())
-                        .unwrap_or_else(|| ".".to_string());
-                    self.launch_session = Some(LaunchRequest::NewDirect { cwd });
-                }
-                (KeyCode::Char('D' | 'd'), KeyModifiers::SHIFT) => {
-                    if let Some(cwd) = self.selected_cwd() {
-                        let path = std::path::Path::new(&cwd);
-                        let dir = if path.exists() {
-                            cwd
-                        } else {
-                            ".".to_string()
-                        };
-                        let placeholder = live::generate_auto_name(&dir, &self.live_sessions);
-                        self.naming_placeholder = placeholder;
-                        self.naming_cwd = Some(dir);
-                        self.naming_input = tui_input::Input::default();
-                        self.naming_dangerous = true;
-                        self.mode = AppMode::NamingSession;
-                    }
-                }
+                // Shift+N/D/W used to be three separate launch keys. They are
+                // now modes cycled with Tab inside the naming popup, so `n` is
+                // the only entry point and the status bar carries one "new"
+                // hint instead of four.
                 (KeyCode::Enter, _) if (key.modifiers.contains(KeyModifiers::SHIFT) || prev_shift_active) && self.is_historical_selected() => {
                     // Shift+Enter: open historical session directly (no tmux)
                     if self.tree_view {
@@ -636,7 +722,7 @@ impl App {
                             }
                             Some(TreeRow::LiveItem { live_index }) => {
                                 let name = self.live_sessions[live_index].tmux_name.clone();
-                                self.launch_session = Some(LaunchRequest::AttachLive { tmux_name: name });
+                                self.request_attach(name);
                             }
                             Some(TreeRow::RunningHeader { project, .. }) => {
                                 let key = format!("running:{}", project);
@@ -662,7 +748,7 @@ impl App {
                         match self.flat_rows.get(self.selected).cloned() {
                             Some(FlatRow::LiveItem { live_index }) => {
                                 let name = self.live_sessions[live_index].tmux_name.clone();
-                                self.launch_session = Some(LaunchRequest::AttachLive { tmux_name: name });
+                                self.request_attach(name);
                             }
                             Some(FlatRow::HistoryItem { session_index }) => {
                                 let session_id = self.resume_session_id_for(session_index).to_string();
@@ -751,7 +837,6 @@ impl App {
                 }
                 _ => {}
             }
-        }
-        Ok(())
     }
+
 }

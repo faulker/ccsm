@@ -15,6 +15,7 @@ mod tests;
 use crate::config::{Config, DisplayMode, PauseMode};
 use crate::data::{self, PreviewMessage, SessionInfo, SessionMeta};
 use crate::live::{self, ActivityState, LiveSession};
+use crate::models;
 use crate::schedule::{self, Job};
 use crate::update;
 use std::collections::{HashMap, HashSet};
@@ -134,9 +135,16 @@ pub enum LaunchRequest {
     /// Attach the terminal to an already-running live tmux session.
     AttachLive { tmux_name: String },
     /// Create and attach to a new live tmux session running claude.
-    NewLive { name: String, cwd: String },
-    /// Create and attach to a new live tmux session running claude with --dangerously-skip-permissions.
-    NewLiveDangerous { name: String, cwd: String },
+    NewLive {
+        /// tmux session name, also passed to claude as `--name`.
+        name: String,
+        /// Working directory the session starts in.
+        cwd: String,
+        /// Launch with `--dangerously-skip-permissions`.
+        dangerous: bool,
+        /// Launch with `--worktree <name>`, so claude creates a git worktree for the session.
+        worktree: bool,
+    },
     /// Start a new claude session directly in the foreground (no tmux).
     NewDirect { cwd: String },
 }
@@ -181,6 +189,62 @@ pub enum AppMode {
     JobForm,
     /// A destructive job action (stop/delete) is awaiting y/n confirmation (reached only from the Jobs tab).
     JobConfirm,
+    /// Stopping a live session is awaiting y/n confirmation (reached only from the Sessions tab).
+    StopSessionConfirm,
+}
+
+/// How a new session launched from the naming popup should be started.
+///
+/// These used to be a pair of booleans set by whichever key opened the popup.
+/// They are one cycled enum so a single `n` covers every launch mode, which is
+/// what keeps the status bar down to one "new" hint instead of four.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NewSessionMode {
+    /// A normal live session in tmux.
+    Plain,
+    /// A live session launched with `--dangerously-skip-permissions`.
+    Dangerous,
+    /// A live session that gets its own git worktree.
+    Worktree,
+    /// A plain `claude` process with no tmux session (the name is unused).
+    Direct,
+}
+
+impl NewSessionMode {
+    /// Every mode, in cycle order.
+    pub const ALL: [NewSessionMode; 4] = [
+        NewSessionMode::Plain,
+        NewSessionMode::Dangerous,
+        NewSessionMode::Worktree,
+        NewSessionMode::Direct,
+    ];
+
+    /// Short label shown in the naming popup's mode row.
+    pub fn label(self) -> &'static str {
+        match self {
+            NewSessionMode::Plain => "plain",
+            NewSessionMode::Dangerous => "danger",
+            NewSessionMode::Worktree => "worktree",
+            NewSessionMode::Direct => "direct",
+        }
+    }
+
+    /// The next mode in cycle order, wrapping.
+    pub fn next(self) -> NewSessionMode {
+        let i = Self::ALL.iter().position(|&m| m == self).unwrap_or(0);
+        Self::ALL[(i + 1) % Self::ALL.len()]
+    }
+
+    /// The previous mode in cycle order, wrapping.
+    pub fn prev(self) -> NewSessionMode {
+        let i = Self::ALL.iter().position(|&m| m == self).unwrap_or(0);
+        Self::ALL[(i + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
+
+    /// True when this mode launches through tmux and therefore needs a name.
+    pub fn needs_name(self) -> bool {
+        self != NewSessionMode::Direct
+    }
 }
 
 /// Tracks which popup triggered the duplicate-name check, so we can return to the right mode.
@@ -211,6 +275,9 @@ pub enum JobConfirmAction {
     Stop,
     /// Delete the job entirely (`Command::DeleteJob`).
     Delete,
+    /// Mark the job finished by hand (`Command::MarkDone`), for work the agent
+    /// completed without ever emitting the completion marker.
+    Done,
 }
 
 
@@ -319,8 +386,13 @@ pub struct App {
     pub activity_last_poll: HashMap<String, Instant>,
     /// Monotonic tick counter, incremented each redraw to drive pulse animation.
     pub tick: u64,
-    /// When true, the naming popup is for a --dangerously-skip-permissions session.
-    pub naming_dangerous: bool,
+    /// Which launch mode the open naming popup will use. Cycled with Tab/←/→
+    /// inside the popup rather than chosen by the key that opened it.
+    pub naming_mode: NewSessionMode,
+    /// The live session awaiting stop confirmation in `AppMode::StopSessionConfirm`.
+    pub stop_confirm_name: Option<String>,
+    /// Vertical scroll offset for the help overlay, in lines.
+    pub help_scroll: u16,
     /// Last error message to display in the status bar.
     pub status_error: Option<String>,
     /// State for the directory-picker modal, or `None` when it's not open.
@@ -370,6 +442,9 @@ pub struct App {
     pub job_form_auto_resume: bool,
     /// How the in-progress job form ties back to an existing session, set by `job_form_from_selection`.
     pub job_form_bind: JobBind,
+    /// Models offered by the job form's model picker, discovered once at startup
+    /// from Claude Code's own state (see `crate::models`).
+    pub model_options: Vec<models::ModelOption>,
 }
 
 /// Truncate a path to its last 2 components (e.g. "/Users/sane/Dev/ccsm" -> "Dev/ccsm").
@@ -444,7 +519,9 @@ impl App {
             activity_states: HashMap::new(),
             activity_last_poll: HashMap::new(),
             tick: 0,
-            naming_dangerous: false,
+            naming_mode: NewSessionMode::Plain,
+            stop_confirm_name: None,
+            help_scroll: 0,
             status_error: None,
             dir_browser: None,
             dir_picker_target: PickerTarget::NewSession,
@@ -469,6 +546,7 @@ impl App {
             job_form_pause_mode: PauseMode::default(),
             job_form_auto_resume: true,
             job_form_bind: JobBind::New,
+            model_options: models::available(),
         };
 
         // Check for required binaries
@@ -537,6 +615,77 @@ impl App {
         if self.selected >= self.visible_item_count() {
             self.selected = self.visible_item_count().saturating_sub(1);
         }
+    }
+
+    /// Open the new-session naming popup for the selected row's project,
+    /// starting in `mode`.
+    ///
+    /// The launch mode is cycled inside the popup (see `cycle_naming_mode`)
+    /// rather than fixed by the key that opened it, so `n` is the single entry
+    /// point for every kind of new session. Returns false (leaving the mode
+    /// unchanged) when there is no selectable cwd, or when `mode` is
+    /// `Worktree` outside a git repo.
+    pub fn open_naming_popup(&mut self, mode: NewSessionMode) -> bool {
+        let Some(cwd) = self.selected_cwd() else {
+            return false;
+        };
+        let dir = if std::path::Path::new(&cwd).exists() {
+            cwd
+        } else {
+            ".".to_string()
+        };
+        if mode == NewSessionMode::Worktree && !live::is_git_repo(&dir) {
+            self.status_error = Some(format!("{dir} is not a git repository"));
+            return false;
+        }
+        self.naming_placeholder = live::generate_auto_name(&dir, &self.live_sessions);
+        self.naming_cwd = Some(dir);
+        self.naming_input = Input::default();
+        self.naming_mode = mode;
+        self.mode = AppMode::NamingSession;
+        true
+    }
+
+    /// Cycle the open naming popup's launch mode, skipping `Worktree` when the
+    /// chosen cwd is not a git repository.
+    ///
+    /// Validating here rather than at submit time is what preserves the old
+    /// behaviour of refusing an impossible worktree up front: the mode simply
+    /// cannot be selected, so there is nothing to reject later.
+    pub fn cycle_naming_mode(&mut self, forward: bool) {
+        let is_repo = self
+            .naming_cwd
+            .as_deref()
+            .map(live::is_git_repo)
+            .unwrap_or(false);
+
+        let mut next = self.naming_mode;
+        // At most one full lap; `Plain` is always selectable so this terminates.
+        for _ in 0..NewSessionMode::ALL.len() {
+            next = if forward { next.next() } else { next.prev() };
+            if next != NewSessionMode::Worktree || is_repo {
+                break;
+            }
+        }
+        self.naming_mode = next;
+    }
+
+    /// Request attaching to `tmux_name` once the TUI exits, but only if that
+    /// tmux session actually exists.
+    ///
+    /// Rows can outlive the session they point at: a job keeps its `tmux_name`
+    /// after the daemon stops it, and the live list is only re-discovered
+    /// periodically. Attaching to a dead session used to abort the process and
+    /// close the app, so a missing session is reported in the status bar and
+    /// the live list is reconciled instead.
+    pub fn request_attach(&mut self, tmux_name: String) {
+        if !live::session_exists(self.config.tmux_bin(), &tmux_name) {
+            self.status_error = Some(format!("No running session '{tmux_name}' to attach to"));
+            self.reload_live_sessions();
+            return;
+        }
+        self.status_error = None;
+        self.launch_session = Some(LaunchRequest::AttachLive { tmux_name });
     }
 
     /// Sync current view settings back into `self.config` and persist it to disk.

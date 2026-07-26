@@ -1,4 +1,4 @@
-mod types;
+pub(crate) mod types;
 pub(crate) mod history;
 pub(crate) mod io;
 pub(crate) mod preview;

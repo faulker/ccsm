@@ -25,8 +25,8 @@ use self::dir_picker::draw_dir_picker;
 use self::info_bar::{build_title_spans, build_usage_status_spans, render_status_bar};
 use self::jobs_tab::{draw_job_confirm_popup, draw_job_form_popup, draw_jobs_tab};
 use self::modals::{
-    draw_duplicate_popup, draw_naming_popup, draw_rename_popup, draw_update_prompt,
-    render_help_popup,
+    draw_duplicate_popup, draw_naming_popup, draw_rename_popup, draw_stop_confirm_popup,
+    draw_update_prompt, render_help_popup,
 };
 use self::preview_pane::{build_live_preview_text, build_preview_text};
 use self::session_list::{build_flat_items, build_tree_items};
@@ -139,7 +139,7 @@ fn draw_sessions_tab(frame: &mut Frame, app: &mut App, list_area: Rect, right_ar
         build_flat_items(app)
     };
 
-    let title_spans = build_title_spans(app);
+    let title_spans = build_title_spans(app, main_chunks[0].width);
 
     let list = List::new(items)
         .block(
@@ -317,12 +317,25 @@ fn draw_overlays(frame: &mut Frame, app: &mut App) {
 
     // Help overlay
     if app.mode == AppMode::Help {
-        render_help_popup(frame, frame.area(), app.help_tab);
+        // The popup clamps the scroll to its content, and the clamped value is
+        // written back so a held `j` cannot run the offset off the end.
+        app.help_scroll = render_help_popup(frame, frame.area(), app.help_tab, app.help_scroll);
     }
 
     // NamingSession overlay (centered popup)
     if app.mode == AppMode::NamingSession {
-        draw_naming_popup(frame, &app.naming_input, &app.naming_placeholder, app.naming_dangerous);
+        let cwd_is_repo = app
+            .naming_cwd
+            .as_deref()
+            .map(crate::live::is_git_repo)
+            .unwrap_or(false);
+        draw_naming_popup(
+            frame,
+            &app.naming_input,
+            &app.naming_placeholder,
+            app.naming_mode,
+            cwd_is_repo,
+        );
     }
 
     // Config popup
@@ -333,6 +346,13 @@ fn draw_overlays(frame: &mut Frame, app: &mut App) {
     // MissingDeps popup
     if app.mode == AppMode::MissingDeps {
         crate::config_popup::draw_missing_deps_popup(frame, app);
+    }
+
+    // Stop-live-session confirmation popup
+    if app.mode == AppMode::StopSessionConfirm {
+        if let Some(name) = app.stop_confirm_name.clone() {
+            draw_stop_confirm_popup(frame, &name);
+        }
     }
 
     // DuplicateSession confirmation popup
@@ -409,5 +429,95 @@ mod tests {
         let mut app = app_with_usage();
         app.main_tab = MainTab::Jobs;
         assert!(tab_bar_text(&mut app).contains("78%"));
+    }
+
+    // --- Small-terminal acceptance ---
+
+    /// Draw the whole frame at `w`x`h` in `mode` and return the screen text.
+    fn screen(mode: AppMode, w: u16, h: u16) -> String {
+        let mut app = App::new(vec![], None, Config::default());
+        app.jobs = vec![];
+        app.watch_state = None;
+        app.mode = mode;
+        app.naming_placeholder = "auto-name".into();
+        app.naming_cwd = Some("/tmp".into());
+        app.stop_confirm_name = Some("sess".into());
+        app.duplicate_name = Some("sess".into());
+
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        (0..h)
+            .map(|y| {
+                (0..w)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The goal in PLAN.md: the relevant shortcuts stay visible on a small
+    /// screen. Help and quit are the two that must never be the ones cut.
+    #[test]
+    fn shortcuts_survive_a_small_terminal() {
+        for (w, h) in [(60u16, 20u16), (80, 24)] {
+            let text = screen(AppMode::Normal, w, h);
+            assert!(text.contains("? help"), "{w}x{h}:\n{text}");
+            assert!(text.contains("q quit"), "{w}x{h}:\n{text}");
+        }
+    }
+
+    #[test]
+    fn every_modal_renders_its_content_at_60x20() {
+        let cases = [
+            (AppMode::Help, "Navigation"),
+            (AppMode::NamingSession, "plain"),
+            (AppMode::StopSessionConfirm, "Stop session"),
+            (AppMode::DuplicateSession, "already exists"),
+            (AppMode::Config, "Hide empty projects"),
+        ];
+        for (mode, needle) in cases {
+            let text = screen(mode.clone(), 60, 20);
+            assert!(
+                text.contains(needle),
+                "{mode:?} lost {needle:?} at 60x20:\n{text}"
+            );
+        }
+    }
+
+    /// The config popup holds ~30 lines but gets 18 rows at 60x20, so the
+    /// About block used to be unreachable. It follows the cursor now.
+    #[test]
+    fn the_config_popup_scrolls_to_reach_its_last_row() {
+        let mut app = App::new(vec![], None, Config::default());
+        app.jobs = vec![];
+        app.watch_state = None;
+        app.mode = AppMode::Config;
+        // The URL row is the last one in the About block.
+        app.config_selected = crate::config_popup::URL_ROW;
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let text: String = (0..20)
+            .map(|y| {
+                (0..60)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("About"), "{text}");
+        assert!(text.contains("github.com/faulker/ccsm"), "{text}");
+    }
+
+    #[test]
+    fn the_naming_popup_shows_every_launch_mode() {
+        let text = screen(AppMode::NamingSession, 80, 24);
+        for label in ["plain", "danger", "worktree", "direct"] {
+            assert!(text.contains(label), "missing {label}:\n{text}");
+        }
+        assert!(text.contains("Tab"), "{text}");
     }
 }

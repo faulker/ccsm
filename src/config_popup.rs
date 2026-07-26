@@ -4,12 +4,21 @@ use crate::keys::normalize_key;
 use crossterm::event::KeyCode;
 
 /// Maximum row index in the config popup (0-based).
-pub const CONFIG_MAX_ROW: usize = 11;
+pub const CONFIG_MAX_ROW: usize = 13;
+
+/// Row index of the idle-completion timeout, in minutes.
+pub(crate) const IDLE_COMPLETE_ROW: usize = 10;
+
+/// Row index of the default continue-prompt text field.
+pub(crate) const CONTINUE_PROMPT_ROW: usize = 11;
+
+/// Row index of the project URL, which opens in a browser rather than editing.
+pub(crate) const URL_ROW: usize = 13;
 
 /// Rows 3..=5 are binary paths: they open the file picker, and can also be typed by hand.
 const PATH_ROWS: std::ops::RangeInclusive<usize> = 3..=5;
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear, Paragraph},
@@ -20,7 +29,7 @@ use crate::theme::{
     ACCENT_BLUE, ACCENT_GREEN, ACCENT_MAUVE, ACCENT_PEACH, ACCENT_RED, BG_SURFACE, FG_SUBTEXT,
     FG_TEXT, HIGHLIGHT_BG,
 };
-use crate::ui::util::input_spans;
+use crate::ui::util::{centered_rect, centered_rect_min, input_spans};
 
 impl App {
     /// Handle a key event while the config popup is open.
@@ -74,6 +83,31 @@ impl App {
                                 commit_ok = false;
                             }
                         },
+                        // Entered in minutes because the useful range is tens
+                        // of minutes; stored in seconds like every other
+                        // duration in the config. "0" (or "off") disables it.
+                        IDLE_COMPLETE_ROW => match parse_minutes(&value) {
+                            Some(minutes) => {
+                                self.config.idle_complete_seconds = minutes * 60;
+                            }
+                            None => {
+                                self.status_error = Some(
+                                    "Idle completion must be a whole number of minutes (0 = off)"
+                                        .to_string(),
+                                );
+                                commit_ok = false;
+                            }
+                        },
+                        // An emptied field falls back to the built-in default
+                        // rather than storing "", which would paste nothing
+                        // into a paused session and leave it stuck.
+                        CONTINUE_PROMPT_ROW => {
+                            self.config.continue_prompt = if value.is_empty() {
+                                Config::default().continue_prompt
+                            } else {
+                                value
+                            };
+                        }
                         _ => {}
                     }
                     if commit_ok {
@@ -167,7 +201,17 @@ impl App {
                         self.config.watch_autostart = !self.config.watch_autostart;
                         self.save_config();
                     }
-                    11 => {
+                    IDLE_COMPLETE_ROW => {
+                        self.config_editing = true;
+                        let current = (self.config.idle_complete_seconds / 60).to_string();
+                        self.config_path_input = tui_input::Input::from(current);
+                    }
+                    CONTINUE_PROMPT_ROW => {
+                        self.config_editing = true;
+                        self.config_path_input =
+                            tui_input::Input::from(self.config.continue_prompt.clone());
+                    }
+                    URL_ROW => {
                         open_url("https://github.com/faulker/ccsm");
                     }
                     _ => {}
@@ -231,8 +275,8 @@ impl App {
 /// obvious which ones drive the jobs manager and which are session-list
 /// preferences, followed by the About block.
 pub fn draw_config_popup(frame: &mut Frame, app: &App) {
-    let area = centered_rect(60, 80, frame.area());
-    let area = Rect { height: 26.min(area.height), ..area };
+    let area = centered_rect_min(60, 80, 44, 12, frame.area());
+    let area = Rect { height: 28.min(area.height), ..area };
     frame.render_widget(Clear, area);
 
     let selected = app.config_selected;
@@ -335,23 +379,67 @@ pub fn draw_config_popup(frame: &mut Frame, app: &App) {
         ),
     ));
 
+    content.push({
+        // Spelled out rather than shown as a bare number, because "0" alone
+        // reads as "immediately" when it actually means the fallback is off
+        // and only the completion marker can finish a job.
+        let style = row_style(IDLE_COMPLETE_ROW);
+        let mut spans = vec![Span::styled(
+            format!("{}Idle completion: ", marker(IDLE_COMPLETE_ROW)),
+            style,
+        )];
+        if app.config_editing && selected == IDLE_COMPLETE_ROW {
+            spans.extend(input_spans(&app.config_path_input, style));
+        } else if app.config.idle_complete_seconds == 0 {
+            spans.push(Span::styled("off (marker only)".to_string(), style));
+        } else {
+            spans.push(Span::styled(
+                format!("after {} min idle", app.config.idle_complete_seconds / 60),
+                style,
+            ));
+        }
+        Line::from(spans)
+    });
+
+    content.push({
+        // Shown, not hidden behind "(default)", because this is the text the
+        // watcher actually pastes to wake every paused job.
+        let style = row_style(CONTINUE_PROMPT_ROW);
+        let mut spans = vec![Span::styled(
+            format!("{}Continue prompt: ", marker(CONTINUE_PROMPT_ROW)),
+            style,
+        )];
+        if app.config_editing && selected == CONTINUE_PROMPT_ROW {
+            spans.extend(input_spans(&app.config_path_input, style));
+        } else {
+            spans.push(Span::styled(app.config.continue_prompt.clone(), style));
+        }
+        Line::from(spans)
+    });
+
     content.push(Line::from(""));
     content.push(section("About"));
+    // The version lives here rather than in the status bar, where it used to
+    // reserve 8 columns of shortcut space at every terminal width.
+    content.push(Line::from(Span::styled(
+        format!("  ccsm v{}", env!("CARGO_PKG_VERSION")),
+        Style::default().fg(FG_SUBTEXT),
+    )));
     content.push({
-        let style = if selected == 10 {
+        let style = if selected == 12 {
             Style::default().fg(ACCENT_MAUVE).bg(HIGHLIGHT_BG)
         } else {
             Style::default().fg(ACCENT_MAUVE)
         };
-        Line::from(Span::styled(format!("{}Developed by Winter Faulk", marker(10)), style))
+        Line::from(Span::styled(format!("{}Developed by Winter Faulk", marker(12)), style))
     });
     content.push({
-        let marker_style = if selected == 11 {
+        let marker_style = if selected == URL_ROW {
             Style::default().fg(ACCENT_BLUE).bg(HIGHLIGHT_BG)
         } else {
             Style::default().fg(ACCENT_BLUE)
         };
-        let url_style = if selected == 11 {
+        let url_style = if selected == URL_ROW {
             Style::default()
                 .fg(ACCENT_BLUE)
                 .add_modifier(Modifier::UNDERLINED)
@@ -362,7 +450,7 @@ pub fn draw_config_popup(frame: &mut Frame, app: &App) {
                 .add_modifier(Modifier::UNDERLINED)
         };
         Line::from(vec![
-            Span::styled(marker(11), marker_style),
+            Span::styled(marker(URL_ROW), marker_style),
             Span::styled("https://github.com/faulker/ccsm", url_style),
         ])
     });
@@ -387,7 +475,7 @@ pub fn draw_config_popup(frame: &mut Frame, app: &App) {
             Span::styled("j/k", key_style),
             Span::styled(" navigate", hint_style),
         ]));
-    } else if selected == 11 {
+    } else if selected == URL_ROW {
         content.push(Line::from(vec![
             Span::styled("  Enter", key_style),
             Span::styled(" open in browser  ", hint_style),
@@ -403,19 +491,41 @@ pub fn draw_config_popup(frame: &mut Frame, app: &App) {
         ]));
     }
 
-    let popup = Paragraph::new(content).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(ACCENT_PEACH))
-            .title(Span::styled(
-                " Config (Esc to close) ",
-                Style::default()
-                    .fg(ACCENT_PEACH)
-                    .add_modifier(Modifier::BOLD),
-            ))
-            .style(Style::default().bg(BG_SURFACE)),
-    );
+    // The popup holds ~30 lines but gets 20 rows at 80x24, so the lower
+    // settings and the About block used to be unreachable. Scroll to keep the
+    // selected row in view: the list is already j/k-navigable, so following the
+    // cursor is better than a second scroll offset the user has to drive.
+    // The marker is the ground truth for which line is selected.
+    let selected_line = content
+        .iter()
+        .position(|l| {
+            l.spans
+                .first()
+                .is_some_and(|s| s.content.starts_with('\u{25b6}'))
+        })
+        .unwrap_or(0) as u16;
+    let view_height = area.height.saturating_sub(2); // borders
+    let max_scroll = (content.len() as u16).saturating_sub(view_height);
+    // Keep one row of context below the cursor where there is room for it.
+    let scroll = selected_line
+        .saturating_sub(view_height.saturating_sub(2))
+        .min(max_scroll);
+
+    let popup = Paragraph::new(content)
+        .scroll((scroll, 0))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(ACCENT_PEACH))
+                .title(Span::styled(
+                    " Config (Esc to close) ",
+                    Style::default()
+                        .fg(ACCENT_PEACH)
+                        .add_modifier(Modifier::BOLD),
+                ))
+                .style(Style::default().bg(BG_SURFACE)),
+        );
     frame.render_widget(popup, area);
 }
 
@@ -479,6 +589,25 @@ fn parse_percent(s: &str) -> Option<f64> {
     Some(v)
 }
 
+/// Parse the idle-completion timeout in whole minutes. Accepts `"0"` and the
+/// words `"off"`/`"never"` (all meaning "disabled"), and an empty field falls
+/// back to the built-in default rather than silently turning the fallback off.
+/// Capped at a week so a typo cannot store a value that never elapses.
+fn parse_minutes(s: &str) -> Option<u64> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return Some(Config::default().idle_complete_seconds / 60);
+    }
+    if trimmed.eq_ignore_ascii_case("off") || trimmed.eq_ignore_ascii_case("never") {
+        return Some(0);
+    }
+    let v: u64 = trimmed.parse().ok()?;
+    if v > 7 * 24 * 60 {
+        return None;
+    }
+    Some(v)
+}
+
 /// Checks that a pause/resume percentage pair stays properly separated: resume
 /// must be strictly less than pause, otherwise the watcher could thrash between
 /// pausing and resuming a session.
@@ -510,27 +639,6 @@ fn open_url(url: &str) {
         .spawn();
 }
 
-/// Compute a centered `Rect` that is `percent_x`% wide and `percent_y`% tall within `area`.
-fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
-    let popup_layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(area);
-
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(popup_layout[1])[1]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -560,6 +668,109 @@ mod tests {
         assert!(percent_ordering_ok(95.0, 50.0));
         assert!(!percent_ordering_ok(95.0, 95.0));
         assert!(!percent_ordering_ok(50.0, 95.0));
+    }
+
+    #[test]
+    fn popup_shows_the_continue_prompt_and_the_about_rows_together() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = App::new(vec![], None, Config::default());
+        app.mode = AppMode::Config;
+        app.config.continue_prompt = "Pick it back up.".to_string();
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let text: String = (0..40)
+            .map(|y| {
+                (0..120)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("Continue prompt: Pick it back up."), "{text}");
+        // The About block must still fit below the new row.
+        assert!(text.contains("https://github.com/faulker/ccsm"), "{text}");
+    }
+
+    #[test]
+    fn popup_shows_the_idle_completion_row_in_both_states() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let render = |seconds: u64| -> String {
+            let mut app = App::new(vec![], None, Config::default());
+            app.mode = AppMode::Config;
+            app.config.idle_complete_seconds = seconds;
+            let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+            terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+            let buffer = terminal.backend().buffer().clone();
+            (0..40)
+                .map(|y| {
+                    (0..120)
+                        .map(|x| buffer[(x, y)].symbol().to_string())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let on = render(900);
+        assert!(on.contains("Idle completion: after 15 min idle"), "{on}");
+        // Adding the row must not push the About block out of the popup.
+        assert!(on.contains("https://github.com/faulker/ccsm"), "{on}");
+
+        // "0" has to read as "off", not as "finish immediately".
+        let off = render(0);
+        assert!(off.contains("Idle completion: off (marker only)"), "{off}");
+    }
+
+    #[test]
+    fn idle_completion_row_commits_minutes_as_seconds() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let _guard = crate::config::test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("CCSM_CONFIG_DIR", dir.path());
+
+        let mut app = App::new(vec![], None, Config::default());
+        app.mode = AppMode::Config;
+        app.config_selected = IDLE_COMPLETE_ROW;
+        app.handle_config_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.config_editing);
+        // The field opens on the current value in minutes, not seconds.
+        assert_eq!(app.config_path_input.value(), "15");
+
+        app.config_path_input = tui_input::Input::from("30".to_string());
+        app.handle_config_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!app.config_editing);
+        assert_eq!(app.config.idle_complete_seconds, 1800);
+
+        // A value that does not parse is rejected and leaves the setting alone.
+        app.handle_config_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.config_path_input = tui_input::Input::from("soon".to_string());
+        app.handle_config_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.config.idle_complete_seconds, 1800);
+        assert!(app.status_error.is_some());
+
+        std::env::remove_var("CCSM_CONFIG_DIR");
+    }
+
+    #[test]
+    fn parse_minutes_accepts_numbers_and_the_off_words() {
+        assert_eq!(parse_minutes("30"), Some(30));
+        assert_eq!(parse_minutes(" 0 "), Some(0));
+        assert_eq!(parse_minutes("off"), Some(0));
+        assert_eq!(parse_minutes("Never"), Some(0));
+        // Empty falls back to the built-in default rather than disabling it.
+        assert_eq!(parse_minutes(""), Some(15));
+    }
+
+    #[test]
+    fn parse_minutes_rejects_junk_and_absurd_values() {
+        assert_eq!(parse_minutes("abc"), None);
+        assert_eq!(parse_minutes("-5"), None);
+        assert_eq!(parse_minutes("1.5"), None);
+        assert_eq!(parse_minutes(&(7 * 24 * 60 + 1).to_string()), None);
+        assert_eq!(parse_minutes(&(7 * 24 * 60).to_string()), Some(10_080));
     }
 
     #[test]

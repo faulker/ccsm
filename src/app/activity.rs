@@ -47,6 +47,35 @@ impl App {
         self.recompute_tree();
     }
 
+    /// Re-query tmux and reconcile `live_sessions` with what is actually running.
+    /// Returns true when the set changed (and the views were rebuilt).
+    ///
+    /// Sessions die outside the TUI's control: a pane exits on its own, or the
+    /// watch daemon stops a job it owns after `x` enqueues `StopJob`. Without a
+    /// periodic reconcile the list keeps showing them as running until the next
+    /// launch, which is what made `x` look like it did nothing.
+    pub fn poll_live_sessions(&mut self) -> bool {
+        let discovered = live::discover_live_sessions(self.config.tmux_bin());
+        if discovered == self.live_sessions {
+            return false;
+        }
+        self.live_sessions = discovered;
+        // Keep cached preview/activity data for sessions that survived; drop the rest.
+        let valid_names: HashSet<String> =
+            self.live_sessions.iter().map(|ls| ls.tmux_name.clone()).collect();
+        self.live_preview_cache.retain(|k, _| valid_names.contains(k));
+        self.activity_states.retain(|k, _| valid_names.contains(k));
+        self.activity_last_poll.retain(|k, _| valid_names.contains(k));
+        self.recompute_flat_rows();
+        self.recompute_tree();
+        // Rows disappeared under the cursor, so keep the highlight on a real row.
+        let visible = self.visible_item_count();
+        if visible > 0 && self.selected >= visible {
+            self.selected = visible - 1;
+        }
+        true
+    }
+
     /// Poll all live sessions for activity state, throttled to every ~3 seconds per session.
     /// For the currently selected session, reuses the preview cache content.
     /// Returns true if any session's activity state changed.

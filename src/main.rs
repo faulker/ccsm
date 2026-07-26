@@ -4,6 +4,7 @@ mod config_popup;
 mod data;
 mod keys;
 mod live;
+mod models;
 mod schedule;
 mod theme;
 mod ui;
@@ -48,6 +49,23 @@ fn restore_terminal() -> Result<()> {
     Ok(())
 }
 
+/// Build the argv for a brand-new claude session. The worktree name is given
+/// explicitly rather than relying on `-w`'s optional value, so the following
+/// `--name` is never parsed as the worktree's name.
+fn new_session_argv(claude: &str, name: &str, dangerous: bool, worktree: bool) -> Vec<String> {
+    let mut argv = vec![claude.to_string()];
+    if dangerous {
+        argv.push("--dangerously-skip-permissions".to_string());
+    }
+    if worktree {
+        argv.push("--worktree".to_string());
+        argv.push(name.to_string());
+    }
+    argv.push("--name".to_string());
+    argv.push(name.to_string());
+    argv
+}
+
 /// Run the main TUI event loop. Spawns a background update check, handles session
 /// launches and in-place binary updates, and returns `true` if the process should
 /// exec-restart itself (e.g. after a self-update).
@@ -73,7 +91,12 @@ fn run_app(
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|_| ".".to_string());
         let name = live::generate_auto_name(&cwd, &app.live_sessions);
-        app.launch_session = Some(app::LaunchRequest::NewLive { name, cwd });
+        app.launch_session = Some(app::LaunchRequest::NewLive {
+            name,
+            cwd,
+            dangerous: false,
+            worktree: false,
+        });
     }
 
     // Always spawn background update check (non-blocking)
@@ -90,6 +113,10 @@ fn run_app(
             let _ = config.mark_update_checked();
         });
     }
+
+    // Wall-clock throttle for reconciling the live-session list against tmux.
+    let mut last_live_poll = std::time::Instant::now();
+    const LIVE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1500);
 
     loop {
         app.tick = app.tick.wrapping_add(1);
@@ -115,6 +142,16 @@ fn run_app(
             let prev_pulse = ((app.tick.wrapping_sub(1)) / 2) % 2;
             let curr_pulse = (app.tick / 2) % 2;
             if activity_changed || prev_pulse != curr_pulse {
+                app.needs_redraw = true;
+            }
+        }
+
+        // Keep the live-session list honest: a session can end without the TUI
+        // doing anything (its pane exited, or the watch daemon stopped a job
+        // after `x`), and a row that still says "running" is the confusing case.
+        if last_live_poll.elapsed() >= LIVE_POLL_INTERVAL {
+            last_live_poll = std::time::Instant::now();
+            if app.poll_live_sessions() {
                 app.needs_redraw = true;
             }
         }
@@ -172,39 +209,46 @@ fn run_app(
             let cfg = config::Config::load();
             let tmux = cfg.tmux_bin().to_string();
             let claude = cfg.claude_bin().to_string();
-            match req {
-                app::LaunchRequest::Resume { session_id, cwd } => {
-                    let dir = if std::path::Path::new(&cwd).exists() { &cwd } else { "." };
-                    let live_sessions = live::discover_live_sessions(&tmux);
-                    let tmux_name = live::generate_auto_name(dir, &live_sessions);
-                    live::start_live_session(&tmux, &tmux_name, dir, &[&claude, "--resume", &session_id])?;
-                    live::attach_to_session(&tmux, &tmux_name)?;
+            // A launch failure (most often attaching to a session that died
+            // between selecting it and exiting the TUI) must not take the whole
+            // app down: report it in the status bar and stay in the TUI.
+            let outcome: anyhow::Result<()> = (|| {
+                match req {
+                    app::LaunchRequest::Resume { session_id, cwd } => {
+                        let dir = if std::path::Path::new(&cwd).exists() { &cwd } else { "." };
+                        let live_sessions = live::discover_live_sessions(&tmux);
+                        let tmux_name = live::generate_auto_name(dir, &live_sessions);
+                        live::start_live_session(&tmux, &tmux_name, dir, &[&claude, "--resume", &session_id])?;
+                        live::attach_to_session(&tmux, &tmux_name)?;
+                    }
+                    app::LaunchRequest::Direct { session_id, cwd } => {
+                        let dir = if std::path::Path::new(&cwd).exists() { &cwd } else { "." };
+                        std::process::Command::new(&claude)
+                            .arg("--resume")
+                            .arg(&session_id)
+                            .current_dir(dir)
+                            .status()?;
+                    }
+                    app::LaunchRequest::AttachLive { tmux_name } => {
+                        live::attach_to_session(&tmux, &tmux_name)?;
+                    }
+                    app::LaunchRequest::NewLive { name, cwd, dangerous, worktree } => {
+                        let argv = new_session_argv(&claude, &name, dangerous, worktree);
+                        let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
+                        live::start_live_session(&tmux, &name, &cwd, &argv_refs)?;
+                        live::attach_to_session(&tmux, &name)?;
+                    }
+                    app::LaunchRequest::NewDirect { cwd } => {
+                        let dir = if std::path::Path::new(&cwd).exists() { &cwd } else { "." };
+                        std::process::Command::new(&claude)
+                            .current_dir(dir)
+                            .status()?;
+                    }
                 }
-                app::LaunchRequest::Direct { session_id, cwd } => {
-                    let dir = if std::path::Path::new(&cwd).exists() { &cwd } else { "." };
-                    std::process::Command::new(&claude)
-                        .arg("--resume")
-                        .arg(&session_id)
-                        .current_dir(dir)
-                        .status()?;
-                }
-                app::LaunchRequest::AttachLive { tmux_name } => {
-                    live::attach_to_session(&tmux, &tmux_name)?;
-                }
-                app::LaunchRequest::NewLive { name, cwd } => {
-                    live::start_live_session(&tmux, &name, &cwd, &[&claude, "--name", &name])?;
-                    live::attach_to_session(&tmux, &name)?;
-                }
-                app::LaunchRequest::NewLiveDangerous { name, cwd } => {
-                    live::start_live_session(&tmux, &name, &cwd, &[&claude, "--dangerously-skip-permissions", "--name", &name])?;
-                    live::attach_to_session(&tmux, &name)?;
-                }
-                app::LaunchRequest::NewDirect { cwd } => {
-                    let dir = if std::path::Path::new(&cwd).exists() { &cwd } else { "." };
-                    std::process::Command::new(&claude)
-                        .current_dir(dir)
-                        .status()?;
-                }
+                Ok(())
+            })();
+            if let Err(e) = outcome {
+                app.status_error = Some(format!("{e:#}"));
             }
             // Reload sessions after returning from any launch
             if let Ok(sessions) = data::load_sessions(filter_path.as_deref()) {
@@ -328,4 +372,50 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::new_session_argv;
+
+    #[test]
+    fn plain_new_session_only_names_itself() {
+        assert_eq!(
+            new_session_argv("claude", "ccsm-A", false, false),
+            vec!["claude", "--name", "ccsm-A"]
+        );
+    }
+
+    #[test]
+    fn dangerous_new_session_skips_permissions() {
+        assert_eq!(
+            new_session_argv("claude", "ccsm-A", true, false),
+            vec!["claude", "--dangerously-skip-permissions", "--name", "ccsm-A"]
+        );
+    }
+
+    #[test]
+    fn worktree_new_session_names_the_worktree_explicitly() {
+        // The worktree name must be passed as its own argument: `-w` takes an
+        // optional value, so leaving it bare would swallow `--name`.
+        assert_eq!(
+            new_session_argv("claude", "ccsm-A", false, true),
+            vec!["claude", "--worktree", "ccsm-A", "--name", "ccsm-A"]
+        );
+    }
+
+    #[test]
+    fn worktree_and_dangerous_compose() {
+        assert_eq!(
+            new_session_argv("/opt/claude", "x", true, true),
+            vec![
+                "/opt/claude",
+                "--dangerously-skip-permissions",
+                "--worktree",
+                "x",
+                "--name",
+                "x"
+            ]
+        );
+    }
 }

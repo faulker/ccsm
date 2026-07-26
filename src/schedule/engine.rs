@@ -24,6 +24,11 @@ pub struct EngineInputs<'a> {
     pub live: &'a HashSet<String>,
     /// Activity state of each live tmux session, keyed by tmux name.
     pub activity: &'a HashMap<String, ActivityState>,
+    /// Ids of jobs whose session transcript reports the completion marker.
+    pub completed: &'a HashSet<String>,
+    /// Epoch ms at which each job's pane was first seen idle in its current
+    /// idle stretch, keyed by job id. Absent means the job is not idle.
+    pub idle_since: &'a HashMap<String, i64>,
     /// The active configuration.
     pub cfg: &'a Config,
 }
@@ -88,6 +93,14 @@ pub enum Action {
         /// Reason recorded in the job's history.
         reason: String,
     },
+    /// Record that a job's work is finished. The daemon stops its tmux session
+    /// and moves it to `Done`, after which nothing ever dispatches it again.
+    MarkDone {
+        /// Job being completed.
+        job_id: String,
+        /// Reason recorded in the job's history.
+        reason: String,
+    },
 }
 
 /// Compute the effective usage percentage to act on: the 5-hour window, and
@@ -109,9 +122,10 @@ fn effective_pct(usage: &UsageSnapshot, watch_seven_day: bool) -> Option<f64> {
 
 /// Decide what actions to take for the given jobs, given the current usage
 /// sample, tmux state, and config. Pure: performs no I/O and has no side
-/// effects. `Done`, `Failed`, `Blocked`, `Starting`, `Pausing`, and
-/// `Resuming` jobs are never acted on here; the daemon drives those through
-/// observation, not planning.
+/// effects. `Done` and `Failed` jobs are never acted on at all. `Blocked`,
+/// `Starting`, `Pausing`, and `Resuming` jobs are driven by the daemon
+/// through observation rather than planning, and are only touched here to
+/// record a completion that has already been reported.
 pub fn plan(jobs: &[Job], inputs: &EngineInputs) -> Vec<Action> {
     let mut actions = Vec::new();
 
@@ -138,6 +152,23 @@ pub fn plan(jobs: &[Job], inputs: &EngineInputs) -> Vec<Action> {
     };
 
     for job in jobs {
+        // Completion outranks every other transition. A job that has reported
+        // its work finished must not be dispatched, resumed, or relaunched
+        // again, and checking it here rather than inside a single state arm is
+        // what closes the loop: the marker usually lands while the job is
+        // Running, but the session often ends on its own straight afterwards,
+        // and a `Stopped` job with auto-resume on would otherwise be relaunched
+        // forever against work that is already done.
+        if !matches!(job.state, JobState::Done | JobState::Failed)
+            && inputs.completed.contains(&job.id)
+        {
+            actions.push(Action::MarkDone {
+                job_id: job.id.clone(),
+                reason: format!("session reported {}", completion::COMPLETION_MARKER),
+            });
+            continue;
+        }
+
         match job.state {
             JobState::Queued => {
                 if let Some(pct) = pause_pct {
@@ -163,6 +194,15 @@ pub fn plan(jobs: &[Job], inputs: &EngineInputs) -> Vec<Action> {
                     actions.push(Action::MarkStopped {
                         job_id: job.id.clone(),
                         reason: "tmux session no longer exists".to_string(),
+                    });
+                    continue;
+                }
+                // Checked before the pause decision: pausing a job that has
+                // already stopped working just to resume it later is churn.
+                if let Some(reason) = idle_completion_reason(job, inputs) {
+                    actions.push(Action::MarkDone {
+                        job_id: job.id.clone(),
+                        reason,
                     });
                     continue;
                 }
@@ -220,10 +260,7 @@ pub fn plan(jobs: &[Job], inputs: &EngineInputs) -> Vec<Action> {
                     .unwrap_or(false)
                     && !still_exhausted;
                 if below_threshold || time_elapsed {
-                    let text = job
-                        .continue_prompt
-                        .clone()
-                        .unwrap_or_else(|| inputs.cfg.continue_prompt.clone());
+                    let text = continuation_text(job, inputs.cfg);
                     actions.push(Action::Resume {
                         job_id: job.id.clone(),
                         text,
@@ -268,10 +305,62 @@ pub fn plan(jobs: &[Job], inputs: &EngineInputs) -> Vec<Action> {
     actions
 }
 
+/// Reason to mark a running job done because its pane has been idle for
+/// longer than `idle_complete_seconds`, or `None` when it has not.
+///
+/// This is the backstop for an agent that finishes its work but never emits
+/// the completion marker (it forgot, or the job was adopted from a session
+/// that was never told the protocol). Without it such a job sits `Running`
+/// forever and every pause/resume cycle keeps poking at finished work.
+/// A pane showing a permission prompt reads as `Waiting`, not `Idle`, so it is
+/// never swept up by this.
+fn idle_completion_reason(job: &Job, inputs: &EngineInputs) -> Option<String> {
+    let limit_ms = (inputs.cfg.idle_complete_seconds as i64).saturating_mul(1000);
+    if limit_ms <= 0 {
+        return None;
+    }
+    let since = *inputs.idle_since.get(&job.id)?;
+    let elapsed_ms = inputs.now_ms - since;
+    if elapsed_ms < limit_ms {
+        return None;
+    }
+    Some(format!(
+        "idle for {} with no completion marker",
+        format_minutes(elapsed_ms)
+    ))
+}
+
+/// Render a duration in whole minutes (`"18m"`), or hours and minutes past an
+/// hour (`"1h20m"`), for job history reasons.
+fn format_minutes(ms: i64) -> String {
+    let total = (ms / 60_000).max(0);
+    let (hours, minutes) = (total / 60, total % 60);
+    if hours > 0 {
+        format!("{hours}h{minutes}m")
+    } else {
+        format!("{minutes}m")
+    }
+}
+
+/// The text to paste into a session to continue it: the job's continue prompt
+/// (or the config default when it has none) with the completion protocol
+/// appended. Every prompt the daemon sends carries the protocol, so a job that
+/// was resumed or relaunched still knows how to report that it is finished.
+pub fn continuation_text(job: &Job, cfg: &Config) -> String {
+    let base = job
+        .continue_prompt
+        .clone()
+        .unwrap_or_else(|| cfg.continue_prompt.clone());
+    completion::with_completion_protocol(&base)
+}
+
 /// Build the argv to start a brand-new claude session for `job`. Element 0
 /// is the claude binary. A tmux probe confirmed `new-session` execvp's its
 /// argv directly (no shell), so a prompt containing spaces, quotes,
 /// `$(...)`, or backticks is safe as a single trailing argv element.
+///
+/// The completion protocol rides `--append-system-prompt`, so it reaches the
+/// agent even when the job's prompt is a slash command.
 pub fn build_start_argv(claude_bin: &str, job: &Job) -> Vec<String> {
     let mut argv = vec![
         claude_bin.to_string(),
@@ -280,6 +369,7 @@ pub fn build_start_argv(claude_bin: &str, job: &Job) -> Vec<String> {
         "--name".to_string(),
         job.name.clone(),
     ];
+    argv.extend(completion::system_prompt_args());
     if let Some(model) = &job.model {
         argv.push("--model".to_string());
         argv.push(model.clone());
@@ -288,7 +378,7 @@ pub fn build_start_argv(claude_bin: &str, job: &Job) -> Vec<String> {
         argv.push("--dangerously-skip-permissions".to_string());
     }
     if !job.prompt.is_empty() {
-        argv.push(job.prompt.clone());
+        argv.push(completion::with_completion_protocol(&job.prompt));
     }
     argv
 }
@@ -309,6 +399,7 @@ pub fn build_resume_argv(claude_bin: &str, job: &Job) -> Vec<String> {
         }
         _ => vec![claude_bin.to_string(), "--continue".to_string()],
     };
+    argv.extend(completion::system_prompt_args());
     if let Some(model) = &job.model {
         argv.push("--model".to_string());
         argv.push(model.clone());

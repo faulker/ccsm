@@ -146,6 +146,24 @@ impl App {
         self.main_tab = MainTab::Jobs;
     }
 
+    /// Move the job form's model selection one step through the discovered
+    /// list, wrapping at both ends. A hand-typed id that is not in the list
+    /// counts as position 0, so cycling from it lands on the neighbours of the
+    /// "(claude default)" entry rather than doing nothing.
+    pub fn cycle_job_form_model(&mut self, forward: bool) {
+        if self.model_options.is_empty() {
+            return;
+        }
+        let len = self.model_options.len();
+        let current = crate::models::index_of(&self.model_options, &self.job_form_model);
+        let next = if forward {
+            (current + 1) % len
+        } else {
+            (current + len - 1) % len
+        };
+        self.job_form_model = self.model_options[next].value.clone();
+    }
+
     /// Open the directory picker for the job form's working-directory field.
     pub fn browse_job_cwd(&mut self) {
         let current = self.job_form_cwd.clone();
@@ -345,12 +363,14 @@ impl App {
         }
     }
 
-    /// Enqueue the confirmed action (`StopJob` or `DeleteJob`) and return to `Jobs`.
+    /// Enqueue the confirmed action (`StopJob`, `DeleteJob`, or `MarkDone`) and
+    /// return to `Jobs`.
     pub fn confirm_job_action(&mut self) {
         if let Some((id, action)) = self.jobs_confirm.take() {
             match action {
                 JobConfirmAction::Stop => self.enqueue_command(Command::StopJob { id }),
                 JobConfirmAction::Delete => self.enqueue_command(Command::DeleteJob { id }),
+                JobConfirmAction::Done => self.enqueue_command(Command::MarkDone { id }),
             }
         }
         self.return_to_jobs_tab();
@@ -373,6 +393,20 @@ impl App {
         let session = &self.live_sessions[idx];
         if let Some(job_id) = session.job_id.clone() {
             self.enqueue_command(Command::StopJob { id: job_id });
+            // With autostart off the daemon may never drain this command, and
+            // the session would sit there looking alive with no explanation.
+            // Only check in that case: with autostart on we just started the
+            // daemon and its heartbeat has not landed yet, so `is_running`
+            // would report a false negative.
+            if !self.config.watch_autostart {
+                self.watch_running = crate::watch::is_running(self.config.tmux_bin());
+                if !self.watch_running {
+                    self.status_error = Some(
+                        "Watcher not running: stop is queued until it starts (s on the Jobs tab)"
+                            .to_string(),
+                    );
+                }
+            }
             return;
         }
         let name = session.tmux_name.clone();

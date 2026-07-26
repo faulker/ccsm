@@ -222,6 +222,8 @@ pub fn run() -> Result<()> {
     // call this tick has fresh inputs rather than empty defaults.
     reconcile(&mut schedule, &tmux, now_ms(), &mut transients);
     let mut activity = poll_activity(&tmux, &schedule);
+    let mut completed = poll_completion(&schedule);
+    update_idle_tracking(&mut transients, &schedule, &activity, now_ms());
 
     loop {
         let tick_start = Instant::now();
@@ -265,6 +267,11 @@ pub fn run() -> Result<()> {
 
         if last_activity_poll.elapsed() >= Duration::from_secs(5) {
             activity = poll_activity(&tmux, &schedule);
+            // Completion shares the activity cadence: both read per-job state
+            // that only changes on the scale of seconds, and reading every
+            // transcript tail once a second would be pure waste.
+            completed = poll_completion(&schedule);
+            update_idle_tracking(&mut transients, &schedule, &activity, now_ms());
             last_activity_poll = Instant::now();
         }
 
@@ -313,6 +320,8 @@ pub fn run() -> Result<()> {
             last_known_pct,
             live: &live_set,
             activity: &activity,
+            completed: &completed,
+            idle_since: &transients.idle_since_ms,
             cfg: &cfg,
         };
         let actions = engine::plan(&schedule.jobs, &inputs);
@@ -402,6 +411,10 @@ struct Transients {
     resuming_since_ms: HashMap<String, i64>,
     /// Epoch ms when session-id discovery retries began for an adopted job.
     session_discover_since_ms: HashMap<String, i64>,
+    /// Epoch ms when a running job's pane was first seen idle in its current
+    /// idle stretch. Removed the moment it looks busy again, so the value is
+    /// always the start of an unbroken run of idleness.
+    idle_since_ms: HashMap<String, i64>,
 }
 
 impl Transients {
@@ -411,6 +424,7 @@ impl Transients {
         self.clear_pausing(job_id);
         self.resuming_since_ms.remove(job_id);
         self.session_discover_since_ms.remove(job_id);
+        self.idle_since_ms.remove(job_id);
     }
 
     /// Clear only the pausing-escalation state for a job, e.g. once its pause
@@ -486,10 +500,7 @@ fn apply_command(
                 ));
                 return;
             }
-            let text = job
-                .continue_prompt
-                .clone()
-                .unwrap_or_else(|| cfg.continue_prompt.clone());
+            let text = engine::continuation_text(job, cfg);
             execute_action(
                 tmux,
                 schedule,
@@ -518,14 +529,24 @@ fn apply_command(
             transients.clear_job(&id);
         }
         Command::MarkDone { id } => {
-            if let Some(job) = schedule.find_mut(&id) {
-                let job_name = job.name.clone();
-                let from = job.state;
-                let reason = "marked done by user".to_string();
-                log(&format_transition(&job_name, &id, from, JobState::Done, &reason));
-                job.transition(JobState::Done, reason, now_ms);
+            if schedule.find(&id).is_none() {
+                log(&format!("mark-done for unknown job {id} ignored"));
+                return;
             }
-            transients.clear_job(&id);
+            // Same path as a self-reported completion, so a job the user
+            // finishes by hand also gets its session stopped.
+            execute_action(
+                tmux,
+                schedule,
+                Action::MarkDone {
+                    job_id: id,
+                    reason: "marked done by user".to_string(),
+                },
+                cfg,
+                now_ms,
+                transients,
+                None,
+            );
         }
         Command::AdoptLive { id, tmux_name } => {
             if let Some(job) = schedule.find_mut(&id) {
@@ -661,6 +682,54 @@ fn poll_activity(tmux: &str, schedule: &Schedule) -> HashMap<String, ActivitySta
         }
     }
     map
+}
+
+/// Record how long each running job has looked idle, so `engine::plan` can
+/// apply the idle-completion fallback without doing any I/O of its own. A job
+/// that is not `Running`, or whose pane looks busy or is waiting on a prompt,
+/// has its entry cleared: the timer measures one unbroken idle stretch, never
+/// a total across interruptions.
+fn update_idle_tracking(
+    transients: &mut Transients,
+    schedule: &Schedule,
+    activity: &HashMap<String, ActivityState>,
+    now_ms: i64,
+) {
+    for job in &schedule.jobs {
+        let idle = job.state == JobState::Running
+            && job
+                .tmux_name
+                .as_ref()
+                .and_then(|name| activity.get(name))
+                .copied()
+                == Some(ActivityState::Idle);
+        if idle {
+            transients.idle_since_ms.entry(job.id.clone()).or_insert(now_ms);
+        } else {
+            transients.idle_since_ms.remove(&job.id);
+        }
+    }
+}
+
+/// Ids of jobs whose session transcript reports the completion marker.
+///
+/// `Queued` jobs are skipped because they have no session yet, and `Done`/
+/// `Failed` jobs because nothing would act on the answer; everything else is
+/// checked, including `Stopped`, since a job that finishes its work and then
+/// exits is exactly the case that used to relaunch forever.
+fn poll_completion(schedule: &Schedule) -> HashSet<String> {
+    schedule
+        .jobs
+        .iter()
+        .filter(|job| {
+            !matches!(
+                job.state,
+                JobState::Queued | JobState::Done | JobState::Failed
+            )
+        })
+        .filter(|job| schedule::completion::job_completed(job))
+        .map(|job| job.id.clone())
+        .collect()
 }
 
 // --- Action execution ----------------------------------------------------
@@ -844,6 +913,27 @@ fn execute_action(
             }
             transients.clear_job(&job_id);
         }
+        Action::MarkDone { job_id, reason } => {
+            // Stop the session before recording the state, so the tmux name a
+            // Done job keeps is only ever a record of where it ran. Leaving it
+            // alive would keep an idle claude sitting in the live list and keep
+            // the daemon polling a pane that has nothing left to say.
+            if let Some(name) = schedule.find(&job_id).and_then(|j| j.tmux_name.clone()) {
+                if let Err(e) = live::stop_live_session(tmux, &name) {
+                    log(&format!(
+                        "job {job_id} completed but its session '{name}' could not be stopped: {e:#}"
+                    ));
+                }
+            }
+            if let Some(job) = schedule.find_mut(&job_id) {
+                let job_name = job.name.clone();
+                let from = job.state;
+                job.resume_after_ms = None;
+                log(&format_transition(&job_name, &job_id, from, JobState::Done, &reason));
+                job.transition(JobState::Done, reason, now_ms);
+            }
+            transients.clear_job(&job_id);
+        }
     }
 }
 
@@ -903,10 +993,7 @@ fn observe_relaunch(tmux: &str, schedule: &mut Schedule, job_id: &str, cfg: &Con
     }
 
     let text = match schedule.find(job_id) {
-        Some(job) => job
-            .continue_prompt
-            .clone()
-            .unwrap_or_else(|| cfg.continue_prompt.clone()),
+        Some(job) => engine::continuation_text(job, cfg),
         None => return,
     };
 
@@ -1453,6 +1540,72 @@ mod tests {
         assert_eq!(aged_back.age_seconds, Some(0));
 
         assert!(aged_usage(None, 0, 1000).is_none());
+    }
+
+    /// A schedule holding exactly the given jobs.
+    fn schedule_of(jobs: Vec<Job>) -> Schedule {
+        Schedule { version: 1, jobs }
+    }
+
+    #[test]
+    fn idle_tracking_starts_the_clock_and_keeps_the_first_timestamp() {
+        let mut transients = Transients::default();
+        let schedule = schedule_of(vec![base_job("a", JobState::Running)]);
+        let activity = HashMap::from([("test".to_string(), ActivityState::Idle)]);
+
+        update_idle_tracking(&mut transients, &schedule, &activity, 1_000);
+        assert_eq!(transients.idle_since_ms.get("a"), Some(&1_000));
+
+        // Still idle later: the clock measures the whole stretch, so the
+        // original timestamp must survive rather than being pushed forward.
+        update_idle_tracking(&mut transients, &schedule, &activity, 9_000);
+        assert_eq!(transients.idle_since_ms.get("a"), Some(&1_000));
+    }
+
+    #[test]
+    fn idle_tracking_resets_when_the_job_looks_busy_again() {
+        let mut transients = Transients::default();
+        let schedule = schedule_of(vec![base_job("a", JobState::Running)]);
+
+        let idle = HashMap::from([("test".to_string(), ActivityState::Idle)]);
+        update_idle_tracking(&mut transients, &schedule, &idle, 1_000);
+        assert!(transients.idle_since_ms.contains_key("a"));
+
+        for state in [ActivityState::Active, ActivityState::Waiting, ActivityState::Unknown] {
+            update_idle_tracking(&mut transients, &schedule, &idle, 2_000);
+            let busy = HashMap::from([("test".to_string(), state)]);
+            update_idle_tracking(&mut transients, &schedule, &busy, 3_000);
+            assert!(
+                !transients.idle_since_ms.contains_key("a"),
+                "{state:?} should clear the idle clock"
+            );
+        }
+    }
+
+    #[test]
+    fn idle_tracking_only_applies_to_running_jobs() {
+        // A paused job sits idle for hours by design; only Running jobs are
+        // candidates for idle completion.
+        let activity = HashMap::from([("test".to_string(), ActivityState::Idle)]);
+        for state in [
+            JobState::Queued,
+            JobState::Starting,
+            JobState::Pausing,
+            JobState::Paused,
+            JobState::Resuming,
+            JobState::Stopped,
+            JobState::Blocked,
+            JobState::Done,
+            JobState::Failed,
+        ] {
+            let mut transients = Transients::default();
+            let schedule = schedule_of(vec![base_job("a", state)]);
+            update_idle_tracking(&mut transients, &schedule, &activity, 1_000);
+            assert!(
+                !transients.idle_since_ms.contains_key("a"),
+                "{state:?} should not accrue idle time"
+            );
+        }
     }
 
     #[test]

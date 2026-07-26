@@ -15,6 +15,7 @@ pub const TMUX_SOCKET: &str = "ccsm";
 pub const WATCH_SESSION: &str = "ccsm-watch";
 
 /// A running tmux session managed by ccsm on the dedicated `ccsm` tmux socket.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveSession {
     /// The tmux session name used to target it in tmux commands.
     pub tmux_name: String,
@@ -443,6 +444,22 @@ pub(crate) fn sanitize_session_name(name: &str) -> String {
     } else {
         trimmed.to_string()
     }
+}
+
+/// True when `dir` is inside a git working tree. Used to reject `--worktree`
+/// launches up front, since claude would otherwise fail inside a tmux session
+/// the user has to attach to before seeing the error.
+pub fn is_git_repo(dir: &str) -> bool {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .arg("rev-parse")
+        .arg("--is-inside-work-tree")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 pub fn generate_auto_name(cwd: &str, existing: &[LiveSession]) -> String {
@@ -916,6 +933,19 @@ pub fn detect_interrupted(content: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_git_repo_distinguishes_repos_from_plain_directories() {
+        // The crate root is a repo; a fresh temp dir is not.
+        assert!(is_git_repo(env!("CARGO_MANIFEST_DIR")));
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!is_git_repo(&dir.path().to_string_lossy()));
+    }
+
+    #[test]
+    fn is_git_repo_is_false_for_a_missing_directory() {
+        assert!(!is_git_repo("/nonexistent/path/for/ccsm/tests"));
+    }
 
     #[test]
     fn sanitize_session_name_strips_leading_dot() {

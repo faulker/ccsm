@@ -3,12 +3,15 @@
 //! threshold, and resumes them when the usage window resets. This module
 //! defines the persisted job model (`Job`/`Schedule`), the on-disk store
 //! (`store`), the command queue used by the TUI to talk to the daemon
-//! (`command`), and the pure decision engine (`engine`).
+//! (`command`), the completion protocol that tells the daemon when a job's
+//! work is actually finished (`completion`), and the pure decision engine
+//! (`engine`).
 
 use crate::config::PauseMode;
 use serde::{Deserialize, Serialize};
 
 pub mod command;
+pub mod completion;
 pub mod engine;
 pub mod store;
 

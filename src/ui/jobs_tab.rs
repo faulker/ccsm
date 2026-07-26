@@ -5,7 +5,7 @@
 //! Mirrors `config_popup.rs`'s shape of holding both the `impl App` key
 //! handlers and the draw functions in one file.
 
-use crate::app::{App, AppMode, JobConfirmAction, LaunchRequest, MainTab};
+use crate::app::{App, AppMode, JobConfirmAction, MainTab};
 use crate::config::PauseMode;
 use crate::keys::normalize_key;
 use crate::schedule::{Job, JobState};
@@ -30,6 +30,10 @@ const JOB_FORM_MAX_ROW: usize = 8;
 
 /// Job-form row index of the working-directory field, which is browsable.
 const JOB_FORM_CWD_ROW: usize = 1;
+
+/// Job-form row index of the model field, which cycles a discovered list
+/// instead of being typed (though `i` still types a custom id).
+const JOB_FORM_MODEL_ROW: usize = 4;
 
 impl App {
     /// Handle a key event while the Jobs tab has focus (Normal mode).
@@ -56,8 +60,14 @@ impl App {
             (KeyCode::Char('j'), _) | (KeyCode::Down, _) => self.jobs_move_down(),
             (KeyCode::Char('k'), _) | (KeyCode::Up, _) => self.jobs_move_up(),
             (KeyCode::Enter, _) => {
-                if let Some(tmux_name) = self.selected_job().and_then(|j| j.tmux_name.clone()) {
-                    self.launch_session = Some(LaunchRequest::AttachLive { tmux_name });
+                match self.selected_job().and_then(|j| j.tmux_name.clone()) {
+                    Some(tmux_name) => self.request_attach(tmux_name),
+                    None => {
+                        if self.selected_job().is_some() {
+                            self.status_error =
+                                Some("This job has no session to attach to".to_string());
+                        }
+                    }
                 }
             }
             (KeyCode::Char('n'), _) => {
@@ -74,12 +84,11 @@ impl App {
             (KeyCode::Char('c'), _) => self.resume_selected_job(),
             (KeyCode::Char('x'), _) => self.open_job_confirm(JobConfirmAction::Stop),
             (KeyCode::Char('d'), _) => self.open_job_confirm(JobConfirmAction::Delete),
+            (KeyCode::Char('f'), _) => self.open_job_confirm(JobConfirmAction::Done),
             (KeyCode::Char(' '), _) => self.toggle_selected_job_auto_resume(),
             (KeyCode::Char('s'), _) => self.toggle_watcher(),
             (KeyCode::Char('L'), _) => {
-                self.launch_session = Some(LaunchRequest::AttachLive {
-                    tmux_name: "ccsm-watch".to_string(),
-                });
+                self.request_attach(crate::live::WATCH_SESSION.to_string());
             }
             _ => {}
         }
@@ -140,13 +149,12 @@ impl App {
             }
             KeyCode::Enter => match self.job_form_field {
                 JOB_FORM_CWD_ROW => self.browse_job_cwd(),
-                0 | 2..=4 => {
+                JOB_FORM_MODEL_ROW => self.cycle_job_form_model(true),
+                0 | 2 | 3 => {
                     let current = match self.job_form_field {
                         0 => self.job_form_name.clone(),
                         2 => self.job_form_prompt.clone(),
-                        3 => self.job_form_continue_prompt.clone(),
-                        4 => self.job_form_model.clone(),
-                        _ => unreachable!(),
+                        _ => self.job_form_continue_prompt.clone(),
                     };
                     self.job_form_input = tui_input::Input::from(current);
                     self.job_form_editing = true;
@@ -162,12 +170,25 @@ impl App {
                 8 => self.submit_job_form(),
                 _ => {}
             },
+            // Left/right also cycle the model list, since it is a list and not a toggle.
+            KeyCode::Left if self.job_form_field == JOB_FORM_MODEL_ROW => {
+                self.cycle_job_form_model(false);
+            }
+            KeyCode::Right if self.job_form_field == JOB_FORM_MODEL_ROW => {
+                self.cycle_job_form_model(true);
+            }
             KeyCode::Char('i') if self.job_form_field == JOB_FORM_CWD_ROW => {
                 // Type the directory by hand instead of browsing for it.
                 self.job_form_input = tui_input::Input::from(self.job_form_cwd.clone());
                 self.job_form_editing = true;
             }
+            KeyCode::Char('i') if self.job_form_field == JOB_FORM_MODEL_ROW => {
+                // Type a model id the discovery pass has not seen yet.
+                self.job_form_input = tui_input::Input::from(self.job_form_model.clone());
+                self.job_form_editing = true;
+            }
             KeyCode::Char(' ') => match self.job_form_field {
+                JOB_FORM_MODEL_ROW => self.cycle_job_form_model(true),
                 5 => self.job_form_dangerous = !self.job_form_dangerous,
                 7 => self.job_form_auto_resume = !self.job_form_auto_resume,
                 _ => {}
@@ -400,7 +421,7 @@ fn draw_job_detail(frame: &mut Frame, app: &App, area: Rect) {
         .style(Style::default().bg(BG_SURFACE));
 
     let content: Vec<Line> = match app.selected_job() {
-        Some(job) => job_detail_lines(job),
+        Some(job) => job_detail_lines(job, app),
         None => vec![
             Line::from(""),
             Line::from(Span::styled(
@@ -442,8 +463,24 @@ fn format_eta(at_ms: i64, now: i64) -> String {
     }
 }
 
-/// Build the detail-pane lines for one job.
-fn job_detail_lines(job: &Job) -> Vec<Line<'static>> {
+/// Describe how a job will finish by itself, so it is obvious from the detail
+/// pane that a dispatched job has an end condition at all, and which one.
+/// A finished job states the outcome instead of the condition.
+fn completion_summary(job: &Job, app: &App) -> String {
+    if job.state == JobState::Done {
+        return "finished".to_string();
+    }
+    let marker = crate::schedule::completion::COMPLETION_MARKER;
+    match app.config.idle_complete_seconds {
+        0 => format!("{marker} from the agent"),
+        seconds => format!("{marker}, or {} min idle", seconds / 60),
+    }
+}
+
+/// Build the detail-pane lines for one job. Fields the job leaves unset are
+/// shown as the value that will actually be used, not as "(default)", so the
+/// pane never hides what the watcher is going to send.
+fn job_detail_lines(job: &Job, app: &App) -> Vec<Line<'static>> {
     let label = Style::default().fg(FG_SUBTEXT);
     let value = Style::default().fg(FG_TEXT);
     let header = Style::default().fg(ACCENT_MAUVE).add_modifier(Modifier::BOLD);
@@ -463,11 +500,16 @@ fn job_detail_lines(job: &Job) -> Vec<Line<'static>> {
     ));
     lines.push(field(
         "Continue prompt",
-        job.continue_prompt.clone().unwrap_or_else(|| "(default)".to_string()),
+        job.continue_prompt
+            .clone()
+            .unwrap_or_else(|| format!("(default) {}", app.config.continue_prompt)),
     ));
     lines.push(field(
         "Model",
-        job.model.clone().unwrap_or_else(|| "(claude default)".to_string()),
+        match &job.model {
+            Some(model) => crate::models::label_for(&app.model_options, model),
+            None => "(claude default)".to_string(),
+        },
     ));
     lines.push(field("Pause mode", job.pause_mode.label().to_string()));
     lines.push(field(
@@ -477,6 +519,10 @@ fn job_detail_lines(job: &Job) -> Vec<Line<'static>> {
     lines.push(field(
         "Skip permissions",
         if job.dangerous { "yes".to_string() } else { "no".to_string() },
+    ));
+    lines.push(field(
+        "Completes on",
+        completion_summary(job, app),
     ));
     lines.push(field(
         "tmux session",
@@ -533,9 +579,81 @@ fn job_detail_lines(job: &Job) -> Vec<Line<'static>> {
     lines
 }
 
+/// Explain what the highlighted job-form row controls.
+///
+/// The scheduler's options (pause modes, auto-resume, the continue prompt, the
+/// model list) are not self-evident from their labels, and the form is where
+/// they get chosen, so the explanation lives next to them rather than only in
+/// the help overlay.
+fn job_form_field_help(app: &App) -> Vec<Line<'static>> {
+    let body = Style::default().fg(FG_SUBTEXT);
+    let strong = Style::default().fg(FG_TEXT);
+    let line = |text: String| Line::from(Span::styled(format!("  {text}"), body));
+
+    match app.job_form_field {
+        0 => vec![
+            Line::from(Span::styled("  Name", strong)),
+            line("Label for the job, and the tmux session name it runs under.".to_string()),
+            line("Dots, colons and spaces become dashes.".to_string()),
+        ],
+        JOB_FORM_CWD_ROW => vec![
+            Line::from(Span::styled("  Directory", strong)),
+            line("Working directory claude starts in. Must already exist.".to_string()),
+            line("Also decides which project the session is filed under.".to_string()),
+        ],
+        2 => vec![
+            Line::from(Span::styled("  Prompt", strong)),
+            line("First message sent when the job is dispatched.".to_string()),
+            line("Leave empty to start the session at an idle prompt.".to_string()),
+        ],
+        3 => vec![
+            Line::from(Span::styled("  Continue prompt", strong)),
+            line("Pasted into the session to wake it after a pause.".to_string()),
+            line(format!("Empty uses the default: \"{}\"", app.config.continue_prompt)),
+        ],
+        JOB_FORM_MODEL_ROW => {
+            let description = app
+                .model_options
+                .iter()
+                .find(|o| o.value == app.job_form_model)
+                .map(|o| o.description.clone())
+                .unwrap_or_else(|| "Custom id, passed to --model as typed.".to_string());
+            vec![
+                Line::from(Span::styled("  Model", strong)),
+                line(description),
+                line("Enter/space/←/→ cycle the list, i types an id by hand.".to_string()),
+            ]
+        }
+        5 => vec![
+            Line::from(Span::styled("  Skip permissions", strong)),
+            line("Runs claude with --dangerously-skip-permissions.".to_string()),
+            line("Unattended jobs stall on permission prompts without it.".to_string()),
+        ],
+        6 => vec![
+            Line::from(Span::styled("  Pause mode", strong)),
+            line("Soft: send Escape and leave the session sitting at its prompt.".to_string()),
+            line("Hard: kill the tmux session, relaunch later with --resume.".to_string()),
+        ],
+        7 => vec![
+            Line::from(Span::styled("  Auto-resume", strong)),
+            line("On: the watcher restarts the job when usage drops or it dies.".to_string()),
+            line("Off: it stays paused or stopped until you resume it yourself.".to_string()),
+        ],
+        _ => vec![
+            Line::from(Span::styled("  Ready", strong)),
+            line("The watcher dispatches the job once usage is below the pause".to_string()),
+            line("threshold. Nothing runs while the watcher is stopped.".to_string()),
+        ],
+    }
+}
+
 /// Render the job create/edit form.
 pub(crate) fn draw_job_form_popup(frame: &mut Frame, app: &App) {
-    let area = centered_rect(60, 70, frame.area());
+    // Sized to its content (9 rows, the action, the field explanation, and the
+    // key hint) rather than to a percentage, so the box does not trail blank
+    // space on a tall terminal.
+    let area = centered_rect(64, 84, frame.area());
+    let area = Rect { height: 21.min(area.height), ..area };
     frame.render_widget(Clear, area);
 
     let selected = app.job_form_field;
@@ -554,8 +672,10 @@ pub(crate) fn draw_job_form_popup(frame: &mut Frame, app: &App) {
     };
 
     // One text field row: renders the live input (with a real cursor) while
-    // this field is being edited, otherwise its stored value.
-    let text_row = |idx: usize, name: &str, value: &str| -> Line<'static> {
+    // this field is being edited, otherwise its stored value. An empty field
+    // shows `empty_label`, which is where an inherited default gets surfaced
+    // instead of the field reading as if nothing will be sent at all.
+    let text_row = |idx: usize, name: &str, value: &str, empty_label: &str| -> Line<'static> {
         let style = row_style(idx);
         let mut spans = vec![Span::styled(
             format!("{}{}: ", marker(idx), name),
@@ -564,7 +684,7 @@ pub(crate) fn draw_job_form_popup(frame: &mut Frame, app: &App) {
         if app.job_form_editing && selected == idx {
             spans.extend(input_spans(&app.job_form_input, style));
         } else if value.is_empty() {
-            spans.push(Span::styled("(empty)".to_string(), style));
+            spans.push(Span::styled(empty_label.to_string(), style.fg(FG_OVERLAY)));
         } else {
             spans.push(Span::styled(value.to_string(), style));
         }
@@ -577,11 +697,37 @@ pub(crate) fn draw_job_form_popup(frame: &mut Frame, app: &App) {
 
     let mut content: Vec<Line> = Vec::new();
     content.push(Line::from(""));
-    content.push(text_row(0, "Name", &app.job_form_name));
-    content.push(text_row(1, "Directory", &app.job_form_cwd));
-    content.push(text_row(2, "Prompt", &app.job_form_prompt));
-    content.push(text_row(3, "Continue prompt", &app.job_form_continue_prompt));
-    content.push(text_row(4, "Model", &app.job_form_model));
+    content.push(text_row(0, "Name", &app.job_form_name, "(required)"));
+    content.push(text_row(1, "Directory", &app.job_form_cwd, "(required)"));
+    content.push(text_row(2, "Prompt", &app.job_form_prompt, "(none)"));
+    content.push(text_row(
+        3,
+        "Continue prompt",
+        &app.job_form_continue_prompt,
+        &format!("(default) {}", app.config.continue_prompt),
+    ));
+    // The model row is a picker, not a text field, except while `i` is typing
+    // a custom id into it.
+    if app.job_form_editing && selected == JOB_FORM_MODEL_ROW {
+        content.push(text_row(JOB_FORM_MODEL_ROW, "Model", &app.job_form_model, ""));
+    } else {
+        let known = app
+            .model_options
+            .iter()
+            .position(|o| o.value == app.job_form_model);
+        let counter = match known {
+            Some(idx) => format!("({}/{})", idx + 1, app.model_options.len()),
+            None => "(custom)".to_string(),
+        };
+        content.push(plain_row(
+            JOB_FORM_MODEL_ROW,
+            format!(
+                "Model: {}   {}",
+                crate::models::label_for(&app.model_options, &app.job_form_model),
+                counter
+            ),
+        ));
+    }
     content.push(plain_row(
         5,
         format!("[{}] Skip permissions", if app.job_form_dangerous { "x" } else { " " }),
@@ -598,6 +744,9 @@ pub(crate) fn draw_job_form_popup(frame: &mut Frame, app: &App) {
         "[ Create job ]"
     };
     content.push(plain_row(8, action_label.to_string()));
+
+    content.push(Line::from(""));
+    content.extend(job_form_field_help(app));
     content.push(Line::from(""));
 
     if app.job_form_editing {
@@ -615,6 +764,17 @@ pub(crate) fn draw_job_form_popup(frame: &mut Frame, app: &App) {
             Span::styled(" browse  ", hint_style),
             Span::styled("i", key_style),
             Span::styled(" type path  ", hint_style),
+            Span::styled("j/k", key_style),
+            Span::styled(" navigate  ", hint_style),
+            Span::styled("Esc", key_style),
+            Span::styled(" back", hint_style),
+        ]));
+    } else if selected == JOB_FORM_MODEL_ROW {
+        content.push(Line::from(vec![
+            Span::styled("  Enter/←/→", key_style),
+            Span::styled(" change model  ", hint_style),
+            Span::styled("i", key_style),
+            Span::styled(" type id  ", hint_style),
             Span::styled("j/k", key_style),
             Span::styled(" navigate  ", hint_style),
             Span::styled("Esc", key_style),
@@ -673,12 +833,19 @@ pub(crate) fn draw_job_confirm_popup(frame: &mut Frame, app: &App) {
     let verb = match action {
         JobConfirmAction::Stop => "Stop",
         JobConfirmAction::Delete => "Delete",
+        JobConfirmAction::Done => "Mark done",
+    };
+    // Marking a job done ends it deliberately rather than destructively, so it
+    // is not dressed in the red the stop/delete prompts use.
+    let accent = match action {
+        JobConfirmAction::Done => ACCENT_GREEN,
+        _ => ACCENT_RED,
     };
 
     let content = vec![
         Line::from(""),
         Line::from(vec![
-            Span::styled(format!("{} ", verb), Style::default().fg(ACCENT_RED).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("{} ", verb), Style::default().fg(accent).add_modifier(Modifier::BOLD)),
             Span::styled(format!("\"{}\"", job_name), Style::default().fg(ACCENT_PEACH).add_modifier(Modifier::BOLD)),
             Span::styled("?", text_style),
         ]),
@@ -697,10 +864,10 @@ pub(crate) fn draw_job_confirm_popup(frame: &mut Frame, app: &App) {
         Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(ACCENT_RED))
+            .border_style(Style::default().fg(accent))
             .title(Span::styled(
                 " Confirm ",
-                Style::default().fg(ACCENT_RED).add_modifier(Modifier::BOLD),
+                Style::default().fg(accent).add_modifier(Modifier::BOLD),
             ))
             .style(Style::default().bg(BG_SURFACE)),
     );
@@ -723,7 +890,153 @@ fn jobs_scroll_offset(selected: usize, total: usize, visible: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_eta, jobs_scroll_offset, truncate_name};
+    use super::{
+        format_eta, job_detail_lines, job_form_field_help, jobs_scroll_offset, truncate_name,
+        App, JobConfirmAction, JobState, JOB_FORM_MAX_ROW, JOB_FORM_MODEL_ROW,
+    };
+    use crate::config::Config;
+
+    #[test]
+    fn every_form_row_explains_itself() {
+        let mut app = App::new(vec![], None, Config::default());
+        for field in 0..=JOB_FORM_MAX_ROW {
+            app.job_form_field = field;
+            let help = job_form_field_help(&app);
+            assert!(
+                help.len() >= 2,
+                "row {field} should have a title and at least one body line"
+            );
+        }
+    }
+
+    #[test]
+    fn model_help_describes_the_selected_model() {
+        let mut app = App::new(vec![], None, Config::default());
+        app.job_form_field = JOB_FORM_MODEL_ROW;
+        app.job_form_model = "opus".to_string();
+        let opus = format!("{:?}", job_form_field_help(&app));
+        app.job_form_model = "totally-made-up".to_string();
+        let custom = format!("{:?}", job_form_field_help(&app));
+        assert_ne!(opus, custom);
+        assert!(custom.contains("Custom id"));
+    }
+
+    /// Render a full frame with the job form open and return the whole buffer
+    /// as text, so what the user actually sees can be asserted on.
+    fn render_form(app: &mut App) -> String {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..40)
+            .map(|y| {
+                (0..120)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn form_shows_the_inherited_continue_prompt_and_the_selected_model() {
+        let mut app = App::new(vec![], None, Config::default());
+        app.mode = crate::app::AppMode::JobForm;
+        app.job_form_continue_prompt.clear();
+        app.job_form_model = "sonnet".to_string();
+        let text = render_form(&mut app);
+        // An unset continue prompt shows what will actually be pasted, and the
+        // model row shows its position in the discovered list.
+        assert!(text.contains("(default) Continue where you left off."), "{text}");
+        assert!(text.contains("Model: sonnet"), "{text}");
+        assert!(text.contains("[ Create job ]"), "{text}");
+    }
+
+    #[test]
+    fn continue_prompt_help_shows_the_configured_default() {
+        let mut app = App::new(vec![], None, Config::default());
+        app.config.continue_prompt = "Pick it back up.".to_string();
+        app.job_form_field = 3;
+        assert!(format!("{:?}", job_form_field_help(&app)).contains("Pick it back up."));
+    }
+
+    /// A minimal queued job for the Jobs-tab rendering and key tests.
+    fn sample_job() -> crate::schedule::Job {
+        crate::schedule::Job {
+            id: "job-1".to_string(),
+            name: "refactor".to_string(),
+            cwd: "/tmp".to_string(),
+            prompt: "Do the thing.".to_string(),
+            continue_prompt: None,
+            claude_session_id: None,
+            tmux_name: None,
+            state: JobState::Queued,
+            pause_mode: crate::config::PauseMode::Soft,
+            dangerous: false,
+            model: None,
+            auto_resume: true,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            paused_at_ms: None,
+            resume_after_ms: None,
+            last_error: None,
+            attempts: 0,
+            history: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn detail_pane_states_how_a_job_will_finish() {
+        let mut app = App::new(vec![], None, Config::default());
+        let mut job = sample_job();
+
+        // The end condition is spelled out while the job is still live, so it
+        // is never a mystery that a dispatched job can end at all.
+        let running = format!("{:?}", job_detail_lines(&job, &app));
+        assert!(running.contains("CCSM_JOB_COMPLETE"), "{running}");
+        assert!(running.contains("15 min idle"), "{running}");
+
+        // With the idle fallback off, only the marker is advertised.
+        app.config.idle_complete_seconds = 0;
+        let marker_only = format!("{:?}", job_detail_lines(&job, &app));
+        assert!(marker_only.contains("CCSM_JOB_COMPLETE"), "{marker_only}");
+        assert!(!marker_only.contains("min idle"), "{marker_only}");
+
+        // A finished job reports the outcome instead of the condition.
+        job.state = JobState::Done;
+        let done = format!("{:?}", job_detail_lines(&job, &app));
+        assert!(done.contains("finished"), "{done}");
+    }
+
+    #[test]
+    fn f_opens_a_mark_done_confirmation_that_renders() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let mut app = App::new(vec![], None, Config::default());
+        app.jobs = vec![sample_job()];
+        app.main_tab = crate::app::MainTab::Jobs;
+        app.handle_jobs_tab_event(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+
+        assert_eq!(app.mode, crate::app::AppMode::JobConfirm);
+        assert_eq!(
+            app.jobs_confirm,
+            Some(("job-1".to_string(), JobConfirmAction::Done))
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let text: String = (0..40)
+            .map(|y| {
+                (0..120)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Mark done \"refactor\"?"), "{text}");
+    }
 
     #[test]
     fn no_offset_when_everything_fits() {

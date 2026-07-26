@@ -46,8 +46,9 @@ Press `?` for the keybinding reference. It opens on the page matching the tab yo
 - **Conversation preview** — scrollable preview of the last 20 turns with working directory and git branch in the info bar
 - **Resume anywhere** — resume a session in tmux (`Enter`) or directly in the foreground (`Shift+Enter`)
 - **Live sessions** — start, attach, detach, rename, and stop tmux-backed Claude sessions; running sessions surface at the top with activity indicators (● active, ● idle, ▶ waiting) and real-time pane preview
-- **Quick launch** — `n` for a named tmux session, `Shift+N` for a foreground session, or `ccsm --new` / `ccsm --spawn` to skip the TUI entirely
-- **Usage-aware scheduling** — dispatch sessions with a prompt, pause them automatically before your 5-hour budget runs out, and continue them when it resets, all without being at the keyboard (Jobs tab, `w`)
+- **Quick launch** — `n` opens one popup for every launch mode (`Tab` cycles plain, skip-permissions, git worktree, and foreground session, or `ccsm --new` / `ccsm --spawn` to skip the TUI entirely
+- **Usage-aware scheduling** — dispatch sessions with a prompt, pause them automatically before your 5-hour budget runs out, and continue them when it resets, all without being at the keyboard (Jobs tab, `Tab`)
+- **Jobs know when they are finished** — every dispatched prompt asks the agent to sign off with `CCSM_JOB_COMPLETE`, which the watcher reads from the session transcript; a job that reports it (or sits idle past a configurable window) is marked done, its session stopped, and it is never re-dispatched
 - **Usage always in view** — the tab strip shows your current usage percentage, the time until the window resets, and a red `⏱ off` if the watcher daemon has died, on every tab
 - **Directory browser** — browse for any path the app needs: a new session's directory (`b`), a job's working directory, or the `claude`/`tmux`/`claude-usage` binaries in the config popup — and type it by hand instead if you prefer
 - **Full cursor editing** — every text field supports `←`/`→`, `Ctrl+←`/`→` by word, `Home`/`End`, `Ctrl+W`, and `Ctrl+U`
@@ -200,20 +201,41 @@ Back in the TUI, live sessions appear at the top of the list with activity indic
 | `Shift+K` / `Mouse wheel ↑` | Scroll preview up (disables auto-scroll for live sessions) |
 | `/` | Activate search/filter mode |
 | `o` | Open config popup (Sessions / Jobs manager / About sections) |
-| `f` | Toggle favorite — pins project to top of list (shown with ★) |
-| `n` | Start new live session in selected project's directory (prompts for name) |
-| `Shift+N` | Start new foreground claude session in selected project's directory (no tmux) |
+| `Space` | Toggle favorite — pins project to top of list (shown with ★) |
+| `n` | New session popup — `Tab` cycles plain / danger / worktree / direct |
+| `v` | Cycle the view mode (tree / flat / grouped) |
 | `l` | Toggle live-only filter (show only running sessions) |
 | `r` | Rename selected session or live session |
-| `x` | Stop (kill) selected live session |
+| `x` | Stop selected live session (asks for confirmation) |
 | `b` | Browse for a directory to start a new session in |
-| `w` | Jump to the Jobs tab (scheduled, usage-aware sessions) |
 | `m` | Manage the selected session as a job (adopt live or historical) |
 | `?` | Open help overlay |
-| `q` / `Esc` / `Ctrl+C` | Quit |
+| `q` / `Ctrl+C` | Quit |
+| `Esc` | Back out of a popup or clear the filter — never quits |
 
 In the config popup, `Tab` / `Shift+Tab` still cycles the session view mode
 (tree [name] → tree [short dir] → tree [full dir] → flat).
+
+### The new-session popup
+
+`n` opens one popup for every way of starting a session. `Tab` cycles the mode
+and the border colour follows it:
+
+| Mode | What it launches |
+|---|---|
+| `plain` | A normal live session in tmux |
+| `danger` | Adds `--dangerously-skip-permissions` |
+| `worktree` | Its own git worktree (`claude --worktree`); dimmed outside a git repo |
+| `direct` | A foreground `claude` with no tmux session (the name is unused) |
+
+Press `Enter` to launch; leaving the name empty uses the suggested one.
+
+### Small terminals
+
+The status bar ranks its shortcuts and shows as many as fit, dropping the least
+important first. `? help` and `q quit` are never dropped, and a trailing `…`
+means some hints were hidden — press `?` for the full list. The help overlay
+scrolls with `j`/`k` and `PgUp`/`PgDn`.
 
 ### Update Prompt
 
@@ -267,7 +289,8 @@ Live sessions are tmux-backed Claude Code sessions managed through a dedicated t
 - **● Amber** — idle (waiting at the prompt)
 - **▶ Red** — waiting (Claude is asking for user input/approval)
 
-- **Start**: press `n` (starts a named live tmux session in the current project dir) or `Shift+N` (starts claude directly in the foreground, no tmux)
+- **Start**: press `n`, then `Tab` to pick the launch mode (`plain` for a named live tmux session in the current project dir, `direct` for claude in the foreground with no tmux)
+- **Start in a worktree**: press `n` and `Tab` to the `worktree` mode, which launches with `claude --worktree <session name>` so the session gets its own git worktree and branch instead of sharing your checkout. The mode is dimmed and unselectable outside a git repository, so ccsm refuses up front rather than letting claude fail inside a tmux session you would have to attach to first.
 - **Attach**: press `Enter` on any live session to attach
 - **Detach**: press `Ctrl+\` inside a live session to return to ccsm
 - **Navigate**: use `Ctrl+n` / `Ctrl+p` to cycle between live sessions without detaching
@@ -285,7 +308,7 @@ means being at the keyboard when it happens. Scheduled jobs close that gap: ccsm
 a session with a prompt, watches your account usage, interrupts the session before the
 budget runs out, and continues it automatically once the window resets.
 
-The Jobs manager is the second tab of the main window: press `Tab` or `w` to reach it.
+The Jobs manager is the second tab of the main window: press `Tab` to reach it.
 The left pane lists jobs with their state, the right pane shows the selected job's
 configuration, timings, last error, and state history. `m` on the Sessions tab adopts
 whatever is selected there (a running live session or a past one) as a managed job.
@@ -302,13 +325,67 @@ is not running, since a silently dead watcher is the one failure that strands ev
 | `n` / `e` | New job / edit selected |
 | `p` / `c` | Pause now / continue now |
 | `x` / `d` | Hard stop / delete (both confirm first) |
+| `f` | Mark done, ending the job for good (confirms first) |
 | `Space` | Toggle auto-resume |
 | `s` | Start or stop the watcher daemon |
 | `L` | Attach to the watcher's live log |
 | `Tab` / `Esc` | Back to the Sessions tab |
 
-In the job form, the **Directory** field opens the directory browser (`Enter` or `b`), or
-`i` to type the path by hand.
+The job form explains whichever field is selected in a block below the form, so the
+scheduler's less obvious options (pause modes, auto-resume, the continue prompt) do not
+need looking up. Two fields behave specially:
+
+- **Directory** opens the directory browser (`Enter` or `b`), or `i` to type the path by hand.
+- **Model** is a picker, not a text field: `Enter`, `Space`, or `←`/`→` cycle it, and `i`
+  types a model id by hand. The list is built at startup rather than shipped with ccsm, so
+  it follows Claude Code as models come and go. It always offers the tier aliases (`opus`,
+  `sonnet`, `haiku`, `fable`), which resolve to the current model in each tier, and adds
+  every concrete model id Claude Code itself knows about from `~/.claude.json` (the extra
+  entries in its own model picker, plus anything that has actually billed tokens).
+
+**Continue prompt** is what the watcher pastes to wake a paused session. Leaving it blank
+on a job inherits the global default (`Continue where you left off.`), which the form and
+detail pane both show in full rather than hiding behind "(default)". Change the global
+default under **Jobs manager → Continue prompt** in the config popup (`o`); clearing it
+restores the built-in text rather than storing an empty string.
+
+### How a job finishes
+
+A dispatched session has no natural end. Claude finishes the work, prints its summary,
+and sits at an idle prompt looking exactly like a session that has merely paused, so
+without a completion signal the watcher would keep waking it and relaunching it against
+work that is already done. Two things stop that.
+
+**The completion marker.** Every session the watcher launches carries a short
+instruction in its system prompt (`--append-system-prompt`): when the task is completely
+finished, make the last line of the final message exactly `CCSM_JOB_COMPLETE`. Every
+continuation prompt repeats it, so a session ccsm adopted rather than launched learns the
+protocol too. The instruction goes in the system prompt rather than being appended to the
+job's prompt because Claude Code hands everything after a slash command to that command
+as its arguments: a job whose prompt is `/goal @PLAN.md` would have swallowed the whole
+protocol paragraph into the goal instead of hearing it. The watcher looks for
+that line in the session's own transcript under `~/.claude/projects/`, not in the tmux
+pane, because the instruction itself is echoed into the pane the moment it is pasted —
+scraping the pane would match ccsm's own words and finish every job on dispatch. Only
+`assistant` messages count, only whole lines match, and the marker written into a file
+through a tool call is ignored, so an agent cannot end its job by talking about the
+marker.
+
+Once a job reports completion it moves to `done`: its tmux session is stopped, and
+nothing dispatches, resumes, or relaunches it again. That holds no matter what state it
+was in — a job that finishes and then exits on its own is caught in `stopped` before the
+relaunch timer fires.
+
+**The idle fallback.** An agent can forget the instruction, and an adopted session was
+never told it in the first place. So a job whose pane has looked idle for an unbroken
+stretch (default 15 minutes) is also marked done, with the reason recorded in its
+history so it is never confused with a self-reported completion. A pane sitting on a
+permission prompt reads as *waiting*, not idle, and is never swept up by this. Change
+the window under **Jobs manager → Idle completion** in the config popup (`o`), or set it
+to `0` to turn the fallback off and rely on the marker alone.
+
+Press `f` on the Jobs tab to mark a job done by hand, which stops its session the same
+way a self-reported completion does.
 
 ### How pausing works
 
@@ -398,6 +475,7 @@ Scheduler settings, all editable under **Jobs manager** in the config popup (`o`
 | `usage_max_age_seconds` | `900` | A usage sample older than this counts as stale |
 | `usage_source` | `"auto"` | Passed to `claude-usage --source` (`auto`, `local`, or `api`) |
 | `defer_while_attached` | `true` | Skip automated keystrokes while you have the session attached |
+| `continue_prompt` | `"Continue where you left off."` | Default text pasted to wake a paused job, when the job has no override |
 | `continue_prompt` | `"Continue where you left off."` | Text pasted into a paused session to resume it |
 | `max_restart_attempts` | `5` | Give up on a job after this many consecutive failures |
 

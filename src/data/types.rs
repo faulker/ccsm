@@ -89,6 +89,9 @@ pub(crate) struct SessionEntry {
     #[serde(rename = "isMeta")]
     pub is_meta: Option<bool>,
     pub message: Option<MessageData>,
+    /// RFC3339 timestamp of the entry, used to tell a marker emitted during
+    /// this job's run from one left in the transcript by an earlier one.
+    pub timestamp: Option<String>,
     pub cwd: Option<String>,
     #[serde(rename = "gitBranch")]
     pub git_branch: Option<String>,

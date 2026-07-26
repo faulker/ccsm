@@ -10,6 +10,15 @@ use crate::config::{test_lock, Config};
 use crate::live::ActivityState;
 use crate::usage::{UsageSnapshot, UsageWindow};
 use std::collections::{HashMap, HashSet};
+use std::sync::LazyLock;
+
+/// Empty completion/idle inputs for the many decision-table tests that do not
+/// exercise the completion protocol. `static` rather than a per-test local so
+/// an `EngineInputs` bound with `let` can borrow them without the temporary
+/// dying at the end of the statement that built it.
+static NO_COMPLETIONS: LazyLock<HashSet<String>> = LazyLock::new(HashSet::new);
+static NO_IDLE: LazyLock<HashMap<String, i64>> = LazyLock::new(HashMap::new);
+
 
 /// A minimal job with sensible defaults for tests, tmux name "test".
 fn base_job(state: JobState) -> Job {
@@ -74,7 +83,7 @@ fn resume_argv_uses_continue_when_session_id_unknown() {
     let mut job = base_job(JobState::Stopped);
     job.claude_session_id = None;
     let argv = build_resume_argv("claude", &job);
-    assert_eq!(argv, vec!["claude", "--continue"]);
+    assert_eq!(argv[..2], ["claude", "--continue"]);
     assert!(!argv.iter().any(|a| a.is_empty()));
 }
 
@@ -83,7 +92,7 @@ fn resume_argv_uses_continue_when_session_id_is_empty_string() {
     let mut job = base_job(JobState::Stopped);
     job.claude_session_id = Some(String::new());
     let argv = build_resume_argv("claude", &job);
-    assert_eq!(argv, vec!["claude", "--continue"]);
+    assert_eq!(argv[..2], ["claude", "--continue"]);
 }
 
 #[test]
@@ -91,7 +100,7 @@ fn resume_argv_uses_resume_when_session_id_known() {
     let mut job = base_job(JobState::Stopped);
     job.claude_session_id = Some("abc-123".to_string());
     let argv = build_resume_argv("claude", &job);
-    assert_eq!(argv, vec!["claude", "--resume", "abc-123"]);
+    assert_eq!(argv[..3], ["claude", "--resume", "abc-123"]);
 }
 
 #[test]
@@ -112,6 +121,8 @@ fn stopped_without_session_id_or_cwd_fails_instead_of_relaunching() {
             last_known_pct: None,
             live: &live,
             activity: &activity,
+            completed: &NO_COMPLETIONS,
+            idle_since: &NO_IDLE,
             cfg: &cfg,
         },
     );
@@ -140,6 +151,8 @@ fn dispatch_sanitizes_an_unsafe_job_name_into_the_tmux_name() {
             last_known_pct: None,
             live: &live,
             activity: &activity,
+            completed: &NO_COMPLETIONS,
+            idle_since: &NO_IDLE,
             cfg: &cfg,
         },
     );
@@ -169,6 +182,8 @@ fn queued_below_threshold_dispatches() {
         last_known_pct: None,
         live: &live,
         activity: &activity,
+        completed: &NO_COMPLETIONS,
+        idle_since: &NO_IDLE,
         cfg: &cfg,
     };
     let actions = plan(&[job], &inputs);
@@ -189,6 +204,8 @@ fn queued_at_or_above_threshold_does_nothing() {
         last_known_pct: None,
         live: &live,
         activity: &activity,
+        completed: &NO_COMPLETIONS,
+        idle_since: &NO_IDLE,
         cfg: &cfg,
     };
     let actions = plan(&[job], &inputs);
@@ -208,6 +225,8 @@ fn running_at_exactly_95_interrupts() {
         last_known_pct: None,
         live: &live,
         activity: &activity,
+        completed: &NO_COMPLETIONS,
+        idle_since: &NO_IDLE,
         cfg: &cfg,
     };
     let actions = plan(&[job], &inputs);
@@ -228,6 +247,8 @@ fn running_at_94_9_does_nothing() {
         last_known_pct: None,
         live: &live,
         activity: &activity,
+        completed: &NO_COMPLETIONS,
+        idle_since: &NO_IDLE,
         cfg: &cfg,
     };
     let actions = plan(&[job], &inputs);
@@ -248,6 +269,8 @@ fn running_hard_pause_mode_hard_stops() {
         last_known_pct: None,
         live: &live,
         activity: &activity,
+        completed: &NO_COMPLETIONS,
+        idle_since: &NO_IDLE,
         cfg: &cfg,
     };
     let actions = plan(&[job], &inputs);
@@ -269,6 +292,8 @@ fn running_waiting_marks_paused_instead_of_interrupt() {
         last_known_pct: None,
         live: &live,
         activity: &activity,
+        completed: &NO_COMPLETIONS,
+        idle_since: &NO_IDLE,
         cfg: &cfg,
     };
     let actions = plan(&[job], &inputs);
@@ -289,6 +314,8 @@ fn running_without_live_tmux_marks_stopped() {
         last_known_pct: None,
         live: &live,
         activity: &activity,
+        completed: &NO_COMPLETIONS,
+        idle_since: &NO_IDLE,
         cfg: &cfg,
     };
     let actions = plan(&[job], &inputs);
@@ -309,6 +336,8 @@ fn stale_high_usage_still_interrupts() {
         last_known_pct: None,
         live: &live,
         activity: &activity,
+        completed: &NO_COMPLETIONS,
+        idle_since: &NO_IDLE,
         cfg: &cfg,
     };
     let actions = plan(&[job], &inputs);
@@ -329,6 +358,8 @@ fn stale_low_usage_does_nothing() {
         last_known_pct: None,
         live: &live,
         activity: &activity,
+        completed: &NO_COMPLETIONS,
+        idle_since: &NO_IDLE,
         cfg: &cfg,
     };
     let actions = plan(&[job], &inputs);
@@ -348,6 +379,8 @@ fn paused_stale_low_usage_is_not_resumed() {
         last_known_pct: None,
         live: &live,
         activity: &activity,
+        completed: &NO_COMPLETIONS,
+        idle_since: &NO_IDLE,
         cfg: &cfg,
     };
     let actions = plan(&[job], &inputs);
@@ -367,6 +400,8 @@ fn paused_fresh_low_usage_resumes() {
         last_known_pct: None,
         live: &live,
         activity: &activity,
+        completed: &NO_COMPLETIONS,
+        idle_since: &NO_IDLE,
         cfg: &cfg,
     };
     let actions = plan(&[job], &inputs);
@@ -396,6 +431,8 @@ fn paused_retry_respects_backoff_even_when_usage_is_low() {
             last_known_pct: None,
             live: &live,
             activity: &activity,
+            completed: &NO_COMPLETIONS,
+            idle_since: &NO_IDLE,
             cfg: &cfg,
         },
     );
@@ -413,6 +450,8 @@ fn paused_retry_respects_backoff_even_when_usage_is_low() {
             last_known_pct: None,
             live: &live,
             activity: &activity,
+            completed: &NO_COMPLETIONS,
+            idle_since: &NO_IDLE,
             cfg: &cfg,
         },
     );
@@ -441,6 +480,8 @@ fn paused_first_resume_is_not_delayed_by_backoff() {
             last_known_pct: None,
             live: &live,
             activity: &activity,
+            completed: &NO_COMPLETIONS,
+            idle_since: &NO_IDLE,
             cfg: &cfg,
         },
     );
@@ -469,6 +510,8 @@ fn paused_does_not_resume_on_deadline_while_still_at_pause_threshold() {
             last_known_pct: None,
             live: &live,
             activity: &activity,
+            completed: &NO_COMPLETIONS,
+            idle_since: &NO_IDLE,
             cfg: &cfg,
         },
     );
@@ -489,6 +532,8 @@ fn paused_resumes_after_deadline_even_if_pct_high() {
         last_known_pct: None,
         live: &live,
         activity: &activity,
+        completed: &NO_COMPLETIONS,
+        idle_since: &NO_IDLE,
         cfg: &cfg,
     };
     let actions = plan(&[job], &inputs);
@@ -510,6 +555,8 @@ fn no_thrash_after_resume_at_49_then_51() {
         last_known_pct: None,
         live: &live,
         activity: &activity,
+        completed: &NO_COMPLETIONS,
+        idle_since: &NO_IDLE,
         cfg: &cfg,
     };
     let actions = plan(&[job.clone()], &inputs49);
@@ -526,6 +573,8 @@ fn no_thrash_after_resume_at_49_then_51() {
         last_known_pct: None,
         live: &live,
         activity: &activity,
+        completed: &NO_COMPLETIONS,
+        idle_since: &NO_IDLE,
         cfg: &cfg,
     };
     let actions2 = plan(&[job], &inputs51);
@@ -553,6 +602,8 @@ fn mixed_job_set_produces_exactly_one_interrupt() {
         last_known_pct: None,
         live: &live,
         activity: &activity,
+        completed: &NO_COMPLETIONS,
+        idle_since: &NO_IDLE,
         cfg: &cfg,
     };
 
@@ -583,6 +634,8 @@ fn watch_seven_day_true_uses_seven_day_max() {
         last_known_pct: None,
         live: &live,
         activity: &activity,
+        completed: &NO_COMPLETIONS,
+        idle_since: &NO_IDLE,
         cfg: &cfg,
     };
     let actions = plan(&[job], &inputs);
@@ -610,6 +663,8 @@ fn watch_seven_day_false_ignores_seven_day() {
         last_known_pct: None,
         live: &live,
         activity: &activity,
+        completed: &NO_COMPLETIONS,
+        idle_since: &NO_IDLE,
         cfg: &cfg,
     };
     let actions = plan(&[job], &inputs);
@@ -631,6 +686,8 @@ fn stopped_relaunches_after_backoff_elapses() {
         last_known_pct: None,
         live: &live,
         activity: &activity,
+        completed: &NO_COMPLETIONS,
+        idle_since: &NO_IDLE,
         cfg: &cfg,
     };
     let actions = plan(&[job], &inputs);
@@ -653,6 +710,8 @@ fn stopped_does_not_relaunch_before_backoff_elapses() {
         last_known_pct: None,
         live: &live,
         activity: &activity,
+        completed: &NO_COMPLETIONS,
+        idle_since: &NO_IDLE,
         cfg: &cfg,
     };
     let actions = plan(&[job], &inputs);
@@ -673,6 +732,8 @@ fn stopped_fails_after_max_restart_attempts() {
         last_known_pct: None,
         live: &live,
         activity: &activity,
+        completed: &NO_COMPLETIONS,
+        idle_since: &NO_IDLE,
         cfg: &cfg,
     };
     let actions = plan(&[job], &inputs);
@@ -692,6 +753,8 @@ fn no_usage_sample_takes_no_action() {
         last_known_pct: Some(99.0),
         live: &live,
         activity: &activity,
+        completed: &NO_COMPLETIONS,
+        idle_since: &NO_IDLE,
         cfg: &cfg,
     };
     let actions = plan(&[job], &inputs);
@@ -707,9 +770,14 @@ fn start_argv_prompt_with_special_chars_is_one_element() {
     let mut job = base_job(JobState::Queued);
     job.prompt = "do $(rm -rf /) and \"quotes\" and `backticks`".to_string();
     let argv = build_start_argv("claude", &job);
-    let matching = argv.iter().filter(|a| **a == job.prompt).count();
+    // The prompt now carries the completion protocol, but it must still be a
+    // single trailing argv element: tmux execvp's argv directly, so shell
+    // metacharacters inside it are inert only as long as it is not split.
+    let matching = argv.iter().filter(|a| a.starts_with(&job.prompt)).count();
     assert_eq!(matching, 1);
-    assert_eq!(argv.last().unwrap(), &job.prompt);
+    let last = argv.last().unwrap();
+    assert!(last.starts_with(&job.prompt), "got {last:?}");
+    assert!(last.contains(completion::COMPLETION_MARKER), "got {last:?}");
 }
 
 #[test]
@@ -717,7 +785,51 @@ fn start_argv_empty_prompt_omits_trailing_element() {
     let job = base_job(JobState::Queued); // prompt is ""
     let argv = build_start_argv("claude", &job);
     assert!(!argv.iter().any(|a| a.is_empty()));
-    assert_eq!(argv.last().unwrap(), &job.name);
+    // The last element is the system-prompt text, never an empty prompt slot.
+    assert!(argv.last().unwrap().contains(completion::COMPLETION_MARKER));
+}
+
+#[test]
+fn start_argv_carries_the_protocol_in_the_system_prompt() {
+    let mut job = base_job(JobState::Queued);
+    job.prompt = "Refactor the parser.".to_string();
+    let argv = build_start_argv("claude", &job);
+    let idx = argv
+        .iter()
+        .position(|a| a == "--append-system-prompt")
+        .expect("start argv carries --append-system-prompt");
+    assert!(argv[idx + 1].contains(completion::COMPLETION_MARKER));
+    assert_eq!(
+        argv.iter().filter(|a| *a == "--append-system-prompt").count(),
+        1
+    );
+}
+
+#[test]
+fn resume_argv_carries_the_protocol_in_the_system_prompt() {
+    // A relaunched session is a fresh process, so it needs the protocol in its
+    // own system prompt just as much as a first dispatch does.
+    let mut job = base_job(JobState::Stopped);
+    job.claude_session_id = Some("abc-123".to_string());
+    let argv = build_resume_argv("claude", &job);
+    let idx = argv
+        .iter()
+        .position(|a| a == "--append-system-prompt")
+        .expect("resume argv carries --append-system-prompt");
+    assert!(argv[idx + 1].contains(completion::COMPLETION_MARKER));
+}
+
+#[test]
+fn start_argv_leaves_a_slash_command_prompt_untouched() {
+    // Claude Code hands everything after the command name to the command as
+    // $ARGUMENTS, newlines included, so an appended protocol paragraph would
+    // become part of the argument instead of an instruction.
+    let mut job = base_job(JobState::Queued);
+    job.prompt = "/goal @PLAN.md".to_string();
+    let argv = build_start_argv("claude", &job);
+    assert_eq!(argv.last().unwrap(), "/goal @PLAN.md");
+    // It still reaches the agent, via the system prompt.
+    assert!(argv.iter().any(|a| a.contains(completion::COMPLETION_MARKER)));
 }
 
 #[test]
@@ -745,8 +857,8 @@ fn resume_argv_has_no_positional_prompt() {
     let argv = build_resume_argv("claude", &job);
     assert!(!argv.iter().any(|a| a == "should not appear"));
     assert_eq!(
-        argv,
-        vec![
+        argv[..3],
+        [
             "claude".to_string(),
             "--resume".to_string(),
             "sess-123".to_string()
@@ -1078,5 +1190,414 @@ fn a_long_running_older_session_is_not_mistaken_for_ours() {
     assert!(
         started < since_ms - 5000,
         "fixture should predate the cutoff"
+    );
+}
+
+// ---------------------------------------------------------------------
+// completion protocol
+// ---------------------------------------------------------------------
+
+/// One assistant JSONL entry whose single text block is `text`.
+fn assistant_line(text: &str) -> String {
+    serde_json::json!({
+        "type": "assistant",
+        "message": { "role": "assistant", "content": [{ "type": "text", "text": text }] }
+    })
+    .to_string()
+}
+
+/// One user JSONL entry carrying `text`, i.e. what a prompt we sent looks like
+/// once it lands in the transcript.
+fn user_line(text: &str) -> String {
+    serde_json::json!({
+        "type": "user",
+        "message": { "role": "user", "content": text }
+    })
+    .to_string()
+}
+
+#[test]
+fn completion_marker_on_its_own_line_from_the_assistant_counts() {
+    let tail = assistant_line("All the tests pass.\n\nCCSM_JOB_COMPLETE");
+    assert!(completion::transcript_shows_completion(&tail, 0));
+}
+
+#[test]
+fn completion_ignores_our_own_instruction_echoed_as_a_user_message() {
+    // Regression: the protocol instruction contains the marker, so a detector
+    // that looked at the pane (or at every transcript entry) would declare the
+    // job finished the instant it was dispatched.
+    let prompt = completion::with_completion_protocol("Refactor the parser.");
+    assert!(prompt.contains(completion::COMPLETION_MARKER));
+    let tail = user_line(&prompt);
+    assert!(!completion::transcript_shows_completion(&tail, 0));
+}
+
+#[test]
+fn completion_ignores_the_marker_mentioned_mid_sentence() {
+    let tail = assistant_line("I will print CCSM_JOB_COMPLETE once the build is green.");
+    assert!(!completion::transcript_shows_completion(&tail, 0));
+}
+
+#[test]
+fn completion_ignores_the_marker_written_through_a_tool_call() {
+    // An agent that writes the marker into a file must not end its own job.
+    let line = serde_json::json!({
+        "type": "assistant",
+        "message": {
+            "role": "assistant",
+            "content": [{
+                "type": "tool_use",
+                "name": "Write",
+                "input": { "content": "CCSM_JOB_COMPLETE" }
+            }]
+        }
+    })
+    .to_string();
+    assert!(!completion::transcript_shows_completion(&line, 0));
+}
+
+#[test]
+fn completion_scans_a_whole_transcript_tail() {
+    let tail = [
+        user_line("Do the thing."),
+        assistant_line("Working on it."),
+        assistant_line("Done.\nCCSM_JOB_COMPLETE\n"),
+    ]
+    .join("\n");
+    assert!(completion::transcript_shows_completion(&tail, 0));
+}
+
+#[test]
+fn completion_tolerates_garbage_and_empty_input() {
+    assert!(!completion::transcript_shows_completion("", 0));
+    assert!(!completion::transcript_shows_completion("not json at all", 0));
+    assert!(!completion::transcript_shows_completion(
+        "{\"type\":\"assistant\" CCSM_JOB_COMPLETE truncated",
+        0
+    ));
+}
+
+#[test]
+fn completion_ignores_a_marker_from_before_the_job_existed() {
+    // Adopting a conversation ccsm already ran to completion must not mark the
+    // new job done on the strength of the previous run's sign-off.
+    let old = serde_json::json!({
+        "type": "assistant",
+        "timestamp": "2026-07-20T10:00:00Z",
+        "message": { "role": "assistant", "content": [{ "type": "text", "text": "CCSM_JOB_COMPLETE" }] }
+    })
+    .to_string();
+    let created_ms = chrono::DateTime::parse_from_rfc3339("2026-07-26T10:00:00Z")
+        .unwrap()
+        .timestamp_millis();
+    assert!(!completion::transcript_shows_completion(&old, created_ms));
+
+    // The same marker emitted after the job was created does count.
+    let fresh = old.replace("2026-07-20T10", "2026-07-26T18");
+    assert!(completion::transcript_shows_completion(&fresh, created_ms));
+}
+
+#[test]
+fn completion_still_matches_an_entry_with_no_timestamp() {
+    // Fail open on the time filter: a transcript format change must degrade
+    // into "no time filter", never into "the marker never works again".
+    let line = serde_json::json!({
+        "type": "assistant",
+        "message": { "role": "assistant", "content": [{ "type": "text", "text": "CCSM_JOB_COMPLETE" }] }
+    })
+    .to_string();
+    assert!(completion::transcript_shows_completion(&line, i64::MAX / 2));
+}
+
+#[test]
+fn with_completion_protocol_leaves_an_empty_prompt_empty() {
+    // A job with no prompt starts at an idle session; sending only the
+    // protocol instruction would be an instruction with no task attached.
+    assert_eq!(completion::with_completion_protocol(""), "");
+    assert_eq!(completion::with_completion_protocol("   \n "), "");
+}
+
+#[test]
+fn read_transcript_tail_drops_the_partial_first_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t.jsonl");
+    std::fs::write(&path, "aaaaaaaaaa\nbbbb\ncccc\n").unwrap();
+
+    // Reading the whole file keeps every line.
+    let all = completion::read_transcript_tail(&path, 1024).unwrap();
+    assert_eq!(all, "aaaaaaaaaa\nbbbb\ncccc\n");
+
+    // Reading a tail that starts mid-line drops that truncated line: starting
+    // 12 bytes from the end lands inside "aaaaaaaaaa", which is discarded.
+    let tail = completion::read_transcript_tail(&path, 12).unwrap();
+    assert_eq!(tail, "bbbb\ncccc\n");
+
+    // Landing exactly on a newline still yields whole lines only.
+    let tail = completion::read_transcript_tail(&path, 6).unwrap();
+    assert_eq!(tail, "cccc\n");
+}
+
+#[test]
+fn with_completion_protocol_leaves_a_slash_command_alone() {
+    let plain = completion::with_completion_protocol("Refactor the parser.");
+    assert!(plain.contains(completion::COMPLETION_MARKER));
+
+    // Appending here would land inside the command's $ARGUMENTS.
+    assert_eq!(
+        completion::with_completion_protocol("/goal @PLAN.md"),
+        "/goal @PLAN.md"
+    );
+    assert_eq!(
+        completion::with_completion_protocol("  \n  /compact"),
+        "  \n  /compact"
+    );
+}
+
+#[test]
+fn is_slash_command_looks_at_the_first_non_empty_line() {
+    assert!(completion::is_slash_command("/goal @PLAN.md"));
+    assert!(completion::is_slash_command("\n\n  /clear"));
+    assert!(!completion::is_slash_command("Fix the / in the path"));
+    assert!(!completion::is_slash_command(""));
+    // A slash further down is just prose; only the opening line is a command.
+    assert!(!completion::is_slash_command("Do the work\n/goal x"));
+}
+
+#[test]
+fn continuation_text_carries_the_protocol() {
+    let cfg = Config::default();
+    let mut job = base_job(JobState::Paused);
+    // The config default is used when the job has no override of its own.
+    let text = continuation_text(&job, &cfg);
+    assert!(text.starts_with(&cfg.continue_prompt));
+    assert!(text.contains(completion::COMPLETION_MARKER));
+
+    job.continue_prompt = Some("Pick it back up.".to_string());
+    let text = continuation_text(&job, &cfg);
+    assert!(text.starts_with("Pick it back up."));
+    assert!(text.contains(completion::COMPLETION_MARKER));
+}
+
+#[test]
+fn completed_running_job_is_marked_done_not_paused() {
+    // Usage is over the pause threshold, which would normally interrupt the
+    // job; completion has to win, or a finished job gets paused and resumed.
+    let cfg = Config::default();
+    let usage = fresh_usage(99.0);
+    let job = base_job(JobState::Running);
+    let live = HashSet::from(["test".to_string()]);
+    let activity = HashMap::new();
+    let completed = HashSet::from(["job-1".to_string()]);
+    let inputs = EngineInputs {
+        now_ms: 0,
+        usage: Some(&usage),
+        last_known_pct: None,
+        live: &live,
+        activity: &activity,
+        completed: &completed,
+        idle_since: &NO_IDLE,
+        cfg: &cfg,
+    };
+    let actions = plan(&[job], &inputs);
+    assert!(
+        matches!(actions.as_slice(), [Action::MarkDone { .. }]),
+        "expected exactly one MarkDone, got {actions:?}"
+    );
+}
+
+#[test]
+fn completed_stopped_job_is_not_relaunched() {
+    // The core regression: an agent finishes, the session exits, and the
+    // Stopped -> Relaunch path restarts the finished work forever.
+    let cfg = Config::default();
+    let usage = fresh_usage(10.0);
+    let mut job = base_job(JobState::Stopped);
+    job.auto_resume = true;
+    job.updated_at_ms = 0;
+    let live = HashSet::new();
+    let activity = HashMap::new();
+    let completed = HashSet::from(["job-1".to_string()]);
+    let inputs = EngineInputs {
+        now_ms: 10_000_000,
+        usage: Some(&usage),
+        last_known_pct: None,
+        live: &live,
+        activity: &activity,
+        completed: &completed,
+        idle_since: &NO_IDLE,
+        cfg: &cfg,
+    };
+    let actions = plan(&[job.clone()], &inputs);
+    assert!(
+        matches!(actions.as_slice(), [Action::MarkDone { .. }]),
+        "expected MarkDone instead of a Relaunch, got {actions:?}"
+    );
+
+    // Without the completion signal the same job would be relaunched.
+    let inputs = EngineInputs {
+        completed: &NO_COMPLETIONS,
+        ..inputs
+    };
+    let actions = plan(&[job], &inputs);
+    assert!(
+        matches!(actions.as_slice(), [Action::Relaunch { .. }]),
+        "fixture should otherwise relaunch, got {actions:?}"
+    );
+}
+
+#[test]
+fn completed_paused_job_is_not_resumed() {
+    let cfg = Config::default();
+    let usage = fresh_usage(10.0);
+    let job = base_job(JobState::Paused);
+    let live = HashSet::new();
+    let activity = HashMap::new();
+    let completed = HashSet::from(["job-1".to_string()]);
+    let inputs = EngineInputs {
+        now_ms: 0,
+        usage: Some(&usage),
+        last_known_pct: None,
+        live: &live,
+        activity: &activity,
+        completed: &completed,
+        idle_since: &NO_IDLE,
+        cfg: &cfg,
+    };
+    let actions = plan(&[job], &inputs);
+    assert!(
+        matches!(actions.as_slice(), [Action::MarkDone { .. }]),
+        "expected MarkDone instead of a Resume, got {actions:?}"
+    );
+}
+
+#[test]
+fn completed_queued_job_is_not_dispatched() {
+    let cfg = Config::default();
+    let usage = fresh_usage(10.0);
+    let job = base_job(JobState::Queued);
+    let live = HashSet::new();
+    let activity = HashMap::new();
+    let completed = HashSet::from(["job-1".to_string()]);
+    let inputs = EngineInputs {
+        now_ms: 0,
+        usage: Some(&usage),
+        last_known_pct: None,
+        live: &live,
+        activity: &activity,
+        completed: &completed,
+        idle_since: &NO_IDLE,
+        cfg: &cfg,
+    };
+    let actions = plan(&[job], &inputs);
+    assert!(
+        matches!(actions.as_slice(), [Action::MarkDone { .. }]),
+        "expected MarkDone instead of a Dispatch, got {actions:?}"
+    );
+}
+
+#[test]
+fn already_done_or_failed_jobs_produce_no_action() {
+    let cfg = Config::default();
+    let usage = fresh_usage(10.0);
+    let live = HashSet::new();
+    let activity = HashMap::new();
+    let completed = HashSet::from(["job-1".to_string()]);
+    for state in [JobState::Done, JobState::Failed] {
+        let job = base_job(state);
+        let inputs = EngineInputs {
+            now_ms: 0,
+            usage: Some(&usage),
+            last_known_pct: None,
+            live: &live,
+            activity: &activity,
+            completed: &completed,
+            idle_since: &NO_IDLE,
+            cfg: &cfg,
+        };
+        let actions = plan(&[job], &inputs);
+        assert!(actions.is_empty(), "{state:?} produced {actions:?}");
+    }
+}
+
+#[test]
+fn running_job_idle_past_the_limit_is_marked_done() {
+    let cfg = Config::default(); // 900s
+    let usage = fresh_usage(10.0);
+    let job = base_job(JobState::Running);
+    let live = HashSet::from(["test".to_string()]);
+    let activity = HashMap::new();
+    let idle_since = HashMap::from([("job-1".to_string(), 0i64)]);
+
+    // One second short of the limit: still running.
+    let inputs = EngineInputs {
+        now_ms: 899_000,
+        usage: Some(&usage),
+        last_known_pct: None,
+        live: &live,
+        activity: &activity,
+        completed: &NO_COMPLETIONS,
+        idle_since: &idle_since,
+        cfg: &cfg,
+    };
+    assert!(plan(std::slice::from_ref(&job), &inputs).is_empty());
+
+    // At the limit: done.
+    let inputs = EngineInputs { now_ms: 900_000, ..inputs };
+    let actions = plan(&[job], &inputs);
+    match actions.as_slice() {
+        [Action::MarkDone { reason, .. }] => {
+            assert!(reason.contains("15m"), "unexpected reason {reason:?}");
+        }
+        other => panic!("expected MarkDone, got {other:?}"),
+    }
+}
+
+#[test]
+fn idle_completion_is_disabled_by_a_zero_timeout() {
+    let mut cfg = Config::default();
+    cfg.idle_complete_seconds = 0;
+    let usage = fresh_usage(10.0);
+    let job = base_job(JobState::Running);
+    let live = HashSet::from(["test".to_string()]);
+    let activity = HashMap::new();
+    let idle_since = HashMap::from([("job-1".to_string(), 0i64)]);
+    let inputs = EngineInputs {
+        now_ms: 100_000_000,
+        usage: Some(&usage),
+        last_known_pct: None,
+        live: &live,
+        activity: &activity,
+        completed: &NO_COMPLETIONS,
+        idle_since: &idle_since,
+        cfg: &cfg,
+    };
+    assert!(plan(&[job], &inputs).is_empty());
+}
+
+#[test]
+fn idle_completion_does_not_apply_to_a_vanished_session() {
+    // The tmux session is gone, so the job is Stopped, not finished: an idle
+    // timer left over from before must not turn a crash into a success.
+    let cfg = Config::default();
+    let usage = fresh_usage(10.0);
+    let job = base_job(JobState::Running);
+    let live = HashSet::new(); // "test" is not live
+    let activity = HashMap::new();
+    let idle_since = HashMap::from([("job-1".to_string(), 0i64)]);
+    let inputs = EngineInputs {
+        now_ms: 100_000_000,
+        usage: Some(&usage),
+        last_known_pct: None,
+        live: &live,
+        activity: &activity,
+        completed: &NO_COMPLETIONS,
+        idle_since: &idle_since,
+        cfg: &cfg,
+    };
+    let actions = plan(&[job], &inputs);
+    assert!(
+        matches!(actions.as_slice(), [Action::MarkStopped { .. }]),
+        "expected MarkStopped, got {actions:?}"
     );
 }

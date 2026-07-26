@@ -117,95 +117,335 @@ pub(crate) fn build_usage_status_spans(app: &App) -> Vec<Span<'static>> {
 }
 
 /// Render the session list title spans (shown in the list block border).
-pub fn build_title_spans(app: &App) -> Vec<Span<'static>> {
+///
+/// `width` is the list pane's full width. The pane is only 30% of the screen —
+/// 18 columns at 60 — so the state badges are spelled out only when they fit
+/// and fall back to single glyphs (then drop entirely) as it narrows. The
+/// spelled-out state is always available in the config popup.
+pub fn build_title_spans(app: &App, width: u16) -> Vec<Span<'static>> {
     let title_style = Style::default().fg(ACCENT_BLUE).add_modifier(Modifier::BOLD);
+    // Two border corners plus a trailing space.
+    let budget = width.saturating_sub(3) as usize;
 
     let mut title_spans = vec![Span::styled(" Sessions ", title_style)];
+    let mut used = " Sessions ".width();
+
+    let (active, idle, waiting) = app.total_activity_counts();
+    let counts = activity_count_spans(active, idle, waiting);
+    let counts_width: usize = counts.iter().map(|s| s.content.width()).sum();
+
+    // Badges for non-default view state. Long form first, then glyphs.
+    let mut badges: Vec<(String, String, Style)> = Vec::new();
     if !app.hide_empty {
-        title_spans.push(Span::styled(" [showing empty]", title_style));
+        badges.push((" [showing empty]".into(), " \u{2205}".into(), title_style));
     }
     if !app.group_chains {
-        title_spans.push(Span::styled(" [ungrouped]", title_style));
+        badges.push((" [ungrouped]".into(), " \u{2261}".into(), title_style));
     }
     if let Some(p) = &app.filter_path {
-        title_spans.push(Span::styled(format!(" ({})", p), title_style));
+        badges.push((format!(" ({})", p), " \u{25b8}".into(), title_style));
     }
-    let (active, idle, waiting) = app.total_activity_counts();
-    title_spans.extend(activity_count_spans(active, idle, waiting));
     if app.live_filter {
-        title_spans.push(Span::styled(" [live only]", Style::default().fg(ACCENT_GREEN)));
+        badges.push((
+            " [live only]".into(),
+            " \u{26a1}".into(),
+            Style::default().fg(ACCENT_GREEN),
+        ));
+    }
+
+    let long_total: usize = badges.iter().map(|(l, _, _)| l.width()).sum();
+    let short_total: usize = badges.iter().map(|(_, s, _)| s.width()).sum();
+    // Activity counts outrank the badges: they describe live work, not a toggle.
+    let long_fits = used + long_total + counts_width <= budget;
+    let short_fits = used + short_total + counts_width <= budget;
+
+    for (long, short, style) in &badges {
+        if long_fits {
+            title_spans.push(Span::styled(long.clone(), *style));
+            used += long.width();
+        } else if short_fits {
+            title_spans.push(Span::styled(short.clone(), *style));
+            used += short.width();
+        }
+    }
+
+    if used + counts_width <= budget {
+        title_spans.extend(counts);
     }
     title_spans.push(Span::styled(" ", title_style));
     title_spans
 }
 
-/// Display width of one hint (key span plus label span).
-fn hint_width(line: &Line) -> u16 {
-    line.spans.iter().map(|s| s.content.width() as u16).sum()
+/// How important a status-bar hint is. When the bar cannot fit everything,
+/// hints are dropped from the highest priority number down.
+///
+/// `P0` exists so that `? help` and `q quit` can never be dropped: the whole
+/// failure mode this replaces was a 60-column terminal showing neither, which
+/// left no visible route to the help overlay that documents the rest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum HintPriority {
+    /// Never dropped, at any width.
+    P0,
+    /// The primary interaction: navigation and the main action.
+    P1,
+    /// Frequently used actions.
+    P2,
+    /// Everything else; documented in the help overlay.
+    P3,
 }
 
-/// Lay out a row of key hints across `area`, spreading them with an even gap
-/// (capped at 6 columns) and filling the remainder with the bar background.
-fn render_hint_row(frame: &mut Frame, hints: &[Line], area: Rect, bar_style: Style) {
-    if hints.is_empty() {
+/// One status-bar key hint.
+pub(crate) struct Hint {
+    pub key: String,
+    pub label: String,
+    pub priority: HintPriority,
+    /// When true, this hint is styled as a Shift-modified binding.
+    pub shifted: bool,
+}
+
+impl Hint {
+    /// Mark this hint as a Shift-modified binding, so it is styled as one.
+    fn shifted(mut self) -> Self {
+        self.shifted = true;
+        self
+    }
+
+    fn new(key: &str, label: &str, priority: HintPriority) -> Self {
+        Self {
+            key: key.to_string(),
+            label: label.to_string(),
+            priority,
+            shifted: false,
+        }
+    }
+
+    /// Rendered width: key plus label, both measured in display columns.
+    fn width(&self) -> u16 {
+        (self.key.width() + self.label.width()) as u16
+    }
+}
+
+/// Marker appended when at least one hint was dropped, so the bar admits it is
+/// incomplete instead of silently truncating.
+const OVERFLOW_MARKER: &str = "…";
+
+/// What `select_hints` decided to draw.
+pub(crate) struct HintLayout {
+    /// Indices into the original slice, in the caller's order.
+    pub chosen: Vec<usize>,
+    /// True when at least one hint was dropped *and* the `…` marker fits.
+    pub overflow: bool,
+}
+
+/// Choose which hints fit in `width`, in priority order.
+///
+/// `P0` hints are reserved first and survive at any width that can physically
+/// hold them; the remainder of the budget is filled by ascending priority. The
+/// `…` marker is budgeted for whenever anything is dropped, so the returned
+/// layout never renders wider than `width`.
+///
+/// Pure and unit-tested: the whole point of this refactor is that "does the bar
+/// fit" stops being something you have to eyeball at four terminal sizes.
+pub(crate) fn select_hints(hints: &[Hint], width: u16) -> HintLayout {
+    let empty = HintLayout { chosen: Vec::new(), overflow: false };
+    if hints.is_empty() || width == 0 {
+        return empty;
+    }
+    let gap: u16 = 2;
+    let marker_cost = OVERFLOW_MARKER.width() as u16 + gap;
+
+    // Cost of adding one more hint to a set that already has `count` members.
+    let cost = |h: &Hint, count: usize| h.width() + if count > 0 { gap } else { 0 };
+
+    let mut chosen: Vec<usize> = Vec::new();
+    let mut used: u16 = 0;
+
+    // Reserve the P0 hints first, but still only while they fit: below roughly
+    // 15 columns not even "? help  q quit" can be drawn, and emitting spans
+    // wider than the area would just hand ratatui a garbled fragment to clip.
+    for (i, h) in hints.iter().enumerate() {
+        if h.priority == HintPriority::P0 {
+            let need = cost(h, chosen.len());
+            if used + need <= width {
+                used += need;
+                chosen.push(i);
+            }
+        }
+    }
+
+    // Fill the rest by priority, then by original order within a priority.
+    let mut rest: Vec<usize> = (0..hints.len())
+        .filter(|i| hints[*i].priority != HintPriority::P0)
+        .collect();
+    rest.sort_by_key(|&i| hints[i].priority);
+
+    let mut dropped_any = false;
+    for i in rest {
+        let need = cost(&hints[i], chosen.len());
+        // Once something has been dropped the marker is owed space, so keep
+        // room for it before accepting any further hint.
+        let reserve = if dropped_any { marker_cost } else { 0 };
+        if used + need + reserve <= width {
+            used += need;
+            chosen.push(i);
+        } else {
+            dropped_any = true;
+        }
+    }
+
+    // The marker only earns its space if it actually fits. Evict the
+    // lowest-priority non-P0 hints to make room; if even that is not enough
+    // (a terminal too narrow for the P0 pair plus `…`), drop the marker rather
+    // than overflow the area.
+    let mut overflow = false;
+    if dropped_any {
+        while used + marker_cost > width {
+            let Some(pos) = chosen
+                .iter()
+                .enumerate()
+                .filter(|(_, &idx)| hints[idx].priority != HintPriority::P0)
+                .max_by_key(|(_, &idx)| hints[idx].priority)
+                .map(|(pos, _)| pos)
+            else {
+                break;
+            };
+            let removed = chosen.remove(pos);
+            used -= cost(&hints[removed], chosen.len());
+        }
+        overflow = used + marker_cost <= width;
+    }
+
+    chosen.sort_unstable();
+    HintLayout { chosen, overflow }
+}
+
+/// The four styles a hint row draws with.
+struct HintStyles {
+    bar: Style,
+    key: Style,
+    label: Style,
+    shift_key: Style,
+    shift_label: Style,
+}
+
+/// Lay out a row of key hints across `area`, dropping the lowest-priority ones
+/// that do not fit and marking the overflow with `…`.
+fn render_hint_row(frame: &mut Frame, hints: &[Hint], area: Rect, styles: &HintStyles) {
+    let HintStyles {
+        bar: bar_style,
+        key: key_style,
+        label: hint_style,
+        shift_key: shift_key_style,
+        shift_label: shift_hint_style,
+    } = *styles;
+    if hints.is_empty() || area.width == 0 {
         return;
     }
-    let hint_widths: Vec<u16> = hints.iter().map(hint_width).collect();
-    let total_hint_width: u16 = hint_widths.iter().sum();
-    let num_gaps = hints.len().saturating_sub(1) as u16;
-    let gap_size = if num_gaps > 0 && area.width > total_hint_width {
-        ((area.width - total_hint_width) / num_gaps).min(6)
+    frame.render_widget(Paragraph::new("").style(bar_style), area);
+
+    let HintLayout { chosen, overflow } = select_hints(hints, area.width);
+    if chosen.is_empty() {
+        return;
+    }
+
+    let mut spans: Vec<Span> = Vec::new();
+    for (n, &i) in chosen.iter().enumerate() {
+        if n > 0 {
+            spans.push(Span::styled("  ", bar_style));
+        }
+        let h = &hints[i];
+        let (k, l) = if h.shifted {
+            (shift_key_style, shift_hint_style)
+        } else {
+            (key_style, hint_style)
+        };
+        spans.push(Span::styled(h.key.clone(), k.bg(HIGHLIGHT_BG)));
+        spans.push(Span::styled(h.label.clone(), l.bg(HIGHLIGHT_BG)));
+    }
+    if overflow {
+        spans.push(Span::styled("  ", bar_style));
+        spans.push(Span::styled(
+            OVERFLOW_MARKER,
+            Style::default().fg(FG_OVERLAY).bg(HIGHLIGHT_BG),
+        ));
+    }
+
+    frame.render_widget(Paragraph::new(Line::from(spans)).style(bar_style), area);
+}
+
+/// Build the Jobs-tab hints, in display order.
+pub(crate) fn jobs_hints() -> Vec<Hint> {
+    use HintPriority::*;
+    vec![
+        Hint::new("↑↓/jk", " nav", P1),
+        Hint::new("Enter", " attach", P1),
+        Hint::new("n", " new", P1),
+        Hint::new("e", " edit", P2),
+        Hint::new("p", " pause", P2),
+        Hint::new("c", " resume", P2),
+        Hint::new("x", " stop", P2),
+        Hint::new("d", " delete", P3),
+        Hint::new("f", " done", P3),
+        Hint::new("Space", " auto", P3),
+        Hint::new("s", " watcher", P3),
+        Hint::new("L", " log", P3),
+        Hint::new("Tab", " sessions", P2),
+        Hint::new("?", " help", P0),
+        Hint::new("q", " quit", P0),
+    ]
+}
+
+/// Build the Sessions-tab hints, in display order.
+///
+/// `is_live` adds the stop hint only when a live session is selected, since it
+/// is the only one that does nothing otherwise. While Shift is held, the two
+/// hints that change meaning say so rather than silently doing something else.
+pub(crate) fn sessions_hints(is_live: bool, shift_active: bool, is_historical: bool) -> Vec<Hint> {
+    use HintPriority::*;
+    let nav = if shift_active {
+        Hint::new("↑↓/JK", " scroll", P1).shifted()
     } else {
-        1
+        Hint::new("↑↓/jk", " nav", P1)
     };
-
-    // Build constraints: hint, gap, hint, gap, ..., hint, Fill(1)
-    let mut constraints: Vec<Constraint> = Vec::new();
-    for (i, w) in hint_widths.iter().enumerate() {
-        if i > 0 {
-            constraints.push(Constraint::Length(gap_size));
-        }
-        constraints.push(Constraint::Length(*w));
+    let open = if shift_active && is_historical {
+        Hint::new("Enter", " open direct", P1).shifted()
+    } else {
+        Hint::new("Enter", " open", P1)
+    };
+    let mut hints = vec![
+        nav,
+        open,
+        Hint::new("n", " new", P1),
+        Hint::new("/", " search", P2),
+        Hint::new("r", " rename", P2),
+    ];
+    if is_live {
+        hints.push(Hint::new("x", " stop", P2));
     }
-    constraints.push(Constraint::Fill(1));
-
-    let hint_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints(constraints)
-        .split(area);
-
-    for (i, hint) in hints.iter().enumerate() {
-        let chunk_idx = i * 2; // each hint is at even indices (0, 2, 4, ...)
-        frame.render_widget(
-            Paragraph::new(hint.clone()).style(bar_style),
-            hint_chunks[chunk_idx],
-        );
-        // Gap chunks (odd indices) get bar background
-        if i > 0 {
-            frame.render_widget(
-                Paragraph::new("").style(bar_style),
-                hint_chunks[chunk_idx - 1],
-            );
-        }
-    }
-    // Fill remaining space with bar background
-    frame.render_widget(
-        Paragraph::new("").style(bar_style),
-        hint_chunks[hints.len() * 2 - 1],
-    );
+    hints.extend([
+        Hint::new("Tab", " jobs", P2),
+        Hint::new("Space", " favorite", P3),
+        Hint::new("v", " view", P3),
+        Hint::new("b", " browse", P3),
+        Hint::new("l", " live only", P3),
+        Hint::new("m", " job", P3),
+        Hint::new("o", " config", P3),
+        Hint::new("?", " help", P0),
+        Hint::new("q", " quit", P0),
+    ]);
+    hints
 }
 
 /// Render the bottom status/help bar.
+///
+/// The version label used to live here, permanently reserving 8 columns at
+/// every terminal size. It moved to the config popup's About block so that
+/// space goes to shortcuts instead.
 pub fn render_status_bar(frame: &mut Frame, app: &App, bar_area: Rect) {
     let bar_style = Style::default().bg(HIGHLIGHT_BG);
-    let version_label = format!("v{} ", env!("CARGO_PKG_VERSION"));
-    let version_width = version_label.len() as u16;
     let bar_chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Min(0),
-            Constraint::Length(version_width),
-        ])
+        .constraints([Constraint::Min(0)])
         .split(bar_area);
 
     if app.filter_active {
@@ -247,6 +487,10 @@ pub fn render_status_bar(frame: &mut Frame, app: &App, bar_area: Rect) {
             .fg(ACCENT_PEACH)
             .add_modifier(Modifier::BOLD);
         let hint_style = Style::default().fg(FG_SUBTEXT);
+        // The Shift styling only ever applies to hints that are genuinely
+        // Shift-modified, and only while Shift is actually held. It used to be
+        // applied unconditionally to a few hints, which made them look "lit"
+        // forever in terminals that never report a bare modifier press.
         let shift_key_style = if app.shift_active {
             Style::default().fg(Color::Rgb(255, 210, 170)).add_modifier(Modifier::BOLD)
         } else {
@@ -258,159 +502,58 @@ pub fn render_status_bar(frame: &mut Frame, app: &App, bar_area: Rect) {
             hint_style
         };
 
-        let mut hints: Vec<Line> = Vec::new();
-
-        // Show post-update status in help bar
-        match &app.update_status {
-            UpdateStatus::Downloading => {
-                hints.push(Line::from(Span::styled(
-                    " Updating... ",
-                    Style::default().fg(ACCENT_PEACH).add_modifier(Modifier::BOLD),
-                )));
-            }
-            UpdateStatus::Failed(msg) => {
-                hints.push(Line::from(Span::styled(
-                    format!(" Update failed: {} ", msg),
-                    Style::default()
-                        .fg(Color::Rgb(243, 139, 168))
-                        .add_modifier(Modifier::BOLD),
-                )));
-            }
-            _ => {}
-        }
-
-        if let Some(err) = &app.status_error {
-            hints.push(Line::from(Span::styled(
+        // A transient message (update progress or an error) takes the whole
+        // bar for as long as it is showing: it matters more than the hints,
+        // and interleaving the two is what made the old bar unreadable.
+        let banner = match (&app.update_status, &app.status_error) {
+            (UpdateStatus::Downloading, _) => Some((
+                " Updating... ".to_string(),
+                Style::default().fg(ACCENT_PEACH).add_modifier(Modifier::BOLD),
+            )),
+            (UpdateStatus::Failed(msg), _) => Some((
+                format!(" Update failed: {msg} "),
+                Style::default()
+                    .fg(Color::Rgb(243, 139, 168))
+                    .add_modifier(Modifier::BOLD),
+            )),
+            (_, Some(err)) => Some((
                 format!(" {err} "),
                 Style::default()
                     .fg(Color::Rgb(243, 139, 168))
                     .add_modifier(Modifier::BOLD),
-            )));
-        }
-
-        if app.main_tab == MainTab::Jobs {
-            for (k, label) in [
-                ("↑↓/jk", " navigate"),
-                ("Enter", " attach"),
-                ("n", " new"),
-                ("e", " edit"),
-                ("p", " pause"),
-                ("c", " resume"),
-                ("x", " stop"),
-                ("d", " delete"),
-                ("Space", " auto-resume"),
-                ("s", " watcher"),
-                ("L", " watcher log"),
-                ("Tab", " sessions"),
-                ("?", " help"),
-            ] {
-                hints.push(Line::from(vec![
-                    Span::styled(k, key_style),
-                    Span::styled(label, hint_style),
-                ]));
-            }
-            render_hint_row(frame, &hints, bar_chunks[0], bar_style);
+            )),
+            _ => None,
+        };
+        if let Some((text, style)) = banner {
             frame.render_widget(
-                Paragraph::new(Span::styled(version_label, Style::default().fg(FG_OVERLAY)))
-                    .style(bar_style)
-                    .alignment(ratatui::layout::Alignment::Right),
-                bar_chunks[1],
+                Paragraph::new(Line::from(Span::styled(text, style))).style(bar_style),
+                bar_chunks[0],
             );
             return;
         }
 
-        let is_live = app.selected_live_index().is_some();
+        let hints = match app.main_tab {
+            MainTab::Jobs => jobs_hints(),
+            MainTab::Sessions => sessions_hints(
+                app.selected_live_index().is_some(),
+                app.shift_active,
+                app.is_historical_selected(),
+            ),
+        };
 
-        hints.push(Line::from(vec![
-            Span::styled(
-                if app.shift_active { " ↑↓/JK" } else { " ↑↓/jk" },
-                if app.shift_active { shift_key_style } else { key_style },
-            ),
-            Span::styled(
-                if app.shift_active { " scroll" } else { " navigate" },
-                if app.shift_active { shift_hint_style } else { hint_style },
-            ),
-        ]));
-        let enter_shift = app.shift_active && app.is_historical_selected();
-        hints.push(Line::from(vec![
-            Span::styled(
-                "Enter",
-                if enter_shift { shift_key_style } else { key_style },
-            ),
-            Span::styled(
-                if enter_shift { " open direct" } else { " open" },
-                if enter_shift { shift_hint_style } else { hint_style },
-            ),
-        ]));
-        hints.push(Line::from(vec![
-            Span::styled("/", key_style),
-            Span::styled(" search", hint_style),
-        ]));
-        hints.push(Line::from(vec![
-            Span::styled("o", key_style),
-            Span::styled(" config", hint_style),
-        ]));
-        hints.push(Line::from(vec![
-            Span::styled("w", key_style),
-            Span::styled(" jobs", hint_style),
-        ]));
-        hints.push(Line::from(vec![
-            Span::styled("r", key_style),
-            Span::styled(" rename", hint_style),
-        ]));
-        hints.push(Line::from(vec![
-            Span::styled(
-                if app.shift_active { "N" } else { "n" },
-                if app.shift_active { shift_key_style } else { key_style },
-            ),
-            Span::styled(
-                if app.shift_active { " new direct" } else { " new live" },
-                if app.shift_active { shift_hint_style } else { hint_style },
-            ),
-        ]));
-        hints.push(Line::from(vec![
-            Span::styled("D", shift_key_style),
-            Span::styled(" new dangerous", shift_hint_style),
-        ]));
-        hints.push(Line::from(vec![
-            Span::styled("b", key_style),
-            Span::styled(" browse", hint_style),
-        ]));
-        hints.push(Line::from(vec![
-            Span::styled("l", shift_key_style),
-            Span::styled(" live filter", shift_hint_style),
-        ]));
-        hints.push(Line::from(vec![
-            Span::styled("f", key_style),
-            Span::styled(" favorite", hint_style),
-        ]));
-        if is_live {
-            hints.push(Line::from(vec![
-                Span::styled("x", key_style),
-                Span::styled(" stop session", hint_style),
-            ]));
-        }
-        hints.push(Line::from(vec![
-            Span::styled("q", key_style),
-            Span::styled(" quit", hint_style),
-        ]));
-        hints.push(Line::from(vec![
-            Span::styled("?", shift_key_style),
-            Span::styled(" help", shift_hint_style),
-        ]));
-
-        render_hint_row(frame, &hints, bar_chunks[0], bar_style);
+        render_hint_row(
+            frame,
+            &hints,
+            bar_chunks[0],
+            &HintStyles {
+                bar: bar_style,
+                key: key_style,
+                label: hint_style,
+                shift_key: shift_key_style,
+                shift_label: shift_hint_style,
+            },
+        );
     }
-
-    frame.render_widget(
-        Paragraph::new(Span::styled(
-            version_label,
-            Style::default().fg(FG_OVERLAY),
-        ))
-        .style(bar_style)
-        .alignment(ratatui::layout::Alignment::Right),
-        bar_chunks[1],
-    );
 }
 
 #[cfg(test)]
@@ -490,10 +633,160 @@ mod tests {
     fn session_title_no_longer_carries_the_usage_chip() {
         let mut app = bare_app();
         app.watch_state = Some(watch_state(Some(78.0)));
-        let title: String = build_title_spans(&app)
+        let title: String = build_title_spans(&app, 120)
             .iter()
             .map(|s| s.content.as_ref())
             .collect();
         assert!(!title.contains("78%"), "{title}");
+    }
+
+    // --- Responsive status bar ---
+
+    /// Render the status bar at `width` and return its text content.
+    fn bar_text(app: &App, width: u16) -> String {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut terminal = Terminal::new(TestBackend::new(width, 3)).unwrap();
+        terminal
+            .draw(|f| {
+                let area = Rect { x: 0, y: 0, width, height: 1 };
+                render_status_bar(f, app, area);
+            })
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .take(width as usize)
+            .map(|c| c.symbol())
+            .collect()
+    }
+
+    /// The failure this whole refactor exists to prevent: a narrow terminal
+    /// that shows neither how to get help nor how to quit.
+    #[test]
+    fn help_and_quit_survive_every_width() {
+        let mut app = bare_app();
+        for width in [40u16, 60, 80, 100, 120, 200] {
+            let text = bar_text(&app, width);
+            assert!(text.contains("? help"), "width {width}: {text}");
+            assert!(text.contains("q quit"), "width {width}: {text}");
+        }
+        app.main_tab = MainTab::Jobs;
+        for width in [40u16, 60, 80, 100, 120, 200] {
+            let text = bar_text(&app, width);
+            assert!(text.contains("? help"), "jobs width {width}: {text}");
+            assert!(text.contains("q quit"), "jobs width {width}: {text}");
+        }
+    }
+
+    #[test]
+    fn a_narrow_bar_admits_that_it_dropped_hints() {
+        let app = bare_app();
+        assert!(bar_text(&app, 60).contains(OVERFLOW_MARKER));
+    }
+
+    #[test]
+    fn a_wide_bar_shows_everything_and_no_marker() {
+        let app = bare_app();
+        let text = bar_text(&app, 200);
+        assert!(!text.contains(OVERFLOW_MARKER), "{text}");
+        assert!(text.contains("browse"), "{text}");
+        assert!(text.contains("config"), "{text}");
+    }
+
+    #[test]
+    fn the_version_label_left_the_status_bar() {
+        let app = bare_app();
+        let text = bar_text(&app, 200);
+        assert!(
+            !text.contains(env!("CARGO_PKG_VERSION")),
+            "version should live in the config About block: {text}"
+        );
+    }
+
+    #[test]
+    fn selection_drops_the_lowest_priority_hints_first() {
+        let hints = sessions_hints(false, false, false);
+        // Wide enough for the essentials but not for all the P3 extras.
+        let chosen = select_hints(&hints, 60).chosen;
+        let kept: Vec<HintPriority> = chosen.iter().map(|&i| hints[i].priority).collect();
+        assert!(kept.contains(&HintPriority::P0));
+        assert!(kept.contains(&HintPriority::P1));
+        // Nothing at a given priority may be kept while a higher-priority,
+        // non-P0 hint was dropped.
+        let worst_kept = kept.iter().filter(|p| **p != HintPriority::P0).max().copied();
+        if let Some(worst) = worst_kept {
+            let dropped_better = (0..hints.len())
+                .filter(|i| !chosen.contains(i))
+                .any(|i| hints[i].priority < worst);
+            assert!(!dropped_better, "dropped a higher-priority hint than one kept");
+        }
+    }
+
+    #[test]
+    fn selection_never_exceeds_the_available_width() {
+        let hints = sessions_hints(true, false, false);
+        for width in 1u16..=200 {
+            let HintLayout { chosen, overflow } = select_hints(&hints, width);
+            let gap = 2usize;
+            let mut used: usize = chosen
+                .iter()
+                .map(|&i| hints[i].width() as usize)
+                .sum::<usize>()
+                + gap * chosen.len().saturating_sub(1);
+            if overflow {
+                used += gap + OVERFLOW_MARKER.width();
+            }
+            assert!(
+                used <= width as usize,
+                "width {width}: used {used} for {} hints",
+                chosen.len()
+            );
+        }
+    }
+
+    #[test]
+    fn a_status_error_takes_the_whole_bar() {
+        let mut app = bare_app();
+        app.status_error = Some("No running session 'foo'".into());
+        let text = bar_text(&app, 120);
+        assert!(text.contains("No running session"), "{text}");
+        // The hints step aside rather than interleaving with the alert.
+        assert!(!text.contains("q quit"), "{text}");
+    }
+
+    #[test]
+    fn the_list_title_fits_a_narrow_pane() {
+        let mut app = bare_app();
+        app.hide_empty = false;
+        app.group_chains = false;
+        app.live_filter = true;
+        for width in [18u16, 24, 30, 40, 60] {
+            let title: String = build_title_spans(&app, width)
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect();
+            assert!(
+                title.width() <= width.saturating_sub(2) as usize,
+                "width {width}: {:?} is {} cols",
+                title,
+                title.width()
+            );
+            assert!(title.contains("Sessions"), "width {width}: {title}");
+        }
+    }
+
+    #[test]
+    fn a_wide_list_title_still_spells_the_badges_out() {
+        let mut app = bare_app();
+        app.live_filter = true;
+        let title: String = build_title_spans(&app, 120)
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(title.contains("[live only]"), "{title}");
     }
 }
