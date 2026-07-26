@@ -20,3 +20,4 @@ zip = "2"
 tui-input = "0.10"
 regex = "1"
 sha2 = "0.10"
+uuid = { version = "1.24.0", features = ["v4"] }

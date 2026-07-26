@@ -1,24 +1,29 @@
 mod ansi;
+mod dir_picker;
 mod info_bar;
+mod jobs_tab;
 mod modals;
 mod preview_pane;
 mod session_list;
 pub(crate) mod util;
 
-use crate::app::{App, AppMode};
+use crate::app::{App, AppMode, MainTab};
 use crate::theme::{
     ACCENT_BLUE, ACCENT_MAUVE, ACCENT_PEACH, BG_SURFACE, FG_OVERLAY, FG_SUBTEXT, HIGHLIGHT_BG,
 };
 use crate::update::UpdateStatus;
 use ratatui::{
-    layout::{Constraint, Direction, Layout},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, List, ListState, Paragraph, Wrap},
     Frame,
 };
+use unicode_width::UnicodeWidthStr;
 
-use self::info_bar::{build_title_spans, render_status_bar};
+use self::dir_picker::draw_dir_picker;
+use self::info_bar::{build_title_spans, build_usage_status_spans, render_status_bar};
+use self::jobs_tab::{draw_job_confirm_popup, draw_job_form_popup, draw_jobs_tab};
 use self::modals::{
     draw_duplicate_popup, draw_naming_popup, draw_rename_popup, draw_update_prompt,
     render_help_popup,
@@ -27,19 +32,104 @@ use self::preview_pane::{build_live_preview_text, build_preview_text};
 use self::session_list::{build_flat_items, build_tree_items};
 use self::util::{estimate_wrapped_height, live_dot_style};
 
-/// Render the full TUI frame: session list, preview pane, info bar, status bar,
-/// and any active modal overlay (rename, update prompt, help, naming popup).
+/// Render the full TUI frame: tab strip, the active tab's two panes, the
+/// status bar, and any active modal overlay (rename, update prompt, help,
+/// naming popup, job form).
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(1)])
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(3),
+            Constraint::Length(1),
+        ])
         .split(frame.area());
+
+    render_tab_bar(frame, app, chunks[0]);
 
     let main_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
-        .split(chunks[0]);
+        .split(chunks[1]);
 
+    match app.main_tab {
+        MainTab::Sessions => draw_sessions_tab(frame, app, main_chunks[0], main_chunks[1]),
+        MainTab::Jobs => draw_jobs_tab(frame, app, main_chunks[0], main_chunks[1]),
+    }
+
+    // Status bar
+    render_status_bar(frame, app, chunks[2]);
+
+    draw_overlays(frame, app);
+}
+
+/// Render the top tab strip. The active tab is highlighted; the Jobs tab
+/// carries a job count so a running schedule is visible from the Sessions tab.
+/// The usage/watcher chip is right-aligned here rather than in either tab's
+/// list title so it stays visible no matter which tab is open.
+fn render_tab_bar(frame: &mut Frame, app: &App, area: Rect) {
+    let bar_style = Style::default().bg(HIGHLIGHT_BG);
+    let active = Style::default()
+        .fg(ACCENT_PEACH)
+        .bg(HIGHLIGHT_BG)
+        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+    let inactive = Style::default().fg(FG_SUBTEXT).bg(HIGHLIGHT_BG);
+
+    let jobs_label = if app.jobs.is_empty() {
+        " Jobs ".to_string()
+    } else {
+        format!(" Jobs ({}) ", app.jobs.len())
+    };
+
+    let spans = vec![
+        Span::styled(
+            " Sessions ",
+            if app.main_tab == MainTab::Sessions { active } else { inactive },
+        ),
+        Span::styled("  ", bar_style),
+        Span::styled(
+            jobs_label,
+            if app.main_tab == MainTab::Jobs { active } else { inactive },
+        ),
+        Span::styled("   ", bar_style),
+        Span::styled("Tab", Style::default().fg(FG_OVERLAY).bg(HIGHLIGHT_BG)),
+        Span::styled(" switch", Style::default().fg(FG_OVERLAY).bg(HIGHLIGHT_BG)),
+    ];
+
+    // The chip is built without a background, so paint the bar background onto
+    // each span before it lands in the tab strip.
+    let chip: Vec<Span<'static>> = build_usage_status_spans(app)
+        .into_iter()
+        .map(|s| Span::styled(s.content, s.style.bg(HIGHLIGHT_BG)))
+        .collect();
+
+    if chip.is_empty() {
+        frame.render_widget(Paragraph::new(Line::from(spans)).style(bar_style), area);
+        return;
+    }
+
+    let chip_width: u16 = chip
+        .iter()
+        .map(|s| s.content.width() as u16)
+        .sum::<u16>()
+        .saturating_add(1); // trailing pad from the right edge
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Fill(1), Constraint::Length(chip_width)])
+        .split(area);
+
+    frame.render_widget(Paragraph::new(Line::from(spans)).style(bar_style), cols[0]);
+    frame.render_widget(
+        Paragraph::new(Line::from(chip))
+            .style(bar_style)
+            .alignment(Alignment::Right),
+        cols[1],
+    );
+}
+
+/// Render the Sessions tab: the session list plus the info bar and preview pane.
+fn draw_sessions_tab(frame: &mut Frame, app: &mut App, list_area: Rect, right_area: Rect) {
+    let main_chunks = [list_area, right_area];
     let session_panel_inner_width = main_chunks[0].width.saturating_sub(2) as usize;
 
     // Session list (filtered or tree)
@@ -208,10 +298,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
 
     frame.render_widget(preview_widget, preview_area);
+}
 
-    // Status bar
-    render_status_bar(frame, app, chunks[1]);
-
+/// Render whichever modal overlay the current `AppMode` calls for, on top of
+/// the active tab.
+fn draw_overlays(frame: &mut Frame, app: &mut App) {
     // Rename popup overlay
     if app.mode == AppMode::Renaming {
         draw_rename_popup(frame, &app.rename_input);
@@ -226,7 +317,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     // Help overlay
     if app.mode == AppMode::Help {
-        render_help_popup(frame, frame.area());
+        render_help_popup(frame, frame.area(), app.help_tab);
     }
 
     // NamingSession overlay (centered popup)
@@ -249,5 +340,74 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         if let Some(ref name) = app.duplicate_name.clone() {
             draw_duplicate_popup(frame, name);
         }
+    }
+
+    // Directory-picker overlay
+    if app.mode == AppMode::DirPicker {
+        draw_dir_picker(frame, app);
+    }
+
+    // Job create/edit form overlay
+    if app.mode == AppMode::JobForm {
+        draw_job_form_popup(frame, app);
+    }
+
+    // Job stop/delete confirmation overlay
+    if app.mode == AppMode::JobConfirm {
+        draw_job_confirm_popup(frame, app);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::schedule::store::WatchState;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    /// An App with a live watcher reporting 78% usage, and no other schedule
+    /// state inherited from the host machine.
+    fn app_with_usage() -> App {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let mut app = App::new(vec![], None, Config::default());
+        app.jobs = vec![];
+        app.mode = AppMode::Normal;
+        app.watch_state = Some(WatchState {
+            pid: 1234,
+            started_at_ms: now,
+            heartbeat_ms: now,
+            last_usage_pct: Some(78.0),
+            last_usage_at_ms: Some(now),
+            reset_at_ms: None,
+            usage_error: None,
+        });
+        app
+    }
+
+    /// Render a full frame and return the text of the tab strip (row 0).
+    fn tab_bar_text(app: &mut App) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        terminal.draw(|f| draw(f, app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..100)
+            .map(|x| buffer[(x, 0)].symbol().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn usage_chip_renders_on_the_sessions_tab() {
+        let mut app = app_with_usage();
+        app.main_tab = MainTab::Sessions;
+        assert!(tab_bar_text(&mut app).contains("78%"));
+    }
+
+    #[test]
+    fn usage_chip_renders_on_the_jobs_tab() {
+        let mut app = app_with_usage();
+        app.main_tab = MainTab::Jobs;
+        assert!(tab_bar_text(&mut app).contains("78%"));
     }
 }

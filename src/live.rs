@@ -2,9 +2,17 @@
 
 use anyhow::Context;
 use regex::Regex;
+use std::io::Write;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::LazyLock;
+use std::time::Duration;
 
 pub const TMUX_SOCKET: &str = "ccsm";
+
+/// The tmux session name reserved for the ccsm scheduler daemon. Filtered out
+/// of `discover_live_sessions` so it never appears in the user's session list
+/// and never gets activity-polled against its own log output.
+pub const WATCH_SESSION: &str = "ccsm-watch";
 
 /// A running tmux session managed by ccsm on the dedicated `ccsm` tmux socket.
 pub struct LiveSession {
@@ -16,6 +24,9 @@ pub struct LiveSession {
     pub cwd: String,
     /// Base name of the working directory, used as a short project label.
     pub project_name: String,
+    /// Scheduler job id tagged on this session via `set_job_tag`, if any.
+    /// Survives `rename-session`, unlike matching on `tmux_name`.
+    pub job_id: Option<String>,
 }
 
 /// Returns true if the ccsm tmux server is currently running (i.e. `tmux -L ccsm list-sessions` succeeds).
@@ -39,7 +50,7 @@ pub fn discover_live_sessions(tmux: &str) -> Vec<LiveSession> {
             TMUX_SOCKET,
             "list-sessions",
             "-F",
-            "#{session_name}\t#{session_path}",
+            "#{session_name}\t#{session_path}\t#{@ccsm_job}",
         ])
         .output();
     let output = match output {
@@ -47,11 +58,30 @@ pub fn discover_live_sessions(tmux: &str) -> Vec<LiveSession> {
         _ => return vec![],
     };
     let text = String::from_utf8_lossy(&output.stdout);
+    parse_session_lines(&text)
+}
+
+/// Parse `list-sessions -F "#{session_name}\t#{session_path}\t#{@ccsm_job}"`
+/// output into `LiveSession` values. Tolerant of a missing third column so
+/// nothing breaks if the format string is ever wrong: an unset `@ccsm_job`
+/// (or a missing column) maps to `job_id: None`. Excludes `WATCH_SESSION`,
+/// the scheduler daemon's own session.
+fn parse_session_lines(text: &str) -> Vec<LiveSession> {
     text.lines()
         .filter_map(|line| {
-            let (name, path) = line.split_once('\t')?;
-            let name = name.to_string();
-            let path = path.to_string();
+            let mut parts = line.splitn(3, '\t');
+            let name = parts.next()?.to_string();
+            let path = parts.next()?.to_string();
+            if name == WATCH_SESSION {
+                return None;
+            }
+            let job_id = parts.next().and_then(|tag| {
+                if tag.is_empty() {
+                    None
+                } else {
+                    Some(tag.to_string())
+                }
+            });
             let project_name = std::path::Path::new(&path)
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
@@ -61,6 +91,7 @@ pub fn discover_live_sessions(tmux: &str) -> Vec<LiveSession> {
                 tmux_name: name,
                 cwd: path,
                 project_name,
+                job_id,
             })
         })
         .collect()
@@ -401,7 +432,7 @@ pub fn detect_activity(content: &str) -> ActivityState {
 /// a session that can never be attached, captured, or killed by name. Replace
 /// the illegal characters with `-` and trim leading/trailing `-` (falling back
 /// to `"session"` if nothing usable remains).
-fn sanitize_session_name(name: &str) -> String {
+pub(crate) fn sanitize_session_name(name: &str) -> String {
     let replaced: String = name
         .chars()
         .map(|c| if c == '.' || c == ':' { '-' } else { c })
@@ -447,6 +478,439 @@ pub fn generate_auto_name(cwd: &str, existing: &[LiveSession]) -> String {
         }
         n += 1;
     }
+}
+
+// --- Scheduler primitives -------------------------------------------------
+//
+// Every tmux invocation below is split into a pure `*_args(...) -> Vec<String>`
+// builder plus a thin runner, so the argv is unit-testable without tmux
+// present.
+//
+// Two exact-match target forms are needed, and they differ by command: a
+// plain `-t name` does prefix/fnmatch matching, which is a real hazard (a
+// session named `ccsm` would also match `ccsm-watch`). Session-scoped
+// commands (has-session, kill-session, rename-session, list-clients) want
+// `=name`; pane-scoped commands (send-keys, capture-pane, paste-buffer,
+// display-message, set-option) want `=name:` — the trailing colon is
+// required because pane targets parse as session:window.pane, and without it
+// tmux reports "can't find pane" (or, worse, `display-message` silently
+// returns an empty string with exit code 0 instead of erroring).
+
+/// Exact-match tmux target for a session-scoped command ("=name").
+fn session_target(name: &str) -> String {
+    format!("={}", name)
+}
+
+/// Exact-match tmux target for a pane-scoped command ("=name:"). The trailing
+/// colon is required: pane targets parse as session:window.pane, and without
+/// it tmux reports "can't find pane".
+fn pane_target(name: &str) -> String {
+    format!("={}:", name)
+}
+
+/// Build argv for `has-session -t =name`.
+fn session_exists_args(name: &str) -> Vec<String> {
+    vec![
+        "-L".to_string(),
+        TMUX_SOCKET.to_string(),
+        "has-session".to_string(),
+        "-t".to_string(),
+        session_target(name),
+    ]
+}
+
+/// True if a session with exactly this name exists on the ccsm socket.
+pub fn session_exists(tmux: &str, name: &str) -> bool {
+    std::process::Command::new(tmux)
+        .args(session_exists_args(name))
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Build argv for `display-message -p -t =name: "#{pane_in_mode}"`.
+fn pane_in_mode_args(name: &str) -> Vec<String> {
+    vec![
+        "-L".to_string(),
+        TMUX_SOCKET.to_string(),
+        "display-message".to_string(),
+        "-p".to_string(),
+        "-t".to_string(),
+        pane_target(name),
+        "#{pane_in_mode}".to_string(),
+    ]
+}
+
+/// True if the pane is in copy/scroll mode, where send-keys would be
+/// swallowed (a paste still lands, but Escape/Enter/C-u are consumed by copy
+/// mode and never reach the application).
+pub fn pane_in_mode(tmux: &str, name: &str) -> bool {
+    std::process::Command::new(tmux)
+        .args(pane_in_mode_args(name))
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "1")
+        .unwrap_or(false)
+}
+
+/// Build argv for `send-keys -t =name: -X cancel`.
+fn cancel_copy_mode_args(name: &str) -> Vec<String> {
+    vec![
+        "-L".to_string(),
+        TMUX_SOCKET.to_string(),
+        "send-keys".to_string(),
+        "-t".to_string(),
+        pane_target(name),
+        "-X".to_string(),
+        "cancel".to_string(),
+    ]
+}
+
+/// Leave copy mode so subsequent send-keys reach the application. Failure is
+/// non-fatal: callers guard send-keys calls with `pane_in_mode` and only need
+/// a best-effort attempt to clear it.
+pub fn cancel_copy_mode(tmux: &str, name: &str) {
+    let _ = std::process::Command::new(tmux)
+        .args(cancel_copy_mode_args(name))
+        .output();
+}
+
+/// Build argv for `list-clients -t =name`.
+fn list_clients_args(name: &str) -> Vec<String> {
+    vec![
+        "-L".to_string(),
+        TMUX_SOCKET.to_string(),
+        "list-clients".to_string(),
+        "-t".to_string(),
+        session_target(name),
+    ]
+}
+
+/// True if any client is attached, meaning the user is looking at this
+/// session.
+pub fn has_attached_client(tmux: &str, name: &str) -> bool {
+    std::process::Command::new(tmux)
+        .args(list_clients_args(name))
+        .output()
+        .map(|o| o.status.success() && !String::from_utf8_lossy(&o.stdout).trim().is_empty())
+        .unwrap_or(false)
+}
+
+/// Build argv for `send-keys -t =name: Escape`.
+fn send_escape_args(name: &str) -> Vec<String> {
+    vec![
+        "-L".to_string(),
+        TMUX_SOCKET.to_string(),
+        "send-keys".to_string(),
+        "-t".to_string(),
+        pane_target(name),
+        "Escape".to_string(),
+    ]
+}
+
+/// Send a single Escape to interrupt the current turn, leaving claude alive
+/// at its prompt. Exits copy mode first. Never send two in rapid succession:
+/// Escape at an idle empty prompt is a harmless no-op, but a double Escape
+/// sent while the first is still being processed is unverified and best
+/// avoided.
+pub fn interrupt_session(tmux: &str, name: &str) -> anyhow::Result<()> {
+    if pane_in_mode(tmux, name) {
+        cancel_copy_mode(tmux, name);
+    }
+    let output = std::process::Command::new(tmux)
+        .args(send_escape_args(name))
+        .output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("Failed to interrupt session '{}': {}", name, stderr.trim());
+    }
+    Ok(())
+}
+
+/// Build argv for `send-keys -t =name: C-c`.
+fn send_ctrl_c_args(name: &str) -> Vec<String> {
+    vec![
+        "-L".to_string(),
+        TMUX_SOCKET.to_string(),
+        "send-keys".to_string(),
+        "-t".to_string(),
+        pane_target(name),
+        "C-c".to_string(),
+    ]
+}
+
+/// Harder interrupt, used only as an escalation step after Escape fails.
+pub fn send_ctrl_c(tmux: &str, name: &str) -> anyhow::Result<()> {
+    if pane_in_mode(tmux, name) {
+        cancel_copy_mode(tmux, name);
+    }
+    let output = std::process::Command::new(tmux)
+        .args(send_ctrl_c_args(name))
+        .output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "Failed to send Ctrl+C to session '{}': {}",
+            name,
+            stderr.trim()
+        );
+    }
+    Ok(())
+}
+
+/// Build argv for `send-keys -t =name: C-u`.
+fn clear_input_line_args(name: &str) -> Vec<String> {
+    vec![
+        "-L".to_string(),
+        TMUX_SOCKET.to_string(),
+        "send-keys".to_string(),
+        "-t".to_string(),
+        pane_target(name),
+        "C-u".to_string(),
+    ]
+}
+
+/// Clear the pane's current input line so a paste does not concatenate with
+/// whatever is already typed there (two successive pastes without this
+/// produce a single run-on line of the old and new text).
+pub fn clear_input_line(tmux: &str, name: &str) -> anyhow::Result<()> {
+    if pane_in_mode(tmux, name) {
+        cancel_copy_mode(tmux, name);
+    }
+    let output = std::process::Command::new(tmux)
+        .args(clear_input_line_args(name))
+        .output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "Failed to clear input line for session '{}': {}",
+            name,
+            stderr.trim()
+        );
+    }
+    Ok(())
+}
+
+/// Build argv for `send-keys -t =name: Enter`.
+fn send_enter_args(name: &str) -> Vec<String> {
+    vec![
+        "-L".to_string(),
+        TMUX_SOCKET.to_string(),
+        "send-keys".to_string(),
+        "-t".to_string(),
+        pane_target(name),
+        "Enter".to_string(),
+    ]
+}
+
+/// Submit the current input line.
+pub fn send_enter(tmux: &str, name: &str) -> anyhow::Result<()> {
+    if pane_in_mode(tmux, name) {
+        cancel_copy_mode(tmux, name);
+    }
+    let output = std::process::Command::new(tmux)
+        .args(send_enter_args(name))
+        .output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "Failed to submit input for session '{}': {}",
+            name,
+            stderr.trim()
+        );
+    }
+    Ok(())
+}
+
+/// Monotonic counter appended to generated tmux buffer names so concurrent
+/// calls to `send_text` never race on the same buffer name.
+static BUFFER_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Generate a unique tmux paste-buffer name, so the daemon never clobbers the
+/// user's paste buffer or races another in-flight call.
+fn unique_buffer_name() -> String {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let n = BUFFER_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("ccsm-{}-{}", millis, n)
+}
+
+/// Collapse embedded `\r?\n` into a single space, so an embedded newline
+/// cannot submit mid-prompt once it lands in the pane's single-line input box.
+fn normalize_prompt_text(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\n', " ")
+}
+
+/// Build argv for `load-buffer -b <buf_name> -` (buffer contents are supplied
+/// on stdin, not argv).
+fn load_buffer_args(buf_name: &str) -> Vec<String> {
+    vec![
+        "-L".to_string(),
+        TMUX_SOCKET.to_string(),
+        "load-buffer".to_string(),
+        "-b".to_string(),
+        buf_name.to_string(),
+        "-".to_string(),
+    ]
+}
+
+/// Build argv for `paste-buffer -d -p -b <buf_name> -t =name:`.
+fn paste_buffer_args(buf_name: &str, name: &str) -> Vec<String> {
+    vec![
+        "-L".to_string(),
+        TMUX_SOCKET.to_string(),
+        "paste-buffer".to_string(),
+        "-d".to_string(),
+        "-p".to_string(),
+        "-b".to_string(),
+        buf_name.to_string(),
+        "-t".to_string(),
+        pane_target(name),
+    ]
+}
+
+/// Insert text as a single bracketed paste without submitting it. Copy mode
+/// swallows send-keys but not pastes, so no `pane_in_mode` guard is needed
+/// here. The text is written to `load-buffer`'s stdin rather than passed on
+/// argv, so there is no argv length limit and no shell-quoting to get wrong.
+pub fn send_text(tmux: &str, name: &str, text: &str) -> anyhow::Result<()> {
+    let normalized = normalize_prompt_text(text);
+    let buf_name = unique_buffer_name();
+
+    let mut child = std::process::Command::new(tmux)
+        .args(load_buffer_args(&buf_name))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .with_context(|| format!("Failed to spawn load-buffer for session '{}'", name))?;
+    child
+        .stdin
+        .take()
+        .expect("stdin was piped")
+        .write_all(normalized.as_bytes())
+        .with_context(|| format!("Failed to write buffer contents for session '{}'", name))?;
+    let output = child
+        .wait_with_output()
+        .with_context(|| format!("Failed to load buffer for session '{}'", name))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "Failed to load-buffer for session '{}': {}",
+            name,
+            stderr.trim()
+        );
+    }
+
+    let output = std::process::Command::new(tmux)
+        .args(paste_buffer_args(&buf_name, name))
+        .output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "Failed to paste buffer into session '{}': {}",
+            name,
+            stderr.trim()
+        );
+    }
+    Ok(())
+}
+
+/// Full prompt delivery: exit copy mode, clear the input line, paste, settle,
+/// then submit. The ~200ms settle between paste and Enter gives the TUI time
+/// to process the paste before the Enter key is sent; without it the Enter
+/// can race the paste and land before the text has been read into the input
+/// box.
+pub fn send_prompt(tmux: &str, name: &str, text: &str) -> anyhow::Result<()> {
+    if pane_in_mode(tmux, name) {
+        cancel_copy_mode(tmux, name);
+    }
+    clear_input_line(tmux, name)?;
+    send_text(tmux, name, text)?;
+    std::thread::sleep(Duration::from_millis(200));
+    send_enter(tmux, name)?;
+    Ok(())
+}
+
+/// Build argv for `set-option -t =name: @ccsm_job <job_id>`.
+fn set_job_tag_args(name: &str, job_id: &str) -> Vec<String> {
+    vec![
+        "-L".to_string(),
+        TMUX_SOCKET.to_string(),
+        "set-option".to_string(),
+        "-t".to_string(),
+        pane_target(name),
+        "@ccsm_job".to_string(),
+        job_id.to_string(),
+    ]
+}
+
+/// Tag a tmux session with a ccsm job id. Survives `rename-session`, unlike a
+/// name-based binding.
+pub fn set_job_tag(tmux: &str, name: &str, job_id: &str) -> anyhow::Result<()> {
+    let output = std::process::Command::new(tmux)
+        .args(set_job_tag_args(name, job_id))
+        .output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "Failed to tag session '{}' with job id: {}",
+            name,
+            stderr.trim()
+        );
+    }
+    Ok(())
+}
+
+/// `start_live_session` followed by `set_job_tag`, so a newly dispatched
+/// session is immediately findable by job id.
+pub fn start_managed_session(
+    tmux: &str,
+    name: &str,
+    cwd: &str,
+    job_id: &str,
+    cmd: &[&str],
+) -> anyhow::Result<()> {
+    start_live_session(tmux, name, cwd, cmd)?;
+    set_job_tag(tmux, name, job_id)
+}
+
+/// Poll until the pane's output stops changing, indicating startup has
+/// settled. Heuristic: two consecutive 30-line captures that are non-empty
+/// and identical. Polls every 250ms until `timeout` elapses; returns `false`
+/// if it never settles in time.
+pub fn wait_pane_settled(tmux: &str, name: &str, timeout: Duration) -> bool {
+    let start = std::time::Instant::now();
+    let mut previous: Option<String> = None;
+    while start.elapsed() < timeout {
+        let capture = poll_pane_tail(tmux, name, 30);
+        if !capture.trim().is_empty() {
+            if previous.as_deref() == Some(capture.as_str()) {
+                return true;
+            }
+            previous = Some(capture);
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    false
+}
+
+/// True if the pane is showing claude's "do you trust this folder" dialog,
+/// which blocks a dispatched session indefinitely. Callers pass
+/// already-captured pane text (e.g. from `poll_pane_tail`).
+pub fn detect_trust_prompt(content: &str) -> bool {
+    let clean = strip_ansi(content);
+    clean.contains("Quick safety check: Is this a project you created or one you trust?")
+        || clean.contains("Yes, I trust this folder")
+}
+
+/// True if the pane shows claude's post-interrupt marker, confirming a soft
+/// pause actually took effect. Callers pass already-captured pane text (e.g.
+/// from `poll_pane_tail`).
+pub fn detect_interrupted(content: &str) -> bool {
+    let clean = strip_ansi(content);
+    clean.contains("Interrupted \u{00b7} What should Claude do instead?")
 }
 
 #[cfg(test)]
@@ -599,5 +1063,214 @@ mod tests {
         // If both waiting and active patterns appear, waiting (checked first) wins
         let content = "Thinking\u{2026} (2m \u{00b7} 5.0k tokens)\nDo you want to proceed?";
         assert_eq!(detect_activity(content), ActivityState::Waiting);
+    }
+
+    #[test]
+    fn session_target_is_exact_match_prefix() {
+        assert_eq!(session_target("x"), "=x");
+    }
+
+    #[test]
+    fn pane_target_has_trailing_colon() {
+        assert_eq!(pane_target("x"), "=x:");
+    }
+
+    #[test]
+    fn session_exists_args_shape() {
+        assert_eq!(
+            session_exists_args("my-sess"),
+            vec!["-L", "ccsm", "has-session", "-t", "=my-sess"]
+        );
+    }
+
+    #[test]
+    fn pane_in_mode_args_shape() {
+        assert_eq!(
+            pane_in_mode_args("my-sess"),
+            vec![
+                "-L",
+                "ccsm",
+                "display-message",
+                "-p",
+                "-t",
+                "=my-sess:",
+                "#{pane_in_mode}"
+            ]
+        );
+    }
+
+    #[test]
+    fn cancel_copy_mode_args_shape() {
+        assert_eq!(
+            cancel_copy_mode_args("my-sess"),
+            vec!["-L", "ccsm", "send-keys", "-t", "=my-sess:", "-X", "cancel"]
+        );
+    }
+
+    #[test]
+    fn list_clients_args_shape() {
+        assert_eq!(
+            list_clients_args("my-sess"),
+            vec!["-L", "ccsm", "list-clients", "-t", "=my-sess"]
+        );
+    }
+
+    #[test]
+    fn send_escape_args_shape() {
+        // The interrupt builder: a single Escape targeted at the pane.
+        assert_eq!(
+            send_escape_args("my-sess"),
+            vec!["-L", "ccsm", "send-keys", "-t", "=my-sess:", "Escape"]
+        );
+    }
+
+    #[test]
+    fn send_ctrl_c_args_shape() {
+        assert_eq!(
+            send_ctrl_c_args("my-sess"),
+            vec!["-L", "ccsm", "send-keys", "-t", "=my-sess:", "C-c"]
+        );
+    }
+
+    #[test]
+    fn clear_input_line_args_shape() {
+        assert_eq!(
+            clear_input_line_args("my-sess"),
+            vec!["-L", "ccsm", "send-keys", "-t", "=my-sess:", "C-u"]
+        );
+    }
+
+    #[test]
+    fn send_enter_args_shape() {
+        assert_eq!(
+            send_enter_args("my-sess"),
+            vec!["-L", "ccsm", "send-keys", "-t", "=my-sess:", "Enter"]
+        );
+    }
+
+    #[test]
+    fn load_buffer_args_shape() {
+        assert_eq!(
+            load_buffer_args("ccsm-123-0"),
+            vec!["-L", "ccsm", "load-buffer", "-b", "ccsm-123-0", "-"]
+        );
+    }
+
+    #[test]
+    fn paste_buffer_args_shape() {
+        assert_eq!(
+            paste_buffer_args("ccsm-123-0", "my-sess"),
+            vec![
+                "-L",
+                "ccsm",
+                "paste-buffer",
+                "-d",
+                "-p",
+                "-b",
+                "ccsm-123-0",
+                "-t",
+                "=my-sess:"
+            ]
+        );
+    }
+
+    #[test]
+    fn set_job_tag_args_shape() {
+        assert_eq!(
+            set_job_tag_args("my-sess", "job-42"),
+            vec![
+                "-L",
+                "ccsm",
+                "set-option",
+                "-t",
+                "=my-sess:",
+                "@ccsm_job",
+                "job-42"
+            ]
+        );
+    }
+
+    #[test]
+    fn targets_handle_unusual_session_names_as_single_argv_element() {
+        // A name containing '=', spaces, or a leading '-' must still produce
+        // exactly one argv element per target, never be split or reinterpreted
+        // as extra flags.
+        for name in ["=weird", "has space", "-flag-like"] {
+            assert_eq!(session_target(name), format!("={}", name));
+            assert_eq!(pane_target(name), format!("={}:", name));
+            let args = send_escape_args(name);
+            assert_eq!(args.len(), 6);
+            assert_eq!(args[4], pane_target(name));
+        }
+    }
+
+    #[test]
+    fn normalize_prompt_text_collapses_newlines() {
+        assert_eq!(normalize_prompt_text("line one\nline two"), "line one line two");
+        assert_eq!(
+            normalize_prompt_text("line one\r\nline two\r\nline three"),
+            "line one line two line three"
+        );
+        assert_eq!(normalize_prompt_text("no newline"), "no newline");
+    }
+
+    #[test]
+    fn parse_session_lines_splits_three_columns() {
+        let text = "sess-a\t/home/sess-a\tjob-1\n";
+        let sessions = parse_session_lines(text);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].tmux_name, "sess-a");
+        assert_eq!(sessions[0].cwd, "/home/sess-a");
+        assert_eq!(sessions[0].job_id, Some("job-1".to_string()));
+    }
+
+    #[test]
+    fn parse_session_lines_empty_job_tag_is_none() {
+        let text = "sess-a\t/home/sess-a\t\n";
+        let sessions = parse_session_lines(text);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].job_id, None);
+    }
+
+    #[test]
+    fn parse_session_lines_excludes_watch_session() {
+        let text = "ccsm-watch\t/home/watch\t\nsess-a\t/home/sess-a\tjob-1\n";
+        let sessions = parse_session_lines(text);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].tmux_name, "sess-a");
+    }
+
+    #[test]
+    fn parse_session_lines_missing_third_column_defaults_to_none() {
+        let text = "sess-a\t/home/sess-a\n";
+        let sessions = parse_session_lines(text);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].tmux_name, "sess-a");
+        assert_eq!(sessions[0].cwd, "/home/sess-a");
+        assert_eq!(sessions[0].job_id, None);
+    }
+
+    #[test]
+    fn detect_trust_prompt_matches_real_dialog() {
+        let content = "Quick safety check: Is this a project you created or one you trust?\n\n1. Yes, I trust this folder\n2. No";
+        assert!(detect_trust_prompt(content));
+    }
+
+    #[test]
+    fn detect_trust_prompt_negative_on_ordinary_output() {
+        let content = "some output\nclaude output here";
+        assert!(!detect_trust_prompt(content));
+    }
+
+    #[test]
+    fn detect_interrupted_matches_marker() {
+        let content = "\u{23bf}  Interrupted \u{00b7} What should Claude do instead?";
+        assert!(detect_interrupted(content));
+    }
+
+    #[test]
+    fn detect_interrupted_negative_on_ordinary_output() {
+        let content = "some output\nclaude output here";
+        assert!(!detect_interrupted(content));
     }
 }

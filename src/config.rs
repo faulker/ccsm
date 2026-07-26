@@ -26,6 +26,28 @@ impl DisplayMode {
     }
 }
 
+/// How a managed session is paused when account usage crosses the threshold.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PauseMode {
+    /// Send Escape to interrupt claude, leaving the tmux session alive at its prompt.
+    #[default]
+    Soft,
+    /// Kill the tmux session; relaunch later with `claude --resume <id>`.
+    Hard,
+}
+
+impl PauseMode {
+    /// Returns the short human-readable label shown in the UI.
+    #[allow(dead_code)]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Soft => "Soft (Escape)",
+            Self::Hard => "Hard (kill + resume)",
+        }
+    }
+}
+
 /// Persisted application configuration stored in `~/.config/ccsm/config.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -54,6 +76,42 @@ pub struct Config {
     /// Custom path to the `tmux` binary (None = look up "tmux" on PATH).
     #[serde(default)]
     pub tmux_path: Option<String>,
+    /// Path to the `claude-usage` binary. `None` means look it up on PATH.
+    #[serde(default)]
+    pub usage_path: Option<String>,
+    /// Pause managed sessions when 5-hour usage reaches this percentage.
+    #[serde(default = "default_pause_percent")]
+    pub usage_pause_percent: f64,
+    /// Resume paused sessions once usage falls to or below this percentage.
+    #[serde(default = "default_resume_percent")]
+    pub usage_resume_percent: f64,
+    /// Seconds between usage polls while a job is active.
+    #[serde(default = "default_usage_poll_seconds")]
+    pub usage_poll_seconds: u64,
+    /// A usage sample older than this many seconds is treated as stale.
+    #[serde(default = "default_usage_max_age_seconds")]
+    pub usage_max_age_seconds: u64,
+    /// Value passed to `claude-usage --source`.
+    #[serde(default = "default_usage_source")]
+    pub usage_source: String,
+    /// Default pause strategy for new jobs.
+    #[serde(default)]
+    pub pause_mode: PauseMode,
+    /// Also pause on the 7-day usage window, not just the 5-hour one.
+    #[serde(default = "default_true")]
+    pub watch_seven_day: bool,
+    /// Start the watcher daemon automatically when a job is created.
+    #[serde(default = "default_true")]
+    pub watch_autostart: bool,
+    /// Skip automated key sends while a tmux client is attached to the session.
+    #[serde(default = "default_true")]
+    pub defer_while_attached: bool,
+    /// Text pasted into a paused session to make it continue.
+    #[serde(default = "default_continue_prompt")]
+    pub continue_prompt: String,
+    /// Give up relaunching a job after this many consecutive failures.
+    #[serde(default = "default_max_restart_attempts")]
+    pub max_restart_attempts: u32,
 }
 
 impl Default for Config {
@@ -68,6 +126,18 @@ impl Default for Config {
             favorites: HashSet::new(),
             claude_path: None,
             tmux_path: None,
+            usage_path: None,
+            usage_pause_percent: default_pause_percent(),
+            usage_resume_percent: default_resume_percent(),
+            usage_poll_seconds: default_usage_poll_seconds(),
+            usage_max_age_seconds: default_usage_max_age_seconds(),
+            usage_source: default_usage_source(),
+            pause_mode: PauseMode::default(),
+            watch_seven_day: default_true(),
+            watch_autostart: default_true(),
+            defer_while_attached: default_true(),
+            continue_prompt: default_continue_prompt(),
+            max_restart_attempts: default_max_restart_attempts(),
         }
     }
 }
@@ -77,10 +147,54 @@ fn default_true() -> bool {
     true
 }
 
+/// Serde default helper for `usage_pause_percent`.
+fn default_pause_percent() -> f64 {
+    95.0
+}
+
+/// Serde default helper for `usage_resume_percent`.
+fn default_resume_percent() -> f64 {
+    50.0
+}
+
+/// Serde default helper for `usage_poll_seconds`.
+fn default_usage_poll_seconds() -> u64 {
+    60
+}
+
+/// Serde default helper for `usage_max_age_seconds`.
+fn default_usage_max_age_seconds() -> u64 {
+    900
+}
+
+/// Serde default helper for `usage_source`.
+fn default_usage_source() -> String {
+    "auto".to_string()
+}
+
+/// Serde default helper for `continue_prompt`.
+fn default_continue_prompt() -> String {
+    "Continue where you left off.".to_string()
+}
+
+/// Serde default helper for `max_restart_attempts`.
+fn default_max_restart_attempts() -> u32 {
+    5
+}
+
+/// Root directory for all ccsm state files. `CCSM_CONFIG_DIR` overrides the
+/// default location, primarily for tests.
+pub fn ccsm_dir() -> Option<PathBuf> {
+    if let Ok(override_dir) = std::env::var("CCSM_CONFIG_DIR") {
+        return Some(PathBuf::from(override_dir));
+    }
+    let base = dirs::config_dir().or_else(|| dirs::home_dir().map(|h| h.join(".config")))?;
+    Some(base.join("ccsm"))
+}
+
 /// Returns the platform-specific path to `ccsm/config.json` inside the user's config directory.
 fn config_path() -> Option<PathBuf> {
-    let base = dirs::config_dir().or_else(|| dirs::home_dir().map(|h| h.join(".config")))?;
-    Some(base.join("ccsm").join("config.json"))
+    Some(ccsm_dir()?.join("config.json"))
 }
 
 impl Config {
@@ -120,6 +234,12 @@ impl Config {
         self.tmux_path.as_deref().unwrap_or("tmux")
     }
 
+    /// Returns the configured claude-usage binary path, or "claude-usage" if unset.
+    #[allow(dead_code)]
+    pub fn usage_bin(&self) -> &str {
+        self.usage_path.as_deref().unwrap_or("claude-usage")
+    }
+
     /// Returns true if the given binary name/path is findable on the system.
     pub fn is_bin_available(bin: &str) -> bool {
         if Path::new(bin).is_absolute() {
@@ -137,7 +257,8 @@ impl Config {
 
     /// Serialize the config to pretty-printed JSON and write it to the config file path.
     pub fn save(&self) -> anyhow::Result<()> {
-        let path = config_path().ok_or_else(|| anyhow::anyhow!("Could not determine config directory"))?;
+        let path =
+            config_path().ok_or_else(|| anyhow::anyhow!("Could not determine config directory"))?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -145,6 +266,15 @@ impl Config {
         std::fs::write(&path, json)?;
         Ok(())
     }
+}
+
+/// Serializes tests that mutate the `CCSM_CONFIG_DIR` environment variable,
+/// since env vars are process-global and tests run concurrently.
+#[cfg(test)]
+pub(crate) fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+    use std::sync::Mutex;
+    static M: Mutex<()> = Mutex::new(());
+    M.lock().unwrap_or_else(|p| p.into_inner())
 }
 
 #[cfg(test)]
@@ -175,11 +305,7 @@ mod tests {
             display_mode: DisplayMode::FullDir,
             hide_empty: true,
             group_chains: false,
-            last_update_check: None,
-            live_filter: false,
-            favorites: HashSet::new(),
-            claude_path: None,
-            tmux_path: None,
+            ..Config::default()
         };
         let json = serde_json::to_string_pretty(&config).unwrap();
         let loaded: Config = serde_json::from_str(&json).unwrap();
@@ -213,11 +339,7 @@ mod tests {
             display_mode: DisplayMode::ShortDir,
             hide_empty: false,
             group_chains: true,
-            last_update_check: None,
-            live_filter: false,
-            favorites: HashSet::new(),
-            claude_path: None,
-            tmux_path: None,
+            ..Config::default()
         };
         let json = serde_json::to_string_pretty(&config).unwrap();
         let mut file = std::fs::File::create(&path).unwrap();
@@ -234,6 +356,11 @@ mod tests {
 
     #[test]
     fn test_config_path_is_valid() {
+        // `config_path` honours CCSM_CONFIG_DIR, which other tests set. Hold
+        // the shared lock and clear the override so this asserts the real
+        // default rather than whichever temp dir happened to be active.
+        let _guard = test_lock();
+        std::env::remove_var("CCSM_CONFIG_DIR");
         let path = config_path().expect("config_path should return Some on supported platforms");
         assert!(path.ends_with("ccsm/config.json"));
     }
@@ -275,11 +402,7 @@ mod tests {
             display_mode: DisplayMode::ShortDir,
             hide_empty: false,
             group_chains: true,
-            last_update_check: None,
-            live_filter: false,
-            favorites: HashSet::new(),
-            claude_path: None,
-            tmux_path: None,
+            ..Config::default()
         };
         let json = serde_json::to_string(&config).unwrap();
         assert!(json.contains("\"short_dir\""));
@@ -387,7 +510,10 @@ mod tests {
         config.tmux_path = Some("/opt/bin/tmux".to_string());
         let json = serde_json::to_string_pretty(&config).unwrap();
         let loaded: Config = serde_json::from_str(&json).unwrap();
-        assert_eq!(loaded.claude_path, Some("/usr/local/bin/claude".to_string()));
+        assert_eq!(
+            loaded.claude_path,
+            Some("/usr/local/bin/claude".to_string())
+        );
         assert_eq!(loaded.tmux_path, Some("/opt/bin/tmux".to_string()));
     }
 
@@ -401,5 +527,64 @@ mod tests {
     fn test_is_bin_available_bare_name_sh() {
         // `sh` should be available on Unix systems
         assert!(Config::is_bin_available("sh"));
+    }
+
+    #[test]
+    fn test_config_backward_compat_without_scheduler_fields() {
+        let json = r#"{"tree_view": true, "display_mode": "name"}"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(config.usage_path, None);
+        assert_eq!(config.usage_pause_percent, 95.0);
+        assert_eq!(config.usage_resume_percent, 50.0);
+        assert_eq!(config.usage_poll_seconds, 60);
+        assert_eq!(config.usage_max_age_seconds, 900);
+        assert_eq!(config.usage_source, "auto");
+        assert_eq!(config.pause_mode, PauseMode::Soft);
+        assert!(config.watch_seven_day);
+        assert!(config.watch_autostart);
+        assert!(config.defer_while_attached);
+        assert_eq!(config.continue_prompt, "Continue where you left off.");
+        assert_eq!(config.max_restart_attempts, 5);
+    }
+
+    #[test]
+    fn test_pause_mode_serde_roundtrip() {
+        let soft_json = serde_json::to_string(&PauseMode::Soft).unwrap();
+        assert_eq!(soft_json, "\"soft\"");
+        let hard_json = serde_json::to_string(&PauseMode::Hard).unwrap();
+        assert_eq!(hard_json, "\"hard\"");
+
+        let soft: PauseMode = serde_json::from_str("\"soft\"").unwrap();
+        assert_eq!(soft, PauseMode::Soft);
+        let hard: PauseMode = serde_json::from_str("\"hard\"").unwrap();
+        assert_eq!(hard, PauseMode::Hard);
+    }
+
+    #[test]
+    fn test_pause_mode_labels() {
+        assert_eq!(PauseMode::Soft.label(), "Soft (Escape)");
+        assert_eq!(PauseMode::Hard.label(), "Hard (kill + resume)");
+    }
+
+    #[test]
+    fn test_usage_bin_default() {
+        let config = Config::default();
+        assert_eq!(config.usage_bin(), "claude-usage");
+    }
+
+    #[test]
+    fn test_usage_bin_custom() {
+        let mut config = Config::default();
+        config.usage_path = Some("/opt/bin/claude-usage".to_string());
+        assert_eq!(config.usage_bin(), "/opt/bin/claude-usage");
+    }
+
+    #[test]
+    fn test_ccsm_dir_honors_override() {
+        let _guard = test_lock();
+        std::env::set_var("CCSM_CONFIG_DIR", "/tmp/ccsm_dir_override_test");
+        let dir = ccsm_dir().expect("ccsm_dir should return Some when override is set");
+        assert_eq!(dir, PathBuf::from("/tmp/ccsm_dir_override_test"));
+        std::env::remove_var("CCSM_CONFIG_DIR");
     }
 }

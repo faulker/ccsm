@@ -1,8 +1,10 @@
 mod activity;
 mod chain;
+mod dir_browser;
 mod display;
 mod filter;
 mod flat;
+mod jobs;
 mod preview;
 mod selection;
 mod tree;
@@ -10,13 +12,86 @@ mod tree;
 #[cfg(test)]
 mod tests;
 
-use crate::config::{Config, DisplayMode};
+use crate::config::{Config, DisplayMode, PauseMode};
 use crate::data::{self, PreviewMessage, SessionInfo, SessionMeta};
 use crate::live::{self, ActivityState, LiveSession};
+use crate::schedule::{self, Job};
 use crate::update;
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 use tui_input::Input;
+
+pub use dir_browser::{DirBrowser, PickerKind, PickerTarget};
+
+/// Which top-level tab of the main window is currently showing.
+///
+/// Tabs replace what used to be a Jobs popup: the jobs manager is a peer of the
+/// session list rather than an overlay, so both share the list/detail layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MainTab {
+    /// The session browser (default).
+    Sessions,
+    /// The scheduler jobs manager.
+    Jobs,
+}
+
+impl MainTab {
+    /// The next tab in the strip, wrapping around.
+    pub fn next(self) -> Self {
+        match self {
+            MainTab::Sessions => MainTab::Jobs,
+            MainTab::Jobs => MainTab::Sessions,
+        }
+    }
+
+    /// The previous tab in the strip, wrapping around.
+    pub fn prev(self) -> Self {
+        self.next()
+    }
+}
+
+/// Which page of the tabbed help overlay is showing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HelpTab {
+    /// Session-list navigation and actions.
+    Sessions,
+    /// Jobs tab, job form, and watcher keys.
+    Jobs,
+    /// Global keys plus config and directory-picker keys.
+    General,
+}
+
+impl HelpTab {
+    /// All help tabs in display order.
+    pub const ALL: [HelpTab; 3] = [HelpTab::Sessions, HelpTab::Jobs, HelpTab::General];
+
+    /// Tab label shown in the help tab strip.
+    pub fn label(self) -> &'static str {
+        match self {
+            HelpTab::Sessions => "Sessions",
+            HelpTab::Jobs => "Jobs",
+            HelpTab::General => "General",
+        }
+    }
+
+    /// The next help tab, wrapping around.
+    pub fn next(self) -> Self {
+        match self {
+            HelpTab::Sessions => HelpTab::Jobs,
+            HelpTab::Jobs => HelpTab::General,
+            HelpTab::General => HelpTab::Sessions,
+        }
+    }
+
+    /// The previous help tab, wrapping around.
+    pub fn prev(self) -> Self {
+        match self {
+            HelpTab::Sessions => HelpTab::General,
+            HelpTab::Jobs => HelpTab::Sessions,
+            HelpTab::General => HelpTab::Jobs,
+        }
+    }
+}
 
 /// One visible row in the tree-view session list.
 #[derive(Debug, Clone, PartialEq)]
@@ -94,12 +169,18 @@ pub enum AppMode {
     Help,
     /// The new-session naming popup is open.
     NamingSession,
+    /// The directory-picker modal is open (choosing a cwd for a new session).
+    DirPicker,
     /// A duplicate session name was entered; waiting for the user to choose open vs. rename.
     DuplicateSession,
     /// The config popup is open.
     Config,
     /// One or more required binaries (claude/tmux) are missing.
     MissingDeps,
+    /// The job create/edit form is open (reached only from the Jobs tab).
+    JobForm,
+    /// A destructive job action (stop/delete) is awaiting y/n confirmation (reached only from the Jobs tab).
+    JobConfirm,
 }
 
 /// Tracks which popup triggered the duplicate-name check, so we can return to the right mode.
@@ -109,6 +190,27 @@ pub enum DuplicateSource {
     NamingSession,
     /// Duplicate detected while renaming an existing live session.
     Renaming,
+}
+
+/// How a submitted job form ties back to an existing session, if at all.
+/// Set by `job_form_from_selection` (the `m` binding) and consumed by `submit_job_form`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum JobBind {
+    /// A brand-new job with no existing session to bind to.
+    New,
+    /// Prefilled from a historical session; carries the chain-latest session id to resume.
+    Resume(String),
+    /// Prefilled from a live tmux session; carries the tmux session name to adopt.
+    Live(String),
+}
+
+/// What a `JobConfirm` prompt is asking the user to confirm.
+#[derive(Debug, Clone, PartialEq)]
+pub enum JobConfirmAction {
+    /// Hard-stop the job (`Command::StopJob`).
+    Stop,
+    /// Delete the job entirely (`Command::DeleteJob`).
+    Delete,
 }
 
 
@@ -152,6 +254,10 @@ pub struct App {
     pub chain_map: HashMap<usize, Vec<usize>>,
     /// Current interaction mode controlling key dispatch.
     pub mode: AppMode,
+    /// Which top-level tab of the main window is showing.
+    pub main_tab: MainTab,
+    /// Which page of the help overlay is showing while `mode == AppMode::Help`.
+    pub help_tab: HelpTab,
     /// Persisted configuration; updated and saved when settings change.
     pub config: Config,
     /// True while a Shift key is held down, used to highlight shift-key hints in the status bar.
@@ -217,6 +323,53 @@ pub struct App {
     pub naming_dangerous: bool,
     /// Last error message to display in the status bar.
     pub status_error: Option<String>,
+    /// State for the directory-picker modal, or `None` when it's not open.
+    pub dir_browser: Option<DirBrowser>,
+    /// Which field the currently open directory picker is choosing a path for.
+    pub dir_picker_target: PickerTarget,
+    /// All jobs known to the scheduler, reloaded from `schedule.json` by `reload_schedule`.
+    pub jobs: Vec<Job>,
+    /// Currently highlighted row in the Jobs popup.
+    pub jobs_selected: usize,
+    /// Fingerprint of `schedule.json` as of the last `reload_schedule`, used by `poll_schedule_changed`.
+    pub schedule_stamp: Option<schedule::store::Stamp>,
+    /// The watch daemon's last-persisted state, or `None` if it has never run.
+    pub watch_state: Option<schedule::store::WatchState>,
+    /// Fingerprint of `watch_state.json` as of the last `reload_schedule`, used by `poll_schedule_changed`.
+    pub watch_stamp: Option<schedule::store::Stamp>,
+    /// True when the `claude-usage` binary cannot be found; disables job creation.
+    pub missing_usage: bool,
+    /// Whether the watch daemon was running as of the last check. Drives the
+    /// title-bar indicator, so a silently dead watcher stays visible.
+    pub watch_running: bool,
+    /// The job id and action awaiting confirmation in `AppMode::JobConfirm`, or `None`.
+    pub jobs_confirm: Option<(String, JobConfirmAction)>,
+    /// Currently highlighted field row in the job form (0..=8).
+    pub job_form_field: usize,
+    /// True while a text field in the job form is being edited.
+    pub job_form_editing: bool,
+    /// Input state for whichever text field in the job form is being edited.
+    pub job_form_input: Input,
+    /// `Some(id)` when the job form is editing an existing job rather than creating one.
+    pub job_form_edit_id: Option<String>,
+    /// Job-form field: display name.
+    pub job_form_name: String,
+    /// Job-form field: working directory.
+    pub job_form_cwd: String,
+    /// Job-form field: initial prompt.
+    pub job_form_prompt: String,
+    /// Job-form field: continue-prompt override (empty means use the configured default).
+    pub job_form_continue_prompt: String,
+    /// Job-form field: model override (empty means use claude's default).
+    pub job_form_model: String,
+    /// Job-form field: whether to launch with `--dangerously-skip-permissions`.
+    pub job_form_dangerous: bool,
+    /// Job-form field: pause strategy for this job.
+    pub job_form_pause_mode: PauseMode,
+    /// Job-form field: whether the daemon should auto-resume this job.
+    pub job_form_auto_resume: bool,
+    /// How the in-progress job form ties back to an existing session, set by `job_form_from_selection`.
+    pub job_form_bind: JobBind,
 }
 
 /// Truncate a path to its last 2 components (e.g. "/Users/sane/Dev/ccsm" -> "Dev/ccsm").
@@ -259,6 +412,8 @@ impl App {
             tree_rows: Vec::new(),
             collapsed: HashSet::new(),
             mode: AppMode::Normal,
+            main_tab: MainTab::Sessions,
+            help_tab: HelpTab::Sessions,
             config,
             shift_active: false,
             rename_input: Input::default(),
@@ -291,6 +446,29 @@ impl App {
             tick: 0,
             naming_dangerous: false,
             status_error: None,
+            dir_browser: None,
+            dir_picker_target: PickerTarget::NewSession,
+            jobs: Vec::new(),
+            jobs_selected: 0,
+            schedule_stamp: None,
+            watch_state: None,
+            watch_stamp: None,
+            missing_usage: false,
+            watch_running: false,
+            jobs_confirm: None,
+            job_form_field: 0,
+            job_form_editing: false,
+            job_form_input: Input::default(),
+            job_form_edit_id: None,
+            job_form_name: String::new(),
+            job_form_cwd: String::new(),
+            job_form_prompt: String::new(),
+            job_form_continue_prompt: String::new(),
+            job_form_model: String::new(),
+            job_form_dangerous: false,
+            job_form_pause_mode: PauseMode::default(),
+            job_form_auto_resume: true,
+            job_form_bind: JobBind::New,
         };
 
         // Check for required binaries
@@ -301,10 +479,12 @@ impl App {
             app.missing_tmux = !tmux_ok;
             app.mode = AppMode::MissingDeps;
         }
+        app.missing_usage = !Config::is_bin_available(app.config.usage_bin());
 
         app.spawn_load_session_names();
         app.init_tree();
         app.recompute_filter();
+        app.reload_schedule();
         app
     }
 

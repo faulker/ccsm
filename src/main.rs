@@ -4,9 +4,12 @@ mod config_popup;
 mod data;
 mod keys;
 mod live;
+mod schedule;
 mod theme;
 mod ui;
 mod update;
+mod usage;
+mod watch;
 
 use anyhow::Result;
 use app::App;
@@ -112,6 +115,23 @@ fn run_app(
             let prev_pulse = ((app.tick.wrapping_sub(1)) / 2) % 2;
             let curr_pulse = (app.tick / 2) % 2;
             if activity_changed || prev_pulse != curr_pulse {
+                app.needs_redraw = true;
+            }
+        }
+
+        // Keep job state live: the watch daemon owns schedule.json, so poll its
+        // cheap stamp each tick and redraw when it (or the daemon's own state
+        // file) changed. This runs on every tab, not just Jobs, because the tab
+        // strip's usage chip reads the same state and would otherwise freeze at
+        // whatever was on disk when the Sessions tab was opened.
+        {
+            let before = (
+                app.jobs.len(),
+                app.schedule_stamp.clone(),
+                app.watch_stamp.clone(),
+            );
+            app.poll_schedule_changed();
+            if before != (app.jobs.len(), app.schedule_stamp.clone(), app.watch_stamp.clone()) {
                 app.needs_redraw = true;
             }
         }
@@ -226,11 +246,22 @@ fn main() -> Result<()> {
     let spawn_session = args.iter().any(|a| a == "--spawn");
     let live_start = args.iter().any(|a| a == "--live");
     let flat = args.iter().any(|a| a == "--flat") || live_start;
+    let watch_daemon = args.iter().any(|a| a == "--watch");
+    let watch_status = args.iter().any(|a| a == "--watch-status");
     let filter_path = args.iter().find(|a| !a.starts_with('-')).map(|arg| {
         std::fs::canonicalize(arg)
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|_| arg.clone())
     });
+
+    if watch_daemon {
+        return watch::run();
+    }
+
+    if watch_status {
+        println!("{}", watch::status_report());
+        return Ok(());
+    }
 
     if spawn_session {
         let cfg = config::Config::load();

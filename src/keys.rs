@@ -1,4 +1,4 @@
-use crate::app::{App, AppMode, DuplicateSource, FlatRow, LaunchRequest, TreeRow};
+use crate::app::{App, AppMode, DuplicateSource, FlatRow, HelpTab, LaunchRequest, MainTab, TreeRow};
 use crate::{data, live};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, ModifierKeyCode, MouseEventKind};
 
@@ -7,7 +7,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, Modifie
 /// With the enhanced keyboard protocol, crossterm reports `Char('a')` with
 /// `KeyModifiers::SHIFT` rather than `Char('A')`.  `tui_input` inserts the
 /// char as-is, so we uppercase it here before delegation.
-fn normalize_key(mut key: crossterm::event::KeyEvent) -> crossterm::event::KeyEvent {
+pub(crate) fn normalize_key(mut key: crossterm::event::KeyEvent) -> crossterm::event::KeyEvent {
     if let KeyCode::Char(c) = key.code {
         if key.modifiers.contains(KeyModifiers::SHIFT) && c.is_ascii_lowercase() {
             key.code = KeyCode::Char(c.to_ascii_uppercase());
@@ -188,6 +188,70 @@ impl App {
         }
     }
 
+    /// Handle a key event while the directory-picker modal is open.
+    ///
+    /// Actual state changes are delegated to the `App` methods defined in
+    /// `app/dir_browser.rs` so they stay unit-testable without needing a raw
+    /// `KeyEvent`; this function only handles routing keys to `path_input`
+    /// (which does need the raw event, for Shift normalization) while typing a path.
+    fn handle_dir_picker_event(&mut self, key: crossterm::event::KeyEvent) {
+        use crossterm::event::Event;
+        use tui_input::backend::crossterm::EventHandler;
+
+        let input_active = self.dir_browser.as_ref().is_some_and(|b| b.input_active);
+
+        if input_active {
+            match key.code {
+                KeyCode::Esc => self.dir_picker_escape(),
+                KeyCode::Enter => self.dir_picker_commit_input(),
+                _ => {
+                    if let Some(browser) = self.dir_browser.as_mut() {
+                        browser.path_input.handle_event(&Event::Key(normalize_key(key)));
+                    }
+                }
+            }
+            return;
+        }
+
+        match key.code {
+            KeyCode::Esc => self.dir_picker_escape(),
+            KeyCode::Char('j') | KeyCode::Down => self.dir_picker_move_down(),
+            KeyCode::Char('k') | KeyCode::Up => self.dir_picker_move_up(),
+            KeyCode::Enter => self.dir_picker_enter(),
+            KeyCode::Char(' ') => self.dir_picker_select(),
+            KeyCode::Char('/') => self.dir_picker_activate_input(),
+            _ => {}
+        }
+    }
+
+    /// Open the help overlay on the page matching the current tab, so help
+    /// about jobs is one keystroke away while looking at jobs.
+    pub fn open_help(&mut self) {
+        self.help_tab = match self.main_tab {
+            MainTab::Jobs => HelpTab::Jobs,
+            MainTab::Sessions => HelpTab::Sessions,
+        };
+        self.mode = AppMode::Help;
+    }
+
+    /// Handle a key event while the tabbed help overlay is open: Tab/arrows and
+    /// `h`/`l` switch pages, `1`..`3` jump to one, anything else closes it.
+    fn handle_help_event(&mut self, key: crossterm::event::KeyEvent) {
+        match key.code {
+            KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
+                self.help_tab = self.help_tab.next();
+            }
+            KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => {
+                self.help_tab = self.help_tab.prev();
+            }
+            KeyCode::Char(c @ '1'..='3') => {
+                let idx = c as usize - '1' as usize;
+                self.help_tab = HelpTab::ALL[idx];
+            }
+            _ => self.mode = AppMode::Normal,
+        }
+    }
+
     /// Handle a key event while the duplicate-session confirmation popup is open.
     ///
     /// `o`/Enter opens the existing session, `r` returns to naming/renaming, `Esc` cancels.
@@ -308,7 +372,7 @@ impl App {
             }
 
             if self.mode == AppMode::Help {
-                self.mode = AppMode::Normal;
+                self.handle_help_event(key);
                 return Ok(());
             }
 
@@ -334,6 +398,28 @@ impl App {
 
             if self.mode == AppMode::MissingDeps {
                 self.handle_missing_deps_event(key);
+                return Ok(());
+            }
+
+            if self.mode == AppMode::DirPicker {
+                self.handle_dir_picker_event(key);
+                return Ok(());
+            }
+
+            if self.mode == AppMode::JobConfirm {
+                self.handle_job_confirm_event(key);
+                return Ok(());
+            }
+
+            if self.mode == AppMode::JobForm {
+                self.handle_job_form_event(key);
+                return Ok(());
+            }
+
+            // The Jobs tab has its own full key map (including quit/help/config),
+            // so it is dispatched before the Sessions-tab bindings below.
+            if self.main_tab == MainTab::Jobs && !self.filter_active {
+                self.handle_jobs_tab_event(key);
                 return Ok(());
             }
 
@@ -385,7 +471,13 @@ impl App {
                 // '?' is Shift+/ on US keyboards; some terminals send Char('?') and
                 // others send Char('/') with SHIFT — handle both before the '/' filter.
                 (KeyCode::Char('?'), _) | (KeyCode::Char('/'), KeyModifiers::SHIFT) => {
-                    self.mode = AppMode::Help;
+                    self.open_help();
+                }
+                (KeyCode::Tab, _) => {
+                    self.cycle_main_tab(true);
+                }
+                (KeyCode::BackTab, _) => {
+                    self.cycle_main_tab(false);
                 }
                 (KeyCode::Char('/'), _) => {
                     self.filter_active = true;
@@ -435,6 +527,15 @@ impl App {
                     self.recompute_flat_rows();
                     self.recompute_tree();
                 }
+                (KeyCode::Char('b'), KeyModifiers::NONE) => {
+                    self.open_dir_picker();
+                }
+                (KeyCode::Char('w'), KeyModifiers::NONE) => {
+                    self.open_jobs_tab();
+                }
+                (KeyCode::Char('m'), KeyModifiers::NONE) => {
+                    self.job_form_from_selection();
+                }
                 (KeyCode::Char('l'), KeyModifiers::NONE) => {
                     self.live_filter = !self.live_filter;
                     self.recompute_flat_rows();
@@ -442,16 +543,7 @@ impl App {
                     self.save_config();
                 }
                 (KeyCode::Char('x'), KeyModifiers::NONE) => {
-                    if let Some(idx) = self.selected_live_index() {
-                        let name = self.live_sessions[idx].tmux_name.clone();
-                        if let Err(e) = live::stop_live_session(self.config.tmux_bin(), &name) {
-                            eprintln!("Failed to stop session: {e}");
-                        }
-                        self.live_sessions = live::discover_live_sessions(self.config.tmux_bin());
-                        self.live_preview_cache.remove(&name);
-                        self.recompute_flat_rows();
-                        self.recompute_tree();
-                    }
+                    self.stop_selected_live_session();
                 }
                 (KeyCode::Char('r'), KeyModifiers::NONE) => {
                     // Check if a live session is selected first

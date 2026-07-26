@@ -8,7 +8,52 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::App;
 use crate::live::ActivityState;
-use crate::theme::{ACCENT_AMBER, ACCENT_GREEN, ACCENT_RED, FG_OVERLAY};
+use crate::theme::{
+    ACCENT_AMBER, ACCENT_BLUE, ACCENT_GREEN, ACCENT_RED, BG_SURFACE, FG_OVERLAY,
+};
+
+/// Render a `tui_input` buffer as spans with a block cursor drawn at the
+/// input's actual cursor position, so Left/Right/Home/End movement is visible.
+///
+/// Every text field in the app routes through this: an editable field that
+/// always parks a cursor at the end of the line looks like it does not support
+/// cursor movement even when the underlying `Input` handles it.
+pub fn input_spans(input: &tui_input::Input, text_style: Style) -> Vec<Span<'static>> {
+    let value = input.value();
+    let cursor = input.visual_cursor();
+    let char_count = value.chars().count();
+    let before: String = value.chars().take(cursor).collect();
+
+    if cursor >= char_count {
+        vec![
+            Span::styled(before, text_style),
+            Span::styled("\u{2588}", Style::default().fg(ACCENT_BLUE)),
+        ]
+    } else {
+        let on_cursor: String = value.chars().skip(cursor).take(1).collect();
+        let after: String = value.chars().skip(cursor + 1).collect();
+        vec![
+            Span::styled(before, text_style),
+            Span::styled(on_cursor, Style::default().bg(ACCENT_BLUE).fg(BG_SURFACE)),
+            Span::styled(after, text_style),
+        ]
+    }
+}
+
+/// Like `input_spans`, but shows `placeholder` (dimmed) when the buffer is empty.
+pub fn input_spans_with_placeholder(
+    input: &tui_input::Input,
+    text_style: Style,
+    placeholder: &str,
+) -> Vec<Span<'static>> {
+    if input.value().is_empty() && !placeholder.is_empty() {
+        return vec![
+            Span::styled(placeholder.to_string(), Style::default().fg(FG_OVERLAY)),
+            Span::styled("\u{2588}", Style::default().fg(ACCENT_BLUE)),
+        ];
+    }
+    input_spans(input, text_style)
+}
 
 /// Build styled spans showing activity counts: `● <active> | ● <idle> [| ▶ <waiting>]`.
 /// Returns an empty vec when all counts are zero.
@@ -196,5 +241,45 @@ pub fn truncate_left_plain(s: &str, max: usize) -> String {
             start = i;
         }
         format!("…{}", chars[start..].iter().collect::<String>())
+    }
+}
+
+#[cfg(test)]
+mod input_span_tests {
+    use super::{input_spans, input_spans_with_placeholder};
+    use ratatui::style::Style;
+    use tui_input::Input;
+
+    #[test]
+    fn cursor_at_the_end_renders_a_trailing_block() {
+        let input = Input::from("abc".to_string());
+        let spans = input_spans(&input, Style::default());
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].content, "abc");
+        assert_eq!(spans[1].content, "\u{2588}");
+    }
+
+    #[test]
+    fn cursor_in_the_middle_splits_the_value_around_the_highlighted_char() {
+        let mut input = Input::from("abc".to_string());
+        input = input.with_cursor(1);
+        let spans = input_spans(&input, Style::default());
+        assert_eq!(spans.len(), 3);
+        assert_eq!(spans[0].content, "a");
+        assert_eq!(spans[1].content, "b", "the char under the cursor is inverted");
+        assert_eq!(spans[2].content, "c");
+    }
+
+    #[test]
+    fn an_empty_buffer_shows_the_placeholder() {
+        let input = Input::default();
+        let spans = input_spans_with_placeholder(&input, Style::default(), "auto-name");
+        assert_eq!(spans[0].content, "auto-name");
+        assert_eq!(spans[1].content, "\u{2588}");
+
+        // A non-empty buffer ignores the placeholder entirely.
+        let typed = Input::from("x".to_string());
+        let spans = input_spans_with_placeholder(&typed, Style::default(), "auto-name");
+        assert_eq!(spans[0].content, "x");
     }
 }

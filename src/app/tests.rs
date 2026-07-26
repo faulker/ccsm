@@ -1,5 +1,6 @@
 use super::*;
 use crate::config::Config;
+use std::path::PathBuf;
 use tui_input::Input;
 
 /// Creates an App with live sessions cleared so tests are not affected by
@@ -1047,4 +1048,629 @@ fn naming_non_dangerous_produces_new_live() {
         }
         other => panic!("Expected NewLive, got {:?}", other),
     }
+}
+
+// --- Directory picker (DirBrowser) ---
+
+#[test]
+fn test_refresh_lists_dirs_only_hidden_included_sorted_case_insensitive() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join(".git")).unwrap();
+    std::fs::create_dir(dir.path().join("Src")).unwrap();
+    std::fs::create_dir(dir.path().join("apple")).unwrap();
+    std::fs::write(dir.path().join("readme.txt"), b"hi").unwrap();
+
+    let browser = DirBrowser::new(dir.path().to_path_buf());
+    let names: Vec<&str> = browser.entries.iter().map(|e| e.name.as_str()).collect();
+
+    // ".." first (a tempdir always has a parent), then case-insensitive alpha order.
+    // The file "readme.txt" must be excluded entirely.
+    assert_eq!(names, vec!["..", ".git", "apple", "Src"]);
+    assert!(browser.entries.iter().all(|e| e.is_dir));
+}
+
+#[test]
+fn test_refresh_at_filesystem_root_has_no_parent_entry() {
+    let browser = DirBrowser::new(PathBuf::from("/"));
+    assert!(!browser.entries.iter().any(|e| e.name == ".."));
+}
+
+#[test]
+fn test_enter_selected_descends_and_go_up_ascends() {
+    let dir = tempfile::tempdir().unwrap();
+    let sub = dir.path().join("child");
+    std::fs::create_dir(&sub).unwrap();
+
+    let mut browser = DirBrowser::new(dir.path().to_path_buf());
+    let idx = browser.entries.iter().position(|e| e.name == "child").unwrap();
+    browser.selected = idx;
+    browser.enter_selected();
+    assert_eq!(browser.current_dir, sub);
+    // refresh() ran on the new directory: it has a parent, so ".." is present.
+    assert!(browser.entries.iter().any(|e| e.name == ".."));
+
+    browser.go_up();
+    assert_eq!(browser.current_dir, dir.path());
+    // refresh() ran again: "child" is visible from the parent directory.
+    assert!(browser.entries.iter().any(|e| e.name == "child"));
+}
+
+#[test]
+fn test_refresh_nonexistent_directory_sets_error_keeps_previous_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("real")).unwrap();
+
+    let mut browser = DirBrowser::new(dir.path().to_path_buf());
+    assert!(browser.error.is_none());
+    let prev_len = browser.entries.len();
+    assert!(prev_len > 0);
+
+    browser.current_dir = dir.path().join("does-not-exist");
+    browser.refresh();
+
+    assert!(browser.error.is_some());
+    assert_eq!(browser.entries.len(), prev_len, "entries should be left intact on error");
+}
+
+#[test]
+fn test_apply_typed_path_accepts_existing_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    let sub = dir.path().join("target");
+    std::fs::create_dir(&sub).unwrap();
+
+    let mut browser = DirBrowser::new(dir.path().to_path_buf());
+    browser.path_input = Input::from(sub.to_string_lossy().to_string());
+    browser.input_active = true;
+    browser.apply_typed_path();
+
+    assert_eq!(browser.current_dir, sub);
+    assert!(!browser.input_active);
+    assert!(browser.error.is_none());
+}
+
+#[test]
+fn test_apply_typed_path_rejects_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("file.txt");
+    std::fs::write(&file, b"hi").unwrap();
+
+    let mut browser = DirBrowser::new(dir.path().to_path_buf());
+    browser.path_input = Input::from(file.to_string_lossy().to_string());
+    browser.input_active = true;
+    browser.apply_typed_path();
+
+    assert!(browser.error.is_some());
+    assert_eq!(browser.current_dir, dir.path());
+    assert!(browser.input_active, "input should stay open on error");
+}
+
+#[test]
+fn test_apply_typed_path_rejects_nonexistent() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut browser = DirBrowser::new(dir.path().to_path_buf());
+    browser.path_input = Input::from(dir.path().join("nope").to_string_lossy().to_string());
+    browser.input_active = true;
+    browser.apply_typed_path();
+
+    assert!(browser.error.is_some());
+    assert!(browser.input_active);
+}
+
+#[test]
+fn test_apply_typed_path_expands_tilde() {
+    let mut browser = DirBrowser::new(std::env::current_dir().unwrap());
+    browser.path_input = Input::from("~".to_string());
+    browser.input_active = true;
+    browser.apply_typed_path();
+
+    assert_eq!(browser.current_dir, dirs::home_dir().unwrap());
+    assert!(!browser.input_active);
+}
+
+#[test]
+fn test_open_dir_picker_sets_mode() {
+    let mut app = make_app(make_sessions(), None, Config::default());
+    app.open_dir_picker();
+    assert_eq!(app.mode, AppMode::DirPicker);
+    assert!(app.dir_browser.is_some());
+}
+
+#[test]
+fn test_dir_picker_escape_closes_input_before_picker() {
+    let mut app = make_app(make_sessions(), None, Config::default());
+    app.open_dir_picker();
+    app.dir_picker_activate_input();
+    assert!(app.dir_browser.as_ref().unwrap().input_active);
+
+    // First Esc closes just the input, staying in DirPicker mode.
+    app.dir_picker_escape();
+    assert_eq!(app.mode, AppMode::DirPicker);
+    assert!(!app.dir_browser.as_ref().unwrap().input_active);
+
+    // Second Esc closes the whole picker.
+    app.dir_picker_escape();
+    assert_eq!(app.mode, AppMode::Normal);
+    assert!(app.dir_browser.is_none());
+}
+
+#[test]
+fn test_dir_picker_select_moves_to_naming_session() {
+    let mut app = make_app(make_sessions(), None, Config::default());
+    app.open_dir_picker();
+    app.dir_picker_select();
+    assert_eq!(app.mode, AppMode::NamingSession);
+    assert!(app.naming_cwd.is_some());
+    assert!(app.dir_browser.is_none());
+}
+
+#[test]
+fn test_dir_picker_move_clamps_at_bounds() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("a")).unwrap();
+    std::fs::create_dir(dir.path().join("b")).unwrap();
+
+    let mut app = make_app(make_sessions(), None, Config::default());
+    app.dir_browser = Some(DirBrowser::new(dir.path().to_path_buf()));
+    let count = app.dir_browser.as_ref().unwrap().entries.len(); // "..", "a", "b"
+    assert_eq!(count, 3);
+
+    // Already at the top: moving up stays at 0.
+    app.dir_picker_move_up();
+    assert_eq!(app.dir_browser.as_ref().unwrap().selected, 0);
+
+    // Moving down past the last entry stops at the last index.
+    for _ in 0..10 {
+        app.dir_picker_move_down();
+    }
+    assert_eq!(app.dir_browser.as_ref().unwrap().selected, count - 1);
+
+    // Moving up from the bottom decreases by exactly one.
+    app.dir_picker_move_up();
+    assert_eq!(app.dir_browser.as_ref().unwrap().selected, count - 2);
+}
+
+// ---------------------------------------------------------------------
+// Jobs manager modals
+// ---------------------------------------------------------------------
+
+/// A live session fixture, optionally carrying a scheduler job tag.
+fn make_live(tmux_name: &str, cwd: &str, job_id: Option<&str>) -> crate::live::LiveSession {
+    crate::live::LiveSession {
+        tmux_name: tmux_name.to_string(),
+        display_name: tmux_name.to_string(),
+        cwd: cwd.to_string(),
+        project_name: "proj".to_string(),
+        job_id: job_id.map(|s| s.to_string()),
+    }
+}
+
+#[test]
+fn w_switches_to_the_jobs_tab_and_esc_returns_to_sessions() {
+    let mut app = make_app(make_sessions(), None, Config::default());
+    app.open_jobs_tab();
+    assert_eq!(app.main_tab, MainTab::Jobs);
+    assert_eq!(app.mode, AppMode::Normal, "the Jobs tab is not a modal");
+    app.open_sessions_tab();
+    assert_eq!(app.main_tab, MainTab::Sessions);
+}
+
+#[test]
+fn tab_cycles_between_the_two_main_tabs() {
+    let mut app = make_app(make_sessions(), None, Config::default());
+    assert_eq!(app.main_tab, MainTab::Sessions);
+    app.cycle_main_tab(true);
+    assert_eq!(app.main_tab, MainTab::Jobs);
+    app.cycle_main_tab(true);
+    assert_eq!(app.main_tab, MainTab::Sessions);
+    app.cycle_main_tab(false);
+    assert_eq!(app.main_tab, MainTab::Jobs);
+}
+
+#[test]
+fn help_opens_on_the_page_matching_the_current_tab() {
+    let mut app = make_app(make_sessions(), None, Config::default());
+    app.open_help();
+    assert_eq!(app.mode, AppMode::Help);
+    assert_eq!(app.help_tab, HelpTab::Sessions);
+
+    app.mode = AppMode::Normal;
+    app.main_tab = MainTab::Jobs;
+    app.open_help();
+    assert_eq!(app.help_tab, HelpTab::Jobs, "jobs help is default on the Jobs tab");
+
+    // Tab order wraps in both directions.
+    assert_eq!(HelpTab::Jobs.next(), HelpTab::General);
+    assert_eq!(HelpTab::Sessions.prev(), HelpTab::General);
+}
+
+#[test]
+fn new_job_form_starts_without_an_edit_id() {
+    let mut app = make_app(make_sessions(), None, Config::default());
+    app.open_jobs_tab();
+    app.open_job_form_new();
+    assert_eq!(app.mode, AppMode::JobForm);
+    assert!(app.job_form_edit_id.is_none());
+}
+
+#[test]
+fn job_form_from_a_historical_row_binds_the_chain_latest_session_id() {
+    let mut app = make_app(make_sessions(), None, Config::default());
+    app.tree_view = false;
+    app.recompute_flat_rows();
+    let Some(idx) = app.selected_session_index() else {
+        return; // no historical row selected in this layout
+    };
+    let expected_id = app.resume_session_id_for(idx).to_string();
+    let expected_cwd = app.sessions[idx].project.clone();
+    app.job_form_from_selection();
+    assert_eq!(app.mode, AppMode::JobForm);
+    assert_eq!(app.job_form_bind, JobBind::Resume(expected_id));
+    assert_eq!(app.job_form_cwd, expected_cwd);
+}
+
+#[test]
+fn job_form_from_a_live_row_binds_the_tmux_name() {
+    let mut app = make_app(vec![], None, Config::default());
+    app.live_sessions = vec![make_live("alpha-A", "/tmp", None)];
+    app.live_filter = true;
+    app.tree_view = false;
+    app.recompute_flat_rows();
+    if app.selected_live_index().is_none() {
+        return; // layout did not select a live row
+    }
+    app.job_form_from_selection();
+    assert_eq!(app.job_form_bind, JobBind::Live("alpha-A".to_string()));
+    assert_eq!(app.job_form_cwd, "/tmp");
+}
+
+#[test]
+fn submitting_an_empty_name_keeps_the_form_open_with_an_error() {
+    let mut app = make_app(vec![], None, Config::default());
+    app.mode = AppMode::JobForm;
+    app.job_form_name = "   ".to_string();
+    app.job_form_cwd = "/tmp".to_string();
+    app.submit_job_form();
+    assert_eq!(app.mode, AppMode::JobForm, "must stay in the form");
+    assert!(app.status_error.is_some());
+}
+
+#[test]
+fn submitting_a_nonexistent_directory_keeps_the_form_open_with_an_error() {
+    let mut app = make_app(vec![], None, Config::default());
+    app.mode = AppMode::JobForm;
+    app.job_form_name = "job".to_string();
+    app.job_form_cwd = "/definitely/not/a/real/directory".to_string();
+    app.submit_job_form();
+    assert_eq!(app.mode, AppMode::JobForm);
+    assert!(app.status_error.is_some());
+}
+
+#[test]
+fn submitting_a_valid_form_enqueues_exactly_one_create_job() {
+    let _guard = crate::config::test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("CCSM_CONFIG_DIR", dir.path());
+
+    let work = tempfile::tempdir().unwrap();
+    let mut app = make_app(vec![], None, Config::default());
+    app.mode = AppMode::JobForm;
+    app.job_form_name = "my-job".to_string();
+    app.job_form_cwd = work.path().to_string_lossy().to_string();
+    app.job_form_prompt = "do the thing".to_string();
+    app.submit_job_form();
+
+    assert_eq!(app.mode, AppMode::Normal, "a valid submit closes the form");
+    assert_eq!(app.main_tab, MainTab::Jobs, "and lands back on the Jobs tab");
+    assert!(app.status_error.is_none());
+
+    let (pending, warnings) = crate::schedule::command::read_pending();
+    assert!(warnings.is_empty());
+    assert_eq!(pending.len(), 1);
+    match &pending[0].1 {
+        crate::schedule::command::Command::CreateJob { job } => {
+            assert_eq!(job.name, "my-job");
+            assert_eq!(job.prompt, "do the thing");
+            assert!(!job.id.is_empty());
+        }
+        other => panic!("expected CreateJob, got {other:?}"),
+    }
+
+    std::env::remove_var("CCSM_CONFIG_DIR");
+}
+
+#[test]
+fn submitting_a_live_bound_form_also_enqueues_adopt_live() {
+    let _guard = crate::config::test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("CCSM_CONFIG_DIR", dir.path());
+
+    let work = tempfile::tempdir().unwrap();
+    let mut app = make_app(vec![], None, Config::default());
+    app.mode = AppMode::JobForm;
+    app.job_form_name = "adopted".to_string();
+    app.job_form_cwd = work.path().to_string_lossy().to_string();
+    app.job_form_bind = JobBind::Live("live-A".to_string());
+    app.submit_job_form();
+
+    let (pending, _) = crate::schedule::command::read_pending();
+    assert_eq!(pending.len(), 2, "CreateJob plus AdoptLive");
+    assert!(matches!(
+        pending[1].1,
+        crate::schedule::command::Command::AdoptLive { .. }
+    ));
+
+    std::env::remove_var("CCSM_CONFIG_DIR");
+}
+
+#[test]
+fn x_on_a_tagged_live_session_enqueues_stop_job_instead_of_killing_tmux() {
+    let _guard = crate::config::test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("CCSM_CONFIG_DIR", dir.path());
+
+    let mut app = make_app(vec![], None, Config::default());
+    app.live_sessions = vec![make_live("managed-A", "/tmp", Some("job-abc"))];
+    app.live_filter = true;
+    app.tree_view = false;
+    app.recompute_flat_rows();
+    if app.selected_live_index().is_none() {
+        std::env::remove_var("CCSM_CONFIG_DIR");
+        return;
+    }
+    app.stop_selected_live_session();
+
+    let (pending, _) = crate::schedule::command::read_pending();
+    assert_eq!(pending.len(), 1, "managed sessions route through the daemon");
+    match &pending[0].1 {
+        crate::schedule::command::Command::StopJob { id } => assert_eq!(id, "job-abc"),
+        other => panic!("expected StopJob, got {other:?}"),
+    }
+
+    std::env::remove_var("CCSM_CONFIG_DIR");
+}
+
+#[test]
+fn jobs_navigation_clamps_at_both_ends() {
+    let mut app = make_app(vec![], None, Config::default());
+    app.jobs = vec![];
+    app.jobs_selected = 0;
+    app.jobs_move_up();
+    assert_eq!(app.jobs_selected, 0, "must not underflow on an empty list");
+    app.jobs_move_down();
+    assert_eq!(app.jobs_selected, 0, "must not run past the end");
+}
+
+// ---------------------------------------------------------------------
+// Path pickers: browsing and manual entry for every path field
+// ---------------------------------------------------------------------
+
+/// A `KeyEvent` with no modifiers, for driving the modal key handlers directly.
+fn key(code: crossterm::event::KeyCode) -> crossterm::event::KeyEvent {
+    crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::NONE)
+}
+
+#[test]
+fn file_pickers_list_files_while_directory_pickers_do_not() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    std::fs::write(dir.path().join("claude"), b"#!/bin/sh\n").unwrap();
+
+    let dirs_only = DirBrowser::new(dir.path().to_path_buf());
+    assert!(dirs_only.entries.iter().all(|e| e.is_dir));
+    assert!(!dirs_only.entries.iter().any(|e| e.name == "claude"));
+
+    let with_files = DirBrowser::with_kind(dir.path().to_path_buf(), PickerKind::File);
+    assert!(with_files.entries.iter().any(|e| e.name == "claude" && !e.is_dir));
+    // Directories still sort ahead of files so navigation stays at the top.
+    let first_file = with_files.entries.iter().position(|e| !e.is_dir).unwrap();
+    assert!(with_files.entries[..first_file].iter().all(|e| e.is_dir));
+}
+
+#[test]
+fn file_picker_selection_only_commits_files() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    std::fs::write(dir.path().join("tmux"), b"x").unwrap();
+
+    let mut browser = DirBrowser::with_kind(dir.path().to_path_buf(), PickerKind::File);
+    let dir_idx = browser.entries.iter().position(|e| e.name == "sub").unwrap();
+    browser.selected = dir_idx;
+    assert!(browser.selected_path().is_none(), "a directory is not a valid file pick");
+
+    let file_idx = browser.entries.iter().position(|e| e.name == "tmux").unwrap();
+    browser.selected = file_idx;
+    assert_eq!(browser.selected_path(), Some(dir.path().join("tmux")));
+}
+
+#[test]
+fn picking_a_binary_writes_the_config_field_and_returns_to_config() {
+    let _guard = crate::config::test_lock();
+    let cfg_dir = tempfile::tempdir().unwrap();
+    std::env::set_var("CCSM_CONFIG_DIR", cfg_dir.path());
+
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("claude");
+    std::fs::write(&bin, b"x").unwrap();
+
+    let mut app = make_app(vec![], None, Config::default());
+    app.open_path_picker(PickerTarget::ConfigClaude, &bin.to_string_lossy());
+    assert_eq!(app.mode, AppMode::DirPicker);
+    assert_eq!(
+        app.dir_browser.as_ref().unwrap().current_dir,
+        dir.path(),
+        "a file value starts the picker in its parent directory"
+    );
+
+    app.dir_picker_select();
+    assert_eq!(app.mode, AppMode::Config, "commit returns to the config popup");
+    assert_eq!(app.config.claude_path, Some(bin.to_string_lossy().to_string()));
+    assert!(app.dir_browser.is_none());
+
+    std::env::remove_var("CCSM_CONFIG_DIR");
+}
+
+#[test]
+fn cancelling_a_picker_returns_to_whichever_mode_opened_it() {
+    let mut app = make_app(vec![], None, Config::default());
+
+    app.open_path_picker(PickerTarget::JobCwd, "");
+    app.dir_picker_escape();
+    assert_eq!(app.mode, AppMode::JobForm);
+
+    app.open_path_picker(PickerTarget::ConfigTmux, "");
+    app.dir_picker_escape();
+    assert_eq!(app.mode, AppMode::Config);
+
+    app.open_dir_picker();
+    app.dir_picker_escape();
+    assert_eq!(app.mode, AppMode::Normal);
+}
+
+#[test]
+fn typing_a_path_commits_it_when_it_matches_what_the_picker_wants() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("work");
+    std::fs::create_dir(&target).unwrap();
+
+    let mut app = make_app(vec![], None, Config::default());
+    app.open_path_picker(PickerTarget::JobCwd, dir.path().to_str().unwrap());
+    app.dir_picker_activate_input();
+    app.dir_browser.as_mut().unwrap().path_input =
+        Input::from(target.to_string_lossy().to_string());
+    app.dir_picker_commit_input();
+
+    assert_eq!(app.mode, AppMode::JobForm);
+    assert_eq!(app.job_form_cwd, target.to_string_lossy().to_string());
+}
+
+#[test]
+fn typing_a_directory_into_a_file_picker_navigates_instead_of_committing() {
+    let _guard = crate::config::test_lock();
+    let cfg_dir = tempfile::tempdir().unwrap();
+    std::env::set_var("CCSM_CONFIG_DIR", cfg_dir.path());
+
+    let dir = tempfile::tempdir().unwrap();
+    let sub = dir.path().join("bin");
+    std::fs::create_dir(&sub).unwrap();
+
+    let mut app = make_app(vec![], None, Config::default());
+    app.open_path_picker(PickerTarget::ConfigUsage, "");
+    app.dir_picker_activate_input();
+    app.dir_browser.as_mut().unwrap().path_input = Input::from(sub.to_string_lossy().to_string());
+    app.dir_picker_commit_input();
+
+    assert_eq!(app.mode, AppMode::DirPicker, "still browsing");
+    assert_eq!(app.dir_browser.as_ref().unwrap().current_dir, sub);
+    assert!(app.config.usage_path.is_none(), "nothing was committed");
+
+    std::env::remove_var("CCSM_CONFIG_DIR");
+}
+
+#[test]
+fn typing_a_bad_path_reports_an_error_without_closing_the_picker() {
+    let mut app = make_app(vec![], None, Config::default());
+    app.open_path_picker(PickerTarget::JobCwd, "");
+    app.dir_picker_activate_input();
+    app.dir_browser.as_mut().unwrap().path_input = Input::from("/definitely/not/here".to_string());
+    app.dir_picker_commit_input();
+
+    assert_eq!(app.mode, AppMode::DirPicker);
+    assert!(app.dir_browser.as_ref().unwrap().error.is_some());
+}
+
+#[test]
+fn the_job_form_directory_field_can_be_browsed_or_typed() {
+    let mut app = make_app(vec![], None, Config::default());
+    app.open_job_form_new();
+    app.job_form_field = 1; // Directory
+
+    // `b` browses.
+    app.handle_job_form_event(key(crossterm::event::KeyCode::Char('b')));
+    assert_eq!(app.mode, AppMode::DirPicker);
+    assert_eq!(app.dir_picker_target, PickerTarget::JobCwd);
+    app.dir_picker_escape();
+    assert_eq!(app.mode, AppMode::JobForm);
+
+    // `i` types the path by hand instead.
+    app.handle_job_form_event(key(crossterm::event::KeyCode::Char('i')));
+    assert!(app.job_form_editing);
+    assert_eq!(app.mode, AppMode::JobForm);
+}
+
+#[test]
+fn editing_a_job_form_field_supports_cursor_movement_and_mid_string_edits() {
+    use crossterm::event::KeyCode;
+
+    let mut app = make_app(vec![], None, Config::default());
+    app.open_job_form_new();
+    app.job_form_field = 0; // Name
+    app.handle_job_form_event(key(KeyCode::Enter));
+    assert!(app.job_form_editing);
+
+    for c in "abcd".chars() {
+        app.handle_job_form_event(key(KeyCode::Char(c)));
+    }
+    assert_eq!(app.job_form_input.value(), "abcd");
+    assert_eq!(app.job_form_input.visual_cursor(), 4);
+
+    // Left twice, then delete backwards: removes 'b', not the last character.
+    app.handle_job_form_event(key(KeyCode::Left));
+    app.handle_job_form_event(key(KeyCode::Left));
+    assert_eq!(app.job_form_input.visual_cursor(), 2);
+    app.handle_job_form_event(key(KeyCode::Backspace));
+    assert_eq!(app.job_form_input.value(), "acd");
+
+    // Home/End move to the extremes, and typing inserts at the cursor.
+    app.handle_job_form_event(key(KeyCode::Home));
+    app.handle_job_form_event(key(KeyCode::Char('X')));
+    assert_eq!(app.job_form_input.value(), "Xacd");
+    app.handle_job_form_event(key(KeyCode::End));
+    app.handle_job_form_event(key(KeyCode::Char('Z')));
+    assert_eq!(app.job_form_input.value(), "XacdZ");
+
+    app.handle_job_form_event(key(KeyCode::Enter));
+    assert!(!app.job_form_editing);
+    assert_eq!(app.job_form_name, "XacdZ");
+}
+
+#[test]
+fn editing_a_config_path_supports_cursor_movement() {
+    use crossterm::event::KeyCode;
+
+    let _guard = crate::config::test_lock();
+    let cfg_dir = tempfile::tempdir().unwrap();
+    std::env::set_var("CCSM_CONFIG_DIR", cfg_dir.path());
+
+    let mut app = make_app(vec![], None, Config::default());
+    app.mode = AppMode::Config;
+    app.config_selected = 3; // Claude binary
+    app.handle_config_event(key(KeyCode::Char('i')));
+    assert!(app.config_editing, "`i` types the path by hand");
+
+    for c in "/bin/x".chars() {
+        app.handle_config_event(key(KeyCode::Char(c)));
+    }
+    app.handle_config_event(key(KeyCode::Left));
+    app.handle_config_event(key(KeyCode::Backspace));
+    assert_eq!(app.config_path_input.value(), "/binx", "deleted the '/' before 'x'");
+
+    app.handle_config_event(key(KeyCode::Enter));
+    assert!(!app.config_editing);
+    assert_eq!(app.config.claude_path, Some("/binx".to_string()));
+
+    std::env::remove_var("CCSM_CONFIG_DIR");
+}
+
+#[test]
+fn enter_on_a_config_path_row_opens_the_file_picker() {
+    use crossterm::event::KeyCode;
+
+    let mut app = make_app(vec![], None, Config::default());
+    app.mode = AppMode::Config;
+    app.config_selected = 5; // claude-usage binary
+    app.handle_config_event(key(KeyCode::Enter));
+
+    assert_eq!(app.mode, AppMode::DirPicker);
+    assert_eq!(app.dir_picker_target, PickerTarget::ConfigUsage);
+    assert_eq!(app.dir_browser.as_ref().unwrap().kind, PickerKind::File);
 }
