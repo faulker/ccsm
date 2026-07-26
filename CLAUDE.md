@@ -18,13 +18,13 @@ cargo fmt --check              # Check formatting
 ./install.sh                   # Build release + symlink to ~/.local/bin/ccsm
 ```
 
-CLI flags: `--flat`, `--live`, `--new`, `--spawn`, `--watch`, `--watch-status`, or a path argument to filter sessions.
+CLI flags: `--flat`, `--live`, `--new`, `--spawn`, `--watch`, `--watch-status`, `--usage`, or a path argument to filter sessions.
 
 ## Architecture
 
 **Main loop** (`main.rs`): CLI parsing → session loading → terminal raw mode setup → event loop (`run_app`) with background threads for update checks and session name loading → session launch on exit.
 
-**Core modules** (4 directory-based, 7 single-file):
+**Core modules** (5 directory-based, 6 single-file):
 
 ### `src/app/`: Application state & logic
 Central `App` struct holding all UI state. Each sub-file adds `impl App` methods for a specific domain:
@@ -83,15 +83,25 @@ Persistent job model plus the decision logic the `watch.rs` daemon executes. Sta
 | `engine.rs` | **Pure** `plan()` returning `Vec<Action>`, plus `build_start_argv()`, `build_resume_argv()`, `backoff_ms()` |
 | `tests.rs` | Decision-table tests plus store/command coverage |
 
+### `src/usage/`: Account usage
+Reads the 5-hour and 7-day rate-limit windows natively; ccsm depends on no external usage tool. Everything except the three I/O entry points is pure.
+
+| File | Concern |
+|------|---------|
+| `mod.rs` | `UsageSnapshot`, `UsageWindow`, `Source`, `reset_at_ms()`, `is_fresh()`, `now_ms()`, source selection in `fetch()`, the `--usage` report in `render()`, and `source_unavailable()` |
+| `local.rs` | Claude Desktop's `plan-usage-history.json`: `history_path()`, `parse_history()`, `load()`, and the 5-hour reset estimate derived from observed window boundaries |
+| `api.rs` | The OAuth usage endpoint: `fetch_usage_body()` (ureq) and `parse()` |
+| `credentials.rs` | OAuth token lookup: env var, then `~/.claude/.credentials.json`, then the macOS Keychain |
+| `tests.rs` | Model, source-selection, and render tests (the api source is never exercised, so no test can raise a Keychain prompt) |
+
 ### Single-file modules
 
-- **`keys.rs`**: Key event handlers split by modal context (rename, naming, duplicate, stop-confirm) and normal mode navigation/actions. `handle_event` reads the terminal and dispatches; the Sessions-tab keymap lives in `dispatch_normal_key_with_shift` so it can be driven from tests.
+- **`keys.rs`**: Key event handlers split by modal context (rename, naming, duplicate, stop-confirm) and normal mode navigation/actions. `handle_event` reads the terminal and dispatches; the Sessions-tab keymap lives in `dispatch_normal_key_with_shift` so it can be driven from tests. `normalize_key`/`shifted_char` resolve Shift for every text field.
 - **`live.rs`**: Tmux integration using dedicated `ccsm` socket. Discovers running sessions, manages attach/detach/rename/kill, captures pane output for live preview.
-- **`config.rs`**: Config struct serialized to `~/.config/ccsm/config.json`. Fields: view mode, display mode, hide_empty, group_chains, live_filter, favorites, custom binary paths, and the scheduler's usage thresholds, continue prompt, and `idle_complete_seconds`.
+- **`config.rs`**: Config struct serialized to `~/.config/ccsm/config.json`. Fields: view mode, display mode, hide_empty, group_chains, live_filter, favorites, custom binary paths, the usage source and history-file override, and the scheduler's usage thresholds, continue prompt, and `idle_complete_seconds`.
 - **`config_popup.rs`**: Config popup modal UI and event handling.
 - **`models.rs`**: Builds the job form's `--model` picker at runtime. Tier aliases (`opus`/`sonnet`/`haiku`/`fable`) plus concrete ids read from `~/.claude.json` (`additionalModelOptionsCache` and `projects.*.lastModelUsage`). Pure `discovered_from_json()` is unit tested; only `available()` touches the filesystem.
 - **`update.rs`**: Background version check against GitHub Releases API (24h cooldown). Downloads platform-specific archive, replaces binary in-place, triggers auto-restart.
-- **`usage.rs`**: Parses `claude-usage --format json`. Pure `parse()`/`reset_at_ms()`/`is_fresh()` plus a shelling-out `fetch()`.
 - **`watch.rs`**: The `ccsm --watch` daemon. Owns all job state, runs a 1s loop (drain commands, reconcile tmux, poll activity, adaptive usage fetch, `engine::plan`, execute, persist). Lives in its own `ccsm-watch` tmux session.
 - **`theme.rs`**: Catppuccin Mocha color palette constants shared across UI.
 
@@ -116,6 +126,9 @@ Persistent job model plus the decision logic the `watch.rs` daemon executes. Sta
 - **Completion outranks every other transition.** The `completed` check sits above the state match in `engine::plan`, not inside the `Running` arm: a finished agent usually exits straight afterwards, and a `Stopped` job with auto-resume on would otherwise be relaunched against work that is already done. The relaunch backoff (30s minimum) is what guarantees the 5s completion poll wins that race.
 - **Idle completion measures one unbroken stretch.** `watch::update_idle_tracking` clears a job's `idle_since_ms` the moment its pane looks busy, waiting, or the job leaves `Running`; the entry is never refreshed while idleness continues, so the timer is a true elapsed time and not a sum.
 - **Usage staleness is asymmetric**: a stale sample may trigger a pause but never a resume. The retained snapshot is aged via `watch::aged_usage` before use so holding it cannot fake freshness.
+- **Fresh local usage short-circuits the api source.** `usage::fetch` under `auto` returns local history the moment it is fresh and only then considers the API, because the API path reads an OAuth token and on macOS that can raise a Keychain prompt — from inside the `ccsm-watch` tmux session, where nobody would see it. Never reorder that check, and never add a test that reaches the api source.
+- **Only the api source knows a real reset time.** The local history file has none, so `usage::local` infers the 5-hour reset from window rollovers visible in the samples and it renders as `(est)`. `UsageWindow::reset_at_ms` prefers the authoritative `resets_at` and falls back to the estimate; a window with neither reports `None` rather than guessing.
+- **The Keychain is read by shelling out to `/usr/bin/security`**, not by linking `security-framework`, so the five cross-compiled release targets don't need a macOS-only dependency. Errors from that path must never echo the credentials blob.
 - **One picker, many targets**: `PickerTarget` decides what kind of path is valid, where the committed path is written, and which mode the picker returns to. Add new browsable path fields by extending that enum, not by cloning the picker.
 - **The status bar ranks hints and drops the ones that do not fit** (`info_bar::select_hints`). Every hint carries a `HintPriority`; `P0` (`? help`, `q quit`) survives any width that can physically hold it, and a `…` marks that something was dropped. The old bar laid hints out as fixed `Constraint::Length` chunks, so a terminal narrower than 158 columns silently deleted the trailing hints — which were `q quit` and `? help`. `select_hints` is pure and unit-tested at every width from 1 to 200; do not go back to eyeballing it
 - **`Esc` never quits.** Every modal treats `Esc` as "back out", so an `Esc` pressed once too many while dismissing a popup must not take the app down. In Sessions/Normal it clears an active filter and is otherwise inert; `q` and `Ctrl+C` quit
@@ -123,6 +136,7 @@ Persistent job model plus the decision logic the `watch.rs` daemon executes. Sta
 - **Popups size through `ui::util::centered_rect_min`, not `centered_rect`.** Percentage-only sizing collapses on small terminals (`centered_rect(46, 3, …)` is zero-height below ~34 rows), which is why popups used to carry ad-hoc `if area.height < N` clamps. Pass the content minimum instead
 - **The help overlay is the fallback for every dropped hint, so it scrolls** (`j`/`k`, `PgUp`/`PgDn`). At 80x24 its content area is 15 rows against a Sessions page of ~24 lines. The config popup scrolls too, but follows `config_selected` rather than taking its own offset
 - **Text fields render through `ui::util::input_spans`**: `tui_input` already handles Left/Right/word/Home/End/Ctrl+U, so a field that looks like it can't move its cursor is a *rendering* bug. Never draw a trailing `|` in place of the real cursor.
+- **Every text field must go through `keys::normalize_key`.** Under the enhanced keyboard protocol the terminal reports the *base* key plus `SHIFT`, so `Shift+2` arrives as `Char('2')` and `tui_input` would insert a literal `2` where an `@` was typed. `normalize_key` uppercases letters and maps the number row and punctuation via `shifted_char`. Requesting `REPORT_ALTERNATE_KEYS` would let the terminal resolve this per layout, but crossterm then *clears* `SHIFT` on the resolved event, and `handle_event` reads that modifier to keep the status bar's Shift hints lit while Shift is held — so the fix stays on the text path.
 - **Never attach blind**: go through `App::request_attach`, which checks `live::session_exists` first and reports a missing session in `status_error`. A job keeps its `tmux_name` after the daemon stops it, so rows routinely outlive their session. `main.rs` also treats a launch failure as a `status_error` rather than propagating it: an error out of `run_app` closes the app.
 - **The live list is reconciled on a timer** (`poll_live_sessions`, every ~1.5s in `run_app`). Sessions end without the TUI doing anything, and `x` on a managed session only enqueues `StopJob` for the daemon, so without this the row keeps claiming to be running.
 - **`status_error` is cleared at the top of every key press** (`keys.rs`), so alerts describe the last action instead of accumulating.
@@ -130,7 +144,7 @@ Persistent job model plus the decision logic the `watch.rs` daemon executes. Sta
 
 ## Tests
 
-Tests live in `#[cfg(test)]` modules: `app/tests.rs`, `data/tests.rs`, `schedule/tests.rs`, `config.rs`, `live.rs`, `models.rs`, `main.rs`, `usage.rs`, `watch.rs`, `config_popup.rs`, `ui/info_bar.rs`, `ui/jobs_tab.rs`, `ui/mod.rs`, `ui/util.rs`, and `update.rs`. Modal layouts are covered by rendering a real frame into ratatui's `TestBackend` and asserting on the resulting text (see `ui/jobs_tab.rs` and `config_popup.rs`), which catches content that overflows a fixed-height popup. They use `tempfile` for filesystem isolation. No external test harness: just `cargo test`.
+Tests live in `#[cfg(test)]` modules: `app/tests.rs`, `data/tests.rs`, `schedule/tests.rs`, `usage/tests.rs` (plus per-file tests in `usage/local.rs`, `usage/api.rs`, `usage/credentials.rs`), `config.rs`, `keys.rs`, `live.rs`, `models.rs`, `main.rs`, `watch.rs`, `config_popup.rs`, `ui/info_bar.rs`, `ui/jobs_tab.rs`, `ui/mod.rs`, `ui/util.rs`, and `update.rs`. Modal layouts are covered by rendering a real frame into ratatui's `TestBackend` and asserting on the resulting text (see `ui/jobs_tab.rs` and `config_popup.rs`), which catches content that overflows a fixed-height popup. They use `tempfile` for filesystem isolation. No external test harness: just `cargo test`.
 
 Tests that set `$CCSM_CONFIG_DIR` must hold `config::test_lock()` for their duration and clear the var afterwards, since env vars are process-global and would otherwise corrupt tests running in parallel.
 

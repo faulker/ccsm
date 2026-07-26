@@ -1,7 +1,7 @@
 //! Pure decision engine for the watch daemon. `plan` looks at the current
 //! jobs, the latest usage sample, and live tmux state, and returns the list
 //! of actions to take. It performs zero I/O so it can be exhaustively unit
-//! tested without tmux, claude-usage, or the filesystem.
+//! tested without tmux, a usage sample, or the filesystem.
 
 use super::*;
 use crate::config::Config;

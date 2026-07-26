@@ -1705,7 +1705,7 @@ fn typing_a_directory_into_a_file_picker_navigates_instead_of_committing() {
 
     assert_eq!(app.mode, AppMode::DirPicker, "still browsing");
     assert_eq!(app.dir_browser.as_ref().unwrap().current_dir, sub);
-    assert!(app.config.usage_path.is_none(), "nothing was committed");
+    assert!(app.config.usage_history_path.is_none(), "nothing was committed");
 
     std::env::remove_var("CCSM_CONFIG_DIR");
 }
@@ -1811,7 +1811,7 @@ fn enter_on_a_config_path_row_opens_the_file_picker() {
 
     let mut app = make_app(vec![], None, Config::default());
     app.mode = AppMode::Config;
-    app.config_selected = 5; // claude-usage binary
+    app.config_selected = 5; // usage history file
     app.handle_config_event(key(KeyCode::Enter));
 
     assert_eq!(app.mode, AppMode::DirPicker);

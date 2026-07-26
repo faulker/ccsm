@@ -284,7 +284,7 @@ fn draw_jobs_list(frame: &mut Frame, app: &App, area: Rect) {
     let mut banner: Vec<Line> = Vec::new();
     if app.missing_usage {
         banner.push(Line::from(Span::styled(
-            " claude-usage not found — set its path in Config (o)",
+            " usage history file not found — set its path in Config (o)",
             Style::default().fg(ACCENT_RED).add_modifier(Modifier::BOLD),
         )));
     }

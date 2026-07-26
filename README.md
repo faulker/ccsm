@@ -25,7 +25,7 @@ Press `n` on the Jobs tab to dispatch a new session: a name, a working directory
 ![New job form](screenshots/job-form.png)
 
 ### Directory browser
-Every path the app needs can be browsed instead of typed, whether it is a new session's directory, a job's working directory, or the `claude` / `tmux` / `claude-usage` binaries. Press `/` inside the picker to type a path by hand.
+Every path the app needs can be browsed instead of typed, whether it is a new session's directory, a job's working directory, the `claude` / `tmux` binaries, or the usage history file. Press `/` inside the picker to type a path by hand.
 
 ![Directory browser](screenshots/directory-picker.png)
 
@@ -50,7 +50,7 @@ Press `?` for the keybinding reference. It opens on the page matching the tab yo
 - **Usage-aware scheduling** — dispatch sessions with a prompt, pause them automatically before your 5-hour budget runs out, and continue them when it resets, all without being at the keyboard (Jobs tab, `Tab`)
 - **Jobs know when they are finished** — every dispatched prompt asks the agent to sign off with `CCSM_JOB_COMPLETE`, which the watcher reads from the session transcript; a job that reports it (or sits idle past a configurable window) is marked done, its session stopped, and it is never re-dispatched
 - **Usage always in view** — the tab strip shows your current usage percentage, the time until the window resets, and a red `⏱ off` if the watcher daemon has died, on every tab
-- **Directory browser** — browse for any path the app needs: a new session's directory (`b`), a job's working directory, or the `claude`/`tmux`/`claude-usage` binaries in the config popup — and type it by hand instead if you prefer
+- **Directory browser** — browse for any path the app needs: a new session's directory (`b`), a job's working directory, or the `claude`/`tmux` binaries and the usage history file in the config popup — and type it by hand instead if you prefer
 - **Full cursor editing** — every text field supports `←`/`→`, `Ctrl+←`/`→` by word, `Home`/`End`, `Ctrl+W`, and `Ctrl+U`
 - **Duplicate detection** — catches duplicate session names with options to open, rename, or cancel
 - **Search & filter** — filter by project name or path; toggle live-only mode with `l`
@@ -149,6 +149,12 @@ Use `--watch` to run the usage-aware scheduler daemon in the foreground, or `--w
 ```sh
 ccsm --watch
 ccsm --watch-status
+```
+
+Use `--usage` to print the current 5-hour and 7-day usage reading and exit:
+
+```sh
+ccsm --usage
 ```
 
 ## Quick Start
@@ -408,6 +414,7 @@ process rather than inside the TUI:
 ```sh
 ccsm --watch          # run the daemon in the foreground (usually not needed)
 ccsm --watch-status   # print daemon health and a summary of every job
+ccsm --usage          # print the current 5-hour and 7-day usage reading
 ```
 
 It normally starts on its own the first time you create a job (`Auto-start watcher` in
@@ -424,9 +431,34 @@ waiting, so queued work is never silently lost.
 
 ### Usage data
 
-Usage comes from the `claude-usage` binary, invoked as `claude-usage --format json`. Set
-its path in the config popup if it is not on your `PATH`. Without it the rest of ccsm
-works normally; only job creation is disabled.
+Usage is read by ccsm itself; there is no separate binary to install. Two sources back
+it, and `usage_source` picks between them:
+
+- **`local`** (no auth, no network) parses Claude Desktop's `plan-usage-history.json`,
+  the same file Desktop writes a sample to every 15-18 minutes. It carries no reset time,
+  so the 5-hour reset is estimated from the window rollovers visible in the sample
+  history and is labelled `(est)` wherever it is shown.
+- **`api`** calls the OAuth usage endpoint with Claude Code's own token, which reports an
+  authoritative reset time. The token is read from `CCSM_USAGE_TOKEN` or
+  `CLAUDE_CODE_OAUTH_TOKEN`, then `~/.claude/.credentials.json`, then the macOS Keychain
+  (which can raise a password prompt).
+- **`auto`** (the default) uses local data while it is fresh and only falls back to the
+  API when it is stale or missing, so the common case needs no credentials at all.
+
+Print the current reading at any time:
+
+```sh
+ccsm --usage
+```
+
+```
+5h window   72% used   resets in ~3h 39m (est)
+7d window   66% used
+source: local, sampled 55s ago
+```
+
+If Claude Desktop is not installed, set `usage_source` to `"api"`, or point
+`usage_history_path` at the file in the config popup if it lives somewhere non-standard.
 
 ccsm is deliberately conservative about stale readings: a stale sample can still trigger
 a pause (erring toward stopping), but never a resume.
@@ -460,7 +492,7 @@ Settings are persisted to `~/.config/ccsm/config.json` and automatically saved w
 | `live_filter` | `true` / `false` | Whether to show only running live sessions |
 | `favorites` | Array of paths | Project directories pinned to the top of the list |
 | `last_update_check` | Unix timestamp | When the last update check was performed (auto-managed) |
-| `claude_path` / `tmux_path` / `usage_path` | Path or unset | Override binary locations; unset means look on `PATH` |
+| `claude_path` / `tmux_path` | Path or unset | Override binary locations; unset means look on `PATH` |
 
 Scheduler settings, all editable under **Jobs manager** in the config popup (`o`):
 
@@ -473,7 +505,8 @@ Scheduler settings, all editable under **Jobs manager** in the config popup (`o`
 | `watch_seven_day` | `true` | Also pause on the 7-day window, not just the 5-hour one |
 | `usage_poll_seconds` | `60` | How often to sample usage while a job is active |
 | `usage_max_age_seconds` | `900` | A usage sample older than this counts as stale |
-| `usage_source` | `"auto"` | Passed to `claude-usage --source` (`auto`, `local`, or `api`) |
+| `usage_source` | `"auto"` | Where to read usage from: `auto`, `local` (Claude Desktop history), or `api` (OAuth endpoint) |
+| `usage_history_path` | `null` | Override the path to Claude Desktop's `plan-usage-history.json` |
 | `defer_while_attached` | `true` | Skip automated keystrokes while you have the session attached |
 | `continue_prompt` | `"Continue where you left off."` | Default text pasted to wake a paused job, when the job has no override |
 | `continue_prompt` | `"Continue where you left off."` | Text pasted into a paused session to resume it |

@@ -76,9 +76,10 @@ pub struct Config {
     /// Custom path to the `tmux` binary (None = look up "tmux" on PATH).
     #[serde(default)]
     pub tmux_path: Option<String>,
-    /// Path to the `claude-usage` binary. `None` means look it up on PATH.
+    /// Path to Claude Desktop's `plan-usage-history.json`. `None` means use the
+    /// standard location for the platform.
     #[serde(default)]
-    pub usage_path: Option<String>,
+    pub usage_history_path: Option<String>,
     /// Pause managed sessions when 5-hour usage reaches this percentage.
     #[serde(default = "default_pause_percent")]
     pub usage_pause_percent: f64,
@@ -91,7 +92,7 @@ pub struct Config {
     /// A usage sample older than this many seconds is treated as stale.
     #[serde(default = "default_usage_max_age_seconds")]
     pub usage_max_age_seconds: u64,
-    /// Value passed to `claude-usage --source`.
+    /// Which usage source to read: `"auto"`, `"local"`, or `"api"`.
     #[serde(default = "default_usage_source")]
     pub usage_source: String,
     /// Default pause strategy for new jobs.
@@ -131,7 +132,7 @@ impl Default for Config {
             favorites: HashSet::new(),
             claude_path: None,
             tmux_path: None,
-            usage_path: None,
+            usage_history_path: None,
             usage_pause_percent: default_pause_percent(),
             usage_resume_percent: default_resume_percent(),
             usage_poll_seconds: default_usage_poll_seconds(),
@@ -247,10 +248,10 @@ impl Config {
         self.tmux_path.as_deref().unwrap_or("tmux")
     }
 
-    /// Returns the configured claude-usage binary path, or "claude-usage" if unset.
-    #[allow(dead_code)]
-    pub fn usage_bin(&self) -> &str {
-        self.usage_path.as_deref().unwrap_or("claude-usage")
+    /// Returns the configured usage-history override, or `None` to use the
+    /// platform's standard Claude Desktop location.
+    pub fn usage_history_override(&self) -> Option<&str> {
+        self.usage_history_path.as_deref().filter(|p| !p.is_empty())
     }
 
     /// Returns true if the given binary name/path is findable on the system.
@@ -546,7 +547,7 @@ mod tests {
     fn test_config_backward_compat_without_scheduler_fields() {
         let json = r#"{"tree_view": true, "display_mode": "name"}"#;
         let config: Config = serde_json::from_str(json).unwrap();
-        assert_eq!(config.usage_path, None);
+        assert_eq!(config.usage_history_path, None);
         assert_eq!(config.usage_pause_percent, 95.0);
         assert_eq!(config.usage_resume_percent, 50.0);
         assert_eq!(config.usage_poll_seconds, 60);
@@ -580,16 +581,35 @@ mod tests {
     }
 
     #[test]
-    fn test_usage_bin_default() {
-        let config = Config::default();
-        assert_eq!(config.usage_bin(), "claude-usage");
+    fn test_usage_history_override_default() {
+        assert_eq!(Config::default().usage_history_override(), None);
     }
 
     #[test]
-    fn test_usage_bin_custom() {
+    fn test_usage_history_override_custom() {
         let mut config = Config::default();
-        config.usage_path = Some("/opt/bin/claude-usage".to_string());
-        assert_eq!(config.usage_bin(), "/opt/bin/claude-usage");
+        config.usage_history_path = Some("/opt/plan-usage-history.json".to_string());
+        assert_eq!(
+            config.usage_history_override(),
+            Some("/opt/plan-usage-history.json")
+        );
+    }
+
+    #[test]
+    fn test_usage_history_override_treats_an_empty_string_as_unset() {
+        let mut config = Config::default();
+        config.usage_history_path = Some(String::new());
+        assert_eq!(config.usage_history_override(), None);
+    }
+
+    #[test]
+    fn test_config_drops_the_legacy_usage_binary_path() {
+        // Configs written before usage was built in carry a claude-usage binary
+        // path. It has no meaning now, so it must be ignored, not adopted as a
+        // history-file path.
+        let json = r#"{"tree_view":true,"display_mode":"name","usage_path":"/usr/local/bin/claude-usage"}"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(config.usage_history_path, None);
     }
 
     #[test]

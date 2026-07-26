@@ -292,6 +292,7 @@ fn main() -> Result<()> {
     let flat = args.iter().any(|a| a == "--flat") || live_start;
     let watch_daemon = args.iter().any(|a| a == "--watch");
     let watch_status = args.iter().any(|a| a == "--watch-status");
+    let usage_report = args.iter().any(|a| a == "--usage");
     let filter_path = args.iter().find(|a| !a.starts_with('-')).map(|arg| {
         std::fs::canonicalize(arg)
             .map(|p| p.to_string_lossy().to_string())
@@ -304,6 +305,24 @@ fn main() -> Result<()> {
 
     if watch_status {
         println!("{}", watch::status_report());
+        return Ok(());
+    }
+
+    // The same read the watch daemon makes, printed once. This is what replaces
+    // reaching for a separate usage CLI when checking limits by hand.
+    if usage_report {
+        let cfg = config::Config::load();
+        match usage::fetch(
+            &cfg.usage_source,
+            cfg.usage_max_age_seconds,
+            cfg.usage_history_override(),
+        ) {
+            Ok(snapshot) => println!("{}", usage::render(&snapshot)),
+            Err(e) => {
+                eprintln!("error: {e:#}");
+                std::process::exit(1);
+            }
+        }
         return Ok(());
     }
 

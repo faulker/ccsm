@@ -4,7 +4,7 @@
 //! once usage falls or the reset window arrives. The decision logic itself
 //! lives in the pure `schedule::engine::plan`; this module is the effectful
 //! shell that gathers inputs, calls it, and carries out the resulting
-//! actions against real tmux sessions and the `claude-usage` binary.
+//! actions against real tmux sessions and real usage data.
 
 use crate::config::{Config, PauseMode};
 use crate::live::{self, ActivityState};
@@ -285,7 +285,11 @@ pub fn run() -> Result<()> {
         let should_fetch = force_usage_fetch || cadence_due || sleep_guard_due;
 
         if should_fetch {
-            match usage::fetch(cfg.usage_bin(), &cfg.usage_source, cfg.usage_max_age_seconds) {
+            match usage::fetch(
+                &cfg.usage_source,
+                cfg.usage_max_age_seconds,
+                cfg.usage_history_override(),
+            ) {
                 Ok(snap) => {
                     if let Some(pct) = snap.five_hour.as_ref().and_then(|w| w.used_percentage) {
                         last_known_pct = Some(pct);
@@ -307,7 +311,7 @@ pub fn run() -> Result<()> {
         }
 
         // A retained sample keeps getting older. `age_seconds` is fixed at the
-        // moment claude-usage reported it, so add the time we have held it;
+        // moment the sample was read, so add the time we have held it;
         // otherwise a sample from ten minutes ago still claims to be fresh and
         // the "never resume on stale data" rule would be silently defeated.
         let aged_snapshot = aged_usage(usage_snapshot.as_ref(), last_usage_fetch_ms, now);
@@ -1286,7 +1290,7 @@ fn escalation_step(elapsed_ms: i64, steps_taken: u8) -> EscalationStep {
 /// window's reset, mirroring `engine::effective_pct`'s max-of-both policy.
 /// Age a retained usage sample by however long it has been held, so that
 /// `is_fresh` reflects the sample's true age rather than its age at the moment
-/// claude-usage reported it. Without this, a sample kept across ticks would
+/// the sample was read. Without this, a sample kept across ticks would
 /// claim indefinite freshness and defeat the "never resume on stale data" rule.
 fn aged_usage(
     usage: Option<&UsageSnapshot>,

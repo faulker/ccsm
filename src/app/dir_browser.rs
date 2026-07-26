@@ -25,7 +25,7 @@ pub enum PickerTarget {
     ConfigClaude,
     /// Path to the `tmux` binary.
     ConfigTmux,
-    /// Path to the `claude-usage` binary.
+    /// Path to Claude Desktop's `plan-usage-history.json`.
     ConfigUsage,
 }
 
@@ -47,7 +47,7 @@ impl PickerTarget {
             PickerTarget::JobCwd => " Job \u{2014} Working Directory ",
             PickerTarget::ConfigClaude => " Config \u{2014} claude Binary ",
             PickerTarget::ConfigTmux => " Config \u{2014} tmux Binary ",
-            PickerTarget::ConfigUsage => " Config \u{2014} claude-usage Binary ",
+            PickerTarget::ConfigUsage => " Config \u{2014} Usage History File ",
         }
     }
 
@@ -363,21 +363,24 @@ impl App {
                 self.commit_config_path_change();
             }
             PickerTarget::ConfigUsage => {
-                self.config.usage_path = Some(path);
+                self.config.usage_history_path = Some(path);
                 self.commit_config_path_change();
             }
         }
     }
 
-    /// Persist a binary-path change made from the picker, re-check availability,
-    /// and return to the config popup.
+    /// Persist a path change made from the picker, re-check availability, and
+    /// return to the config popup.
     fn commit_config_path_change(&mut self) {
         if let Err(e) = self.config.save() {
             self.status_error = Some(format!("Failed to save config: {e}"));
         }
         self.missing_claude = !Config::is_bin_available(self.config.claude_bin());
         self.missing_tmux = !Config::is_bin_available(self.config.tmux_bin());
-        self.missing_usage = !Config::is_bin_available(self.config.usage_bin());
+        self.missing_usage = crate::usage::source_unavailable(
+            &self.config.usage_source,
+            self.config.usage_history_override(),
+        );
         self.mode = AppMode::Config;
     }
 

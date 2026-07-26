@@ -58,8 +58,6 @@ fn fresh_usage(five_pct: f64) -> UsageSnapshot {
             resets_at_estimated_ms: None,
         }),
         seven_day: None,
-        seven_day_opus: None,
-        seven_day_sonnet: None,
         extra_usage_dollars: None,
     }
 }

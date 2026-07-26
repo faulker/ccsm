@@ -5,15 +5,64 @@ use crate::app::{
 use crate::{data, live};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, ModifierKeyCode, MouseEventKind};
 
-/// Normalize a key event so that Shift+letter produces an uppercase `Char`.
+/// The character a US-layout key produces when Shift is held. Covers the
+/// number row and the punctuation keys; letters are handled by uppercasing.
 ///
-/// With the enhanced keyboard protocol, crossterm reports `Char('a')` with
-/// `KeyModifiers::SHIFT` rather than `Char('A')`.  `tui_input` inserts the
-/// char as-is, so we uppercase it here before delegation.
+/// This is a layout assumption, and the only one available: without
+/// `REPORT_ALTERNATE_KEYS` the terminal sends the *base* key and never says
+/// what the layout would have produced. See `normalize_key` for why that flag
+/// is not requested.
+fn shifted_char(c: char) -> Option<char> {
+    Some(match c {
+        '1' => '!',
+        '2' => '@',
+        '3' => '#',
+        '4' => '$',
+        '5' => '%',
+        '6' => '^',
+        '7' => '&',
+        '8' => '*',
+        '9' => '(',
+        '0' => ')',
+        '-' => '_',
+        '=' => '+',
+        '[' => '{',
+        ']' => '}',
+        '\\' => '|',
+        ';' => ':',
+        '\'' => '"',
+        ',' => '<',
+        '.' => '>',
+        '/' => '?',
+        '`' => '~',
+        _ => return None,
+    })
+}
+
+/// Normalize a key event so a Shift-held key produces the character it types.
+///
+/// With the enhanced keyboard protocol, crossterm reports the *unshifted* key
+/// plus `KeyModifiers::SHIFT`: `Shift+a` arrives as `Char('a')` and `Shift+2`
+/// as `Char('2')`. `tui_input` inserts the char as-is, so without this an `@`
+/// lands in the field as a `2`.
+///
+/// Requesting `KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS` would make the
+/// terminal resolve this per layout, which is strictly more correct, but it
+/// also clears `SHIFT` on every shifted keypress — and `handle_event` reads
+/// that modifier to drive the status bar's Shift hints, which would then go
+/// dark while Shift is still held. Fixing the text path only keeps that
+/// affordance intact.
+///
+/// A key that already carries its shifted character (a terminal that resolved
+/// it) is left alone, so this never double-shifts.
 pub(crate) fn normalize_key(mut key: crossterm::event::KeyEvent) -> crossterm::event::KeyEvent {
     if let KeyCode::Char(c) = key.code {
-        if key.modifiers.contains(KeyModifiers::SHIFT) && c.is_ascii_lowercase() {
-            key.code = KeyCode::Char(c.to_ascii_uppercase());
+        if key.modifiers.contains(KeyModifiers::SHIFT) {
+            if c.is_ascii_lowercase() {
+                key.code = KeyCode::Char(c.to_ascii_uppercase());
+            } else if let Some(shifted) = shifted_char(c) {
+                key.code = KeyCode::Char(shifted);
+            }
         }
     }
     key
@@ -839,4 +888,104 @@ impl App {
             }
     }
 
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::KeyEvent;
+
+    /// A key as the enhanced protocol reports it: the unshifted char plus SHIFT.
+    fn shifted(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::SHIFT)
+    }
+
+    #[test]
+    fn shift_and_a_digit_types_its_symbol() {
+        // The reported bug: Shift+2 landed in the field as "2".
+        assert_eq!(normalize_key(shifted('2')).code, KeyCode::Char('@'));
+    }
+
+    #[test]
+    fn every_shifted_key_on_the_number_row_is_covered() {
+        let pairs = [
+            ('1', '!'),
+            ('2', '@'),
+            ('3', '#'),
+            ('4', '$'),
+            ('5', '%'),
+            ('6', '^'),
+            ('7', '&'),
+            ('8', '*'),
+            ('9', '('),
+            ('0', ')'),
+            ('-', '_'),
+            ('=', '+'),
+        ];
+        for (base, expected) in pairs {
+            assert_eq!(
+                normalize_key(shifted(base)).code,
+                KeyCode::Char(expected),
+                "Shift+{base} should type {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_shifted_punctuation_key_is_covered() {
+        let pairs = [
+            ('[', '{'),
+            (']', '}'),
+            ('\\', '|'),
+            (';', ':'),
+            ('\'', '"'),
+            (',', '<'),
+            ('.', '>'),
+            ('/', '?'),
+            ('`', '~'),
+        ];
+        for (base, expected) in pairs {
+            assert_eq!(
+                normalize_key(shifted(base)).code,
+                KeyCode::Char(expected),
+                "Shift+{base} should type {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn shift_and_a_letter_still_uppercases() {
+        assert_eq!(normalize_key(shifted('a')).code, KeyCode::Char('A'));
+        assert_eq!(normalize_key(shifted('z')).code, KeyCode::Char('Z'));
+    }
+
+    #[test]
+    fn a_key_without_shift_is_untouched() {
+        for c in ['2', 'a', '/', '-'] {
+            let key = KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+            assert_eq!(normalize_key(key).code, KeyCode::Char(c));
+        }
+    }
+
+    #[test]
+    fn an_already_shifted_char_is_not_shifted_twice() {
+        // A terminal that resolved the layout itself sends the final character;
+        // remapping it again would turn a typed "@" into something else.
+        for c in ['@', '!', 'A', '?'] {
+            assert_eq!(normalize_key(shifted(c)).code, KeyCode::Char(c));
+        }
+    }
+
+    #[test]
+    fn a_non_char_key_is_untouched() {
+        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT);
+        assert_eq!(normalize_key(key).code, KeyCode::Enter);
+    }
+
+    #[test]
+    fn normalizing_preserves_the_modifiers_and_kind() {
+        let key = normalize_key(shifted('2'));
+        assert!(key.modifiers.contains(KeyModifiers::SHIFT));
+        assert_eq!(key.kind, KeyEventKind::Press);
+    }
 }

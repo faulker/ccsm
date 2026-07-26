@@ -409,7 +409,8 @@ pub struct App {
     pub watch_state: Option<schedule::store::WatchState>,
     /// Fingerprint of `watch_state.json` as of the last `reload_schedule`, used by `poll_schedule_changed`.
     pub watch_stamp: Option<schedule::store::Stamp>,
-    /// True when the `claude-usage` binary cannot be found; disables job creation.
+    /// True when the configured usage source cannot produce data at all (the
+    /// local history file is missing and the source is pinned to `local`).
     pub missing_usage: bool,
     /// Whether the watch daemon was running as of the last check. Drives the
     /// title-bar indicator, so a silently dead watcher stays visible.
@@ -557,7 +558,10 @@ impl App {
             app.missing_tmux = !tmux_ok;
             app.mode = AppMode::MissingDeps;
         }
-        app.missing_usage = !Config::is_bin_available(app.config.usage_bin());
+        app.missing_usage = crate::usage::source_unavailable(
+            &app.config.usage_source,
+            app.config.usage_history_override(),
+        );
 
         app.spawn_load_session_names();
         app.init_tree();

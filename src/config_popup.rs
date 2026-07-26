@@ -15,7 +15,8 @@ pub(crate) const CONTINUE_PROMPT_ROW: usize = 11;
 /// Row index of the project URL, which opens in a browser rather than editing.
 pub(crate) const URL_ROW: usize = 13;
 
-/// Rows 3..=5 are binary paths: they open the file picker, and can also be typed by hand.
+/// Rows 3..=5 are file paths (the two binaries and the usage history file):
+/// they open the file picker, and can also be typed by hand.
 const PATH_ROWS: std::ops::RangeInclusive<usize> = 3..=5;
 use ratatui::{
     layout::Rect,
@@ -51,7 +52,7 @@ impl App {
                             self.config.tmux_path = optional_from_input(value);
                         }
                         5 => {
-                            self.config.usage_path = optional_from_input(value);
+                            self.config.usage_history_path = optional_from_input(value);
                         }
                         6 => match parse_percent(&value) {
                             Some(v) if percent_ordering_ok(v, self.config.usage_resume_percent) => {
@@ -224,7 +225,7 @@ impl App {
                 let current = match self.config_selected {
                     3 => self.config.claude_path.clone(),
                     4 => self.config.tmux_path.clone(),
-                    _ => self.config.usage_path.clone(),
+                    _ => self.config.usage_history_path.clone(),
                 }
                 .unwrap_or_default();
                 self.config_path_input = tui_input::Input::from(current);
@@ -251,7 +252,7 @@ impl App {
         let current = match target {
             PickerTarget::ConfigClaude => self.config.claude_path.clone(),
             PickerTarget::ConfigTmux => self.config.tmux_path.clone(),
-            _ => self.config.usage_path.clone(),
+            _ => self.config.usage_history_path.clone(),
         }
         .unwrap_or_default();
         self.open_path_picker(target, &current);
@@ -364,9 +365,12 @@ pub fn draw_config_popup(frame: &mut Frame, app: &App) {
     content.push(section("Jobs manager (scheduler & watcher)"));
     content.push(path_row(
         5,
-        "claude-usage binary",
-        app.config.usage_path.as_ref(),
-        format!("{} (default)", app.config.usage_bin()),
+        "Usage history file",
+        app.config.usage_history_path.as_ref(),
+        format!(
+            "{} (default)",
+            crate::usage::local::history_path(None).display()
+        ),
     ));
     content.push(percent_row(6, "Pause jobs at usage", app.config.usage_pause_percent));
     content.push(percent_row(7, "Resume jobs at usage", app.config.usage_resume_percent));
@@ -777,8 +781,82 @@ mod tests {
     fn optional_from_input_maps_empty_string_to_none() {
         assert_eq!(optional_from_input(String::new()), None);
         assert_eq!(
-            optional_from_input("/usr/local/bin/claude-usage".to_string()),
-            Some("/usr/local/bin/claude-usage".to_string())
+            optional_from_input("/usr/local/bin/claude".to_string()),
+            Some("/usr/local/bin/claude".to_string())
         );
+    }
+
+    #[test]
+    fn a_text_field_types_shifted_characters() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let _guard = crate::config::test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("CCSM_CONFIG_DIR", dir.path());
+
+        let mut app = App::new(vec![], None, Config::default());
+        app.mode = AppMode::Config;
+        app.config_selected = CONTINUE_PROMPT_ROW;
+        app.handle_config_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.config_editing);
+        app.config_path_input = tui_input::Input::default();
+
+        // As the enhanced keyboard protocol reports them: the base key plus SHIFT.
+        for c in ['2', 'h', 'i', '1'] {
+            app.handle_config_event(KeyEvent::new(KeyCode::Char(c), KeyModifiers::SHIFT));
+        }
+
+        assert_eq!(app.config_path_input.value(), "@HI!");
+
+        std::env::remove_var("CCSM_CONFIG_DIR");
+    }
+
+    #[test]
+    fn popup_shows_the_usage_history_row() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = App::new(vec![], None, Config::default());
+        app.mode = AppMode::Config;
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let text: String = (0..40)
+            .map(|y| {
+                (0..120)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("Usage history file"), "{text}");
+        // The row that replaced it must be gone: there is no binary to point at.
+        assert!(!text.contains("claude-usage binary"), "{text}");
+    }
+
+    #[test]
+    fn usage_history_row_commits_a_typed_path() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let _guard = crate::config::test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("CCSM_CONFIG_DIR", dir.path());
+
+        let mut app = App::new(vec![], None, Config::default());
+        app.mode = AppMode::Config;
+        app.config_selected = 5;
+        app.handle_config_event(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        assert!(app.config_editing, "row 5 must be typeable");
+
+        app.config_path_input = tui_input::Input::from("/tmp/plan-usage-history.json".to_string());
+        app.handle_config_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(
+            app.config.usage_history_path.as_deref(),
+            Some("/tmp/plan-usage-history.json")
+        );
+        assert_eq!(
+            app.config.usage_history_override(),
+            Some("/tmp/plan-usage-history.json")
+        );
+
+        std::env::remove_var("CCSM_CONFIG_DIR");
     }
 }
