@@ -26,14 +26,17 @@ pub use dir_browser::{DirBrowser, PickerKind, PickerTarget};
 
 /// Which top-level tab of the main window is currently showing.
 ///
-/// Tabs replace what used to be a Jobs popup: the jobs manager is a peer of the
-/// session list rather than an overlay, so both share the list/detail layout.
+/// Tabs replace what used to be a Jobs popup and, later, a Config popup: both
+/// are peers of the session list rather than overlays, so all three share the
+/// list/detail layout and none of them can be buried under another modal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MainTab {
     /// The session browser (default).
     Sessions,
     /// The scheduler jobs manager.
     Jobs,
+    /// Application settings.
+    Config,
 }
 
 impl MainTab {
@@ -41,13 +44,18 @@ impl MainTab {
     pub fn next(self) -> Self {
         match self {
             MainTab::Sessions => MainTab::Jobs,
-            MainTab::Jobs => MainTab::Sessions,
+            MainTab::Jobs => MainTab::Config,
+            MainTab::Config => MainTab::Sessions,
         }
     }
 
     /// The previous tab in the strip, wrapping around.
     pub fn prev(self) -> Self {
-        self.next()
+        match self {
+            MainTab::Sessions => MainTab::Config,
+            MainTab::Jobs => MainTab::Sessions,
+            MainTab::Config => MainTab::Jobs,
+        }
     }
 }
 
@@ -181,8 +189,6 @@ pub enum AppMode {
     DirPicker,
     /// A duplicate session name was entered; waiting for the user to choose open vs. rename.
     DuplicateSession,
-    /// The config popup is open.
-    Config,
     /// One or more required binaries (claude/tmux) are missing.
     MissingDeps,
     /// The job create/edit form is open (reached only from the Jobs tab).
@@ -370,15 +376,15 @@ pub struct App {
     pub duplicate_source: Option<DuplicateSource>,
     /// The cwd to restore if the user chooses to pick a different name (NamingSession source only).
     pub duplicate_cwd: Option<String>,
-    /// Currently selected row in the config popup (0..=CONFIG_MAX_ROW).
+    /// Currently selected row in the Config tab's settings list (0..=CONFIG_MAX_ROW).
     pub config_selected: usize,
     /// True when the `claude` binary cannot be found at startup.
     pub missing_claude: bool,
     /// True when the `tmux` binary cannot be found at startup.
     pub missing_tmux: bool,
-    /// True when editing a text field in the config popup (path fields).
+    /// True when editing a text field on the Config tab (paths, percentages, prompts).
     pub config_editing: bool,
-    /// Input state for the path text field in the config popup.
+    /// Input state for the text field being edited on the Config tab.
     pub config_path_input: Input,
     /// Per-session activity state (Active, Idle, Unknown).
     pub activity_states: HashMap<String, ActivityState>,
@@ -412,6 +418,13 @@ pub struct App {
     /// True when the configured usage source cannot produce data at all (the
     /// local history file is missing and the source is pinned to `local`).
     pub missing_usage: bool,
+    /// Usage sampled by the TUI itself from the local history file. The chip
+    /// prefers this over `watch_state`, so it stays live with no watcher
+    /// running at all. `None` until the first successful poll.
+    pub usage: Option<crate::usage::UsageSnapshot>,
+    /// When `poll_usage` last ran, so it can rate-limit itself independently of
+    /// the event loop's tick rate.
+    pub usage_polled_at: Option<std::time::Instant>,
     /// Whether the watch daemon was running as of the last check. Drives the
     /// title-bar indicator, so a silently dead watcher stays visible.
     pub watch_running: bool,
@@ -532,6 +545,8 @@ impl App {
             watch_state: None,
             watch_stamp: None,
             missing_usage: false,
+            usage: None,
+            usage_polled_at: None,
             watch_running: false,
             jobs_confirm: None,
             job_form_field: 0,

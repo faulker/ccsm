@@ -155,16 +155,19 @@ pub fn plan(jobs: &[Job], inputs: &EngineInputs) -> Vec<Action> {
         // Completion outranks every other transition. A job that has reported
         // its work finished must not be dispatched, resumed, or relaunched
         // again, and checking it here rather than inside a single state arm is
-        // what closes the loop: the marker usually lands while the job is
+        // what closes the loop: the signal usually lands while the job is
         // Running, but the session often ends on its own straight afterwards,
         // and a `Stopped` job with auto-resume on would otherwise be relaunched
         // forever against work that is already done.
+        //
+        // The reason names no specific channel because there are two (stop hook
+        // and marker); `watch::poll_completion` logs which one fired.
         if !matches!(job.state, JobState::Done | JobState::Failed)
             && inputs.completed.contains(&job.id)
         {
             actions.push(Action::MarkDone {
                 job_id: job.id.clone(),
-                reason: format!("session reported {}", completion::COMPLETION_MARKER),
+                reason: "session reported completion".to_string(),
             });
             continue;
         }
@@ -359,7 +362,9 @@ pub fn continuation_text(job: &Job, cfg: &Config) -> String {
 /// argv directly (no shell), so a prompt containing spaces, quotes,
 /// `$(...)`, or backticks is safe as a single trailing argv element.
 ///
-/// The completion protocol rides `--append-system-prompt`, so it reaches the
+/// Completion is reported two ways: the `Stop` hook in `--settings` fires
+/// deterministically when the agent finishes responding, and the marker
+/// protocol rides `--append-system-prompt` as a fallback so it reaches the
 /// agent even when the job's prompt is a slash command.
 pub fn build_start_argv(claude_bin: &str, job: &Job) -> Vec<String> {
     let mut argv = vec![
@@ -369,6 +374,7 @@ pub fn build_start_argv(claude_bin: &str, job: &Job) -> Vec<String> {
         "--name".to_string(),
         job.name.clone(),
     ];
+    argv.extend(completion::hook_settings_args(&job.id));
     argv.extend(completion::system_prompt_args());
     if let Some(model) = &job.model {
         argv.push("--model".to_string());
@@ -399,6 +405,7 @@ pub fn build_resume_argv(claude_bin: &str, job: &Job) -> Vec<String> {
         }
         _ => vec![claude_bin.to_string(), "--continue".to_string()],
     };
+    argv.extend(completion::hook_settings_args(&job.id));
     argv.extend(completion::system_prompt_args());
     if let Some(model) = &job.model {
         argv.push("--model".to_string());

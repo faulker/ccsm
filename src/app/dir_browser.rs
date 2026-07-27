@@ -14,7 +14,7 @@ pub enum PickerKind {
 /// Which field the directory picker is currently choosing a path for. Drives
 /// both what kind of path is accepted and where the picker returns on commit
 /// or cancel, so one picker serves the new-session flow, the job form, and the
-/// config popup's binary-path fields.
+/// Config tab's binary-path fields.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PickerTarget {
     /// Working directory for a new live session (hands off to the naming popup).
@@ -52,12 +52,16 @@ impl PickerTarget {
     }
 
     /// The mode the picker returns to when it closes.
+    ///
+    /// The config targets return to `Normal`: their origin is the Config *tab*,
+    /// which is a `MainTab` and not a mode, and the picker never changes the
+    /// active tab, so it is still underneath when the picker closes.
     fn origin_mode(self) -> AppMode {
         match self {
             PickerTarget::NewSession => AppMode::Normal,
             PickerTarget::JobCwd => AppMode::JobForm,
             PickerTarget::ConfigClaude | PickerTarget::ConfigTmux | PickerTarget::ConfigUsage => {
-                AppMode::Config
+                AppMode::Normal
             }
         }
     }
@@ -370,7 +374,7 @@ impl App {
     }
 
     /// Persist a path change made from the picker, re-check availability, and
-    /// return to the config popup.
+    /// return to the Config tab underneath.
     fn commit_config_path_change(&mut self) {
         if let Err(e) = self.config.save() {
             self.status_error = Some(format!("Failed to save config: {e}"));
@@ -381,7 +385,7 @@ impl App {
             &self.config.usage_source,
             self.config.usage_history_override(),
         );
-        self.mode = AppMode::Config;
+        self.mode = AppMode::Normal;
     }
 
     /// Activate the "type a path" input, pre-filled with the current directory.

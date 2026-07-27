@@ -1296,6 +1296,98 @@ fn completion_ignores_a_marker_from_before_the_job_existed() {
     assert!(completion::transcript_shows_completion(&fresh, created_ms));
 }
 
+// ---------------------------------------------------------------------
+// Stop hook: the primary completion signal
+// ---------------------------------------------------------------------
+
+#[test]
+fn stop_stamp_roundtrips_and_clears() {
+    let _guard = test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("CCSM_CONFIG_DIR", dir.path());
+
+    assert!(!completion::stop_recorded("job-1"));
+    completion::record_stop("job-1").unwrap();
+    assert!(completion::stop_recorded("job-1"));
+    // Unrelated jobs are unaffected.
+    assert!(!completion::stop_recorded("job-2"));
+    completion::clear_stop("job-1");
+    assert!(!completion::stop_recorded("job-1"));
+    // Clearing a job that never stopped is a no-op, not an error.
+    completion::clear_stop("job-1");
+
+    std::env::remove_var("CCSM_CONFIG_DIR");
+}
+
+#[test]
+fn stop_stamp_rejects_ids_that_would_escape_the_stamp_directory() {
+    let _guard = test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("CCSM_CONFIG_DIR", dir.path());
+
+    for bad in ["", "..", ".", "../../etc/passwd", "a/b", r"a\b", "a\0b"] {
+        assert!(
+            completion::stamp_path(bad).is_none(),
+            "{bad:?} should not resolve to a stamp path"
+        );
+        // A rejected id must fail loudly rather than writing somewhere else.
+        assert!(completion::record_stop(bad).is_err(), "{bad:?}");
+        assert!(!completion::stop_recorded(bad), "{bad:?}");
+    }
+
+    std::env::remove_var("CCSM_CONFIG_DIR");
+}
+
+#[test]
+fn hook_settings_args_declare_a_stop_hook_running_job_complete() {
+    let args = completion::hook_settings_args("job-1");
+    assert_eq!(args[0], "--settings");
+    let value: serde_json::Value = serde_json::from_str(&args[1]).unwrap();
+    let command = value["hooks"]["Stop"][0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap();
+    assert!(command.ends_with("--job-complete 'job-1'"), "got {command:?}");
+    assert_eq!(value["hooks"]["Stop"][0]["hooks"][0]["type"], "command");
+    // The binary path is single-quoted, so a path containing spaces survives
+    // the shell the hook runs under.
+    assert!(command.starts_with('\''), "got {command:?}");
+}
+
+#[test]
+fn hook_settings_args_are_empty_for_an_unusable_job_id() {
+    // No hook is better than a hook pointed at a path outside the stamp
+    // directory; the job falls back to the marker protocol.
+    assert!(completion::hook_settings_args("../escape").is_empty());
+    assert!(completion::hook_settings_args("").is_empty());
+}
+
+#[test]
+fn start_argv_installs_the_stop_hook() {
+    let job = base_job(JobState::Queued);
+    let argv = build_start_argv("claude", &job);
+    let idx = argv.iter().position(|a| a == "--settings").unwrap();
+    let value: serde_json::Value = serde_json::from_str(&argv[idx + 1]).unwrap();
+    assert!(value["hooks"]["Stop"][0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap()
+        .contains(&job.id));
+}
+
+#[test]
+fn resume_argv_installs_the_stop_hook() {
+    // A relaunched job gets a fresh process, so it needs the hook re-installed
+    // just like a first dispatch does.
+    let mut job = base_job(JobState::Stopped);
+    job.claude_session_id = Some("abc-123".to_string());
+    let argv = build_resume_argv("claude", &job);
+    let idx = argv.iter().position(|a| a == "--settings").unwrap();
+    let value: serde_json::Value = serde_json::from_str(&argv[idx + 1]).unwrap();
+    assert!(value["hooks"]["Stop"][0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap()
+        .contains(&job.id));
+}
+
 #[test]
 fn completion_still_matches_an_entry_with_no_timestamp() {
     // Fail open on the time filter: a transcript format change must degrade

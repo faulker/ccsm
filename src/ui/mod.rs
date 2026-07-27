@@ -1,4 +1,5 @@
 mod ansi;
+pub(crate) mod config_tab;
 mod dir_picker;
 mod info_bar;
 mod jobs_tab;
@@ -21,6 +22,7 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthStr;
 
+use self::config_tab::{draw_config_tab, draw_missing_deps_popup};
 use self::dir_picker::draw_dir_picker;
 use self::info_bar::{build_title_spans, build_usage_status_spans, render_status_bar};
 use self::jobs_tab::{draw_job_confirm_popup, draw_job_form_popup, draw_jobs_tab};
@@ -47,14 +49,22 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     render_tab_bar(frame, app, chunks[0]);
 
+    // Sessions and Jobs are list-plus-detail, where the detail is the point.
+    // Config is the other way round: its rows carry full paths and prompt text,
+    // so the list needs the wider half or every value renders as an ellipsis.
+    let (left, right) = match app.main_tab {
+        MainTab::Config => (55, 45),
+        _ => (30, 70),
+    };
     let main_chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
+        .constraints([Constraint::Percentage(left), Constraint::Percentage(right)])
         .split(chunks[1]);
 
     match app.main_tab {
         MainTab::Sessions => draw_sessions_tab(frame, app, main_chunks[0], main_chunks[1]),
         MainTab::Jobs => draw_jobs_tab(frame, app, main_chunks[0], main_chunks[1]),
+        MainTab::Config => draw_config_tab(frame, app, main_chunks[0], main_chunks[1]),
     }
 
     // Status bar
@@ -64,7 +74,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 }
 
 /// Render the top tab strip. The active tab is highlighted; the Jobs tab
-/// carries a job count so a running schedule is visible from the Sessions tab.
+/// carries a job count so a running schedule is visible from the other tabs.
 /// The usage/watcher chip is right-aligned here rather than in either tab's
 /// list title so it stays visible no matter which tab is open.
 fn render_tab_bar(frame: &mut Frame, app: &App, area: Rect) {
@@ -90,6 +100,11 @@ fn render_tab_bar(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled(
             jobs_label,
             if app.main_tab == MainTab::Jobs { active } else { inactive },
+        ),
+        Span::styled("  ", bar_style),
+        Span::styled(
+            " Config ",
+            if app.main_tab == MainTab::Config { active } else { inactive },
         ),
         Span::styled("   ", bar_style),
         Span::styled("Tab", Style::default().fg(FG_OVERLAY).bg(HIGHLIGHT_BG)),
@@ -338,14 +353,9 @@ fn draw_overlays(frame: &mut Frame, app: &mut App) {
         );
     }
 
-    // Config popup
-    if app.mode == AppMode::Config {
-        crate::config_popup::draw_config_popup(frame, app);
-    }
-
     // MissingDeps popup
     if app.mode == AppMode::MissingDeps {
-        crate::config_popup::draw_missing_deps_popup(frame, app);
+        draw_missing_deps_popup(frame, app);
     }
 
     // Stop-live-session confirmation popup
@@ -403,6 +413,7 @@ mod tests {
             last_usage_at_ms: Some(now),
             reset_at_ms: None,
             usage_error: None,
+            version: Some(env!("CARGO_PKG_VERSION").to_string()),
         });
         app
     }
@@ -475,7 +486,6 @@ mod tests {
             (AppMode::NamingSession, "plain"),
             (AppMode::StopSessionConfirm, "Stop session"),
             (AppMode::DuplicateSession, "already exists"),
-            (AppMode::Config, "Hide empty projects"),
         ];
         for (mode, needle) in cases {
             let text = screen(mode.clone(), 60, 20);
@@ -486,16 +496,16 @@ mod tests {
         }
     }
 
-    /// The config popup holds ~30 lines but gets 18 rows at 60x20, so the
+    /// The config list holds ~28 lines but gets 18 rows at 60x20, so the
     /// About block used to be unreachable. It follows the cursor now.
     #[test]
-    fn the_config_popup_scrolls_to_reach_its_last_row() {
+    fn the_config_tab_scrolls_to_reach_its_last_row() {
         let mut app = App::new(vec![], None, Config::default());
         app.jobs = vec![];
         app.watch_state = None;
-        app.mode = AppMode::Config;
+        app.main_tab = MainTab::Config;
         // The URL row is the last one in the About block.
-        app.config_selected = crate::config_popup::URL_ROW;
+        app.config_selected = crate::ui::config_tab::URL_ROW;
 
         let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
         terminal.draw(|f| draw(f, &mut app)).unwrap();
@@ -509,7 +519,65 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(text.contains("About"), "{text}");
-        assert!(text.contains("github.com/faulker/ccsm"), "{text}");
+        // The list pane is 33 columns wide here, so the URL is truncated; what
+        // matters is that the marker reached the last row at all.
+        assert!(text.contains("\u{25b6} https://github.com/faulker"), "{text}");
+    }
+
+    /// Draw a tab (rather than a mode) at `w`x`h` and return the screen text.
+    fn tab_screen(tab: MainTab, w: u16, h: u16) -> String {
+        let mut app = App::new(vec![], None, Config::default());
+        app.jobs = vec![];
+        app.watch_state = None;
+        app.main_tab = tab;
+
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        (0..h)
+            .map(|y| {
+                (0..w)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn the_tab_strip_lists_all_three_tabs() {
+        let mut app = app_with_usage();
+        app.main_tab = MainTab::Config;
+        let text = tab_bar_text(&mut app);
+        for label in ["Sessions", "Jobs", "Config"] {
+            assert!(text.contains(label), "missing {label}:\n{text}");
+        }
+    }
+
+    #[test]
+    fn usage_chip_renders_on_the_config_tab() {
+        let mut app = app_with_usage();
+        app.main_tab = MainTab::Config;
+        assert!(tab_bar_text(&mut app).contains("78%"));
+    }
+
+    /// The whole point of the move off a popup: the settings and their
+    /// explanation share the window instead of one covering the other.
+    #[test]
+    fn the_config_tab_shows_settings_beside_their_explanation() {
+        let text = tab_screen(MainTab::Config, 100, 30);
+        assert!(text.contains("Hide empty projects"), "{text}");
+        assert!(text.contains("About this setting"), "{text}");
+        // Row 0 is selected on a fresh App, so its help is what shows.
+        assert!(text.contains("crashed"), "{text}");
+    }
+
+    /// Nothing draws on top of the Config tab, so its content survives the
+    /// smallest terminal the rest of the app is tested at.
+    #[test]
+    fn the_config_tab_renders_its_first_setting_at_60x20() {
+        let text = tab_screen(MainTab::Config, 60, 20);
+        assert!(text.contains("Hide empty projects"), "{text}");
     }
 
     #[test]

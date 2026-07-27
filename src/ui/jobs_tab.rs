@@ -2,7 +2,7 @@
 //! job create/edit form and the y/n confirmation for destructive actions,
 //! which remain modal overlays on top of it.
 //!
-//! Mirrors `config_popup.rs`'s shape of holding both the `impl App` key
+//! Mirrors `config_tab.rs`'s shape of holding both the `impl App` key
 //! handlers and the draw functions in one file.
 
 use crate::app::{App, AppMode, JobConfirmAction, MainTab};
@@ -54,8 +54,7 @@ impl App {
                 self.open_help();
             }
             (KeyCode::Char('o'), KeyModifiers::NONE) => {
-                self.config_selected = 0;
-                self.mode = AppMode::Config;
+                self.open_config_tab();
             }
             (KeyCode::Char('j'), _) | (KeyCode::Down, _) => self.jobs_move_down(),
             (KeyCode::Char('k'), _) | (KeyCode::Up, _) => self.jobs_move_up(),

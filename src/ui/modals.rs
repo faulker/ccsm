@@ -369,7 +369,7 @@ fn sessions_help_lines() -> Vec<Line<'static>> {
         help_row("v", "Cycle view mode (tree / flat / grouped)"),
         help_row("r", "Rename selected session or live session"),
         help_row("Space", "Toggle favorite — pins project to top of list (★)"),
-        help_row("o", "Open the config popup"),
+        help_row("o", "Jump to the Config tab"),
         Line::from(""),
         help_header("New session popup"),
         help_row("Tab", "Cycle launch mode: plain, danger, worktree, direct"),
@@ -425,16 +425,16 @@ fn jobs_help_lines() -> Vec<Line<'static>> {
         help_row("resume", "Auto-resume jobs restart when usage falls or resets"),
         help_row("state", "The tab title shows watcher on/off; off means nothing runs"),
         help_row("done", "Agents end with CCSM_JOB_COMPLETE; that job stops for good"),
-        help_row("idle", "A job idle past Config's idle-completion time also finishes"),
+        help_row("idle", "A job idle past the Config tab's idle-completion time also finishes"),
     ]
 }
 
-/// Help page for global keys, the config popup, and the directory picker.
+/// Help page for global keys, the Config tab, and the directory picker.
 fn general_help_lines() -> Vec<Line<'static>> {
     vec![
         help_header("Global"),
-        help_row("Tab / Shift+Tab", "Switch between the Sessions and Jobs tabs"),
-        help_row("o", "Open the config popup"),
+        help_row("Tab / Shift+Tab", "Cycle the Sessions, Jobs and Config tabs"),
+        help_row("o", "Jump straight to the Config tab"),
         help_row("?", "Open this help"),
         help_row("q / Ctrl+C", "Quit"),
         help_row("Esc", "Back out of a popup. Never quits the app."),
@@ -449,14 +449,16 @@ fn general_help_lines() -> Vec<Line<'static>> {
         help_row("y / Enter", "Confirm"),
         help_row("n / Esc", "Cancel"),
         Line::from(""),
-        help_header("Config popup"),
-        help_row("j/k", "Move between settings"),
+        help_header("Config tab"),
+        help_row("j/k  ↑/↓", "Move between settings"),
+        help_row("Home/End", "Jump to the first/last setting"),
         help_row("Space/Enter", "Toggle a setting, edit a value, or browse for a path"),
         help_row("i", "Type a path by hand instead of browsing"),
-        help_row("Tab / Shift+Tab", "Cycle the session view mode"),
-        help_row("Esc", "Close the config popup"),
+        help_row("←/→", "On View: cycle the session view mode either way"),
+        help_row("Esc", "Back to the Sessions tab"),
+        help_row("(help)", "The selected setting is explained in the right-hand pane"),
         Line::from(""),
-        help_header("Text fields (filter, rename, job form, config paths)"),
+        help_header("Text fields (filter, rename, job form, config values)"),
         help_row("←/→", "Move the cursor one character"),
         help_row("Ctrl+←/→", "Move the cursor one word"),
         help_row("Home/End", "Jump to the start/end of the line"),

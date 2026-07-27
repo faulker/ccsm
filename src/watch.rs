@@ -195,6 +195,7 @@ pub fn run() -> Result<()> {
         last_usage_at_ms: None,
         reset_at_ms: None,
         usage_error: None,
+        version: Some(env!("CARGO_PKG_VERSION").to_string()),
     };
     let _ = store::save_watch_state(&state);
 
@@ -222,7 +223,7 @@ pub fn run() -> Result<()> {
     // call this tick has fresh inputs rather than empty defaults.
     reconcile(&mut schedule, &tmux, now_ms(), &mut transients);
     let mut activity = poll_activity(&tmux, &schedule);
-    let mut completed = poll_completion(&schedule);
+    let mut completed = poll_completion(&tmux, &schedule, &Config::load());
     update_idle_tracking(&mut transients, &schedule, &activity, now_ms());
 
     loop {
@@ -270,7 +271,7 @@ pub fn run() -> Result<()> {
             // Completion shares the activity cadence: both read per-job state
             // that only changes on the scale of seconds, and reading every
             // transcript tail once a second would be pure waste.
-            completed = poll_completion(&schedule);
+            completed = poll_completion(&tmux, &schedule, &cfg);
             update_idle_tracking(&mut transients, &schedule, &activity, now_ms());
             last_activity_poll = Instant::now();
         }
@@ -477,6 +478,9 @@ fn apply_command(
                 log(&format!("job {id} deleted via command"));
             }
             transients.clear_job(&id);
+            // Otherwise the stamp directory grows one file per deleted job
+            // forever, and a recycled id would start out looking complete.
+            schedule::completion::clear_stop(&id);
         }
         Command::PauseJob { id } => {
             let Some(job) = schedule.find(&id) else {
@@ -650,6 +654,9 @@ fn reconcile(schedule: &mut Schedule, tmux: &str, now_ms: i64, transients: &mut 
         }
     }
 
+    // Only sessions ccsm adopted need discovering. Jobs it dispatched itself
+    // record their session id at launch, so reaching this loop with one unset
+    // means the job really was adopted from an already-running tmux session.
     for job in schedule.jobs.iter_mut() {
         if job.state == JobState::Running && job.claude_session_id.is_none() {
             let since = *transients
@@ -721,7 +728,7 @@ fn update_idle_tracking(
 /// `Failed` jobs because nothing would act on the answer; everything else is
 /// checked, including `Stopped`, since a job that finishes its work and then
 /// exits is exactly the case that used to relaunch forever.
-fn poll_completion(schedule: &Schedule) -> HashSet<String> {
+fn poll_completion(tmux: &str, schedule: &Schedule, cfg: &Config) -> HashSet<String> {
     schedule
         .jobs
         .iter()
@@ -731,7 +738,37 @@ fn poll_completion(schedule: &Schedule) -> HashSet<String> {
                 JobState::Queued | JobState::Done | JobState::Failed
             )
         })
-        .filter(|job| schedule::completion::job_completed(job))
+        .filter(|job| {
+            if schedule::completion::stop_recorded(&job.id) {
+                // A user attached to the session ends turns too, and firing the
+                // hook on their conversation would complete the job out from
+                // under them. The stamp is left in place, so the job completes
+                // as soon as they detach.
+                if cfg.defer_while_attached {
+                    if let Some(name) = &job.tmux_name {
+                        if live::has_attached_client(tmux, name) {
+                            return false;
+                        }
+                    }
+                }
+                log(&format!(
+                    "job {} ({}) reported completion via stop hook",
+                    &job.id[..8.min(job.id.len())],
+                    job.name
+                ));
+                return true;
+            }
+            if schedule::completion::job_completed(job) {
+                log(&format!(
+                    "job {} ({}) reported completion via {}",
+                    &job.id[..8.min(job.id.len())],
+                    job.name,
+                    schedule::completion::COMPLETION_MARKER
+                ));
+                return true;
+            }
+            false
+        })
         .map(|job| job.id.clone())
         .collect()
 }
@@ -767,10 +804,18 @@ fn execute_action(
             let cwd = job.cwd.clone();
             let from = job.state;
             let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
+            schedule::completion::clear_stop(&job_id);
             match live::start_managed_session(tmux, &tmux_name, &cwd, &job_id, &argv_refs) {
                 Ok(()) => {
                     if let Some(job) = schedule.find_mut(&job_id) {
                         job.tmux_name = Some(tmux_name.clone());
+                        // `build_start_argv` launches under `--session-id <job id>`,
+                        // so the session id is known here and never needs
+                        // discovering. Recording it is what lets a later resume
+                        // use `--resume <id>` instead of `--continue`, which
+                        // picks whatever conversation in the cwd is newest and
+                        // can therefore continue the wrong one.
+                        job.claude_session_id = Some(job_id.clone());
                         let reason = "dispatched".to_string();
                         log(&format_transition(&job_name, &job_id, from, JobState::Starting, &reason));
                         job.transition(JobState::Starting, reason, now_ms);
@@ -848,6 +893,7 @@ fn execute_action(
                 log(&format!("deferred: user attached (job {job_id})"));
                 return;
             }
+            schedule::completion::clear_stop(&job_id);
             match live::send_prompt(tmux, &tmux_name, &text) {
                 Ok(()) => {
                     if let Some(job) = schedule.find_mut(&job_id) {
@@ -880,6 +926,7 @@ fn execute_action(
             let live_sessions = live::discover_live_sessions(tmux);
             let tmux_name = live::generate_auto_name(&cwd, &live_sessions);
             let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
+            schedule::completion::clear_stop(&job_id);
             match live::start_managed_session(tmux, &tmux_name, &cwd, &job_id, &argv_refs) {
                 Ok(()) => {
                     if let Some(job) = schedule.find_mut(&job_id) {
@@ -1651,5 +1698,54 @@ mod tests {
 
         let neither = UsageSnapshot::default();
         assert_eq!(resume_after_from_usage(Some(&neither), true), None);
+    }
+
+    /// A config that never shells out to tmux from `poll_completion`.
+    fn no_defer_cfg() -> Config {
+        Config {
+            defer_while_attached: false,
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn poll_completion_reports_a_job_whose_stop_hook_fired() {
+        let _guard = crate::config::test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("CCSM_CONFIG_DIR", dir.path());
+
+        let mut schedule = Schedule::default();
+        schedule.jobs.push(base_job("job-1", JobState::Running));
+        let cfg = no_defer_cfg();
+
+        // No stamp yet: the job is still working.
+        assert!(poll_completion("tmux", &schedule, &cfg).is_empty());
+
+        schedule::completion::record_stop("job-1").unwrap();
+        let completed = poll_completion("tmux", &schedule, &cfg);
+        assert!(completed.contains("job-1"));
+
+        std::env::remove_var("CCSM_CONFIG_DIR");
+    }
+
+    #[test]
+    fn poll_completion_ignores_stop_stamps_for_finished_and_queued_jobs() {
+        let _guard = crate::config::test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("CCSM_CONFIG_DIR", dir.path());
+
+        let mut schedule = Schedule::default();
+        for (id, state) in [
+            ("done", JobState::Done),
+            ("failed", JobState::Failed),
+            ("queued", JobState::Queued),
+        ] {
+            schedule.jobs.push(base_job(id, state));
+            schedule::completion::record_stop(id).unwrap();
+        }
+
+        assert!(poll_completion("tmux", &schedule, &no_defer_cfg()).is_empty());
+
+        std::env::remove_var("CCSM_CONFIG_DIR");
     }
 }

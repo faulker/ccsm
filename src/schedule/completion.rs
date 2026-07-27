@@ -4,13 +4,25 @@
 //! an idle prompt, so without an explicit completion signal the daemon keeps
 //! resuming and relaunching it forever. This module supplies that signal.
 //!
-//! A short protocol instruction tells the agent to emit [`COMPLETION_MARKER`]
-//! on a line of its own once the work is genuinely finished. It reaches the
-//! agent two ways: sessions ccsm launches get it in their system prompt
-//! ([`system_prompt_args`]), and every continuation prompt carries it too
-//! ([`with_completion_protocol`]) so adopted sessions, which ccsm never
-//! launched, learn the protocol as well. The daemon then looks for that
-//! marker in the session's **own**
+//! There are two independent signals, because asking the model to report its
+//! own completion turned out not to work.
+//!
+//! **The stop hook is the primary signal.** Every session ccsm launches carries
+//! a `Stop` hook ([`hook_settings_args`]) that runs `ccsm --job-complete <id>`
+//! when the agent finishes responding, which drops a stamp file
+//! ([`record_stop`]) the daemon reads. This is deterministic: the harness fires
+//! it, so no amount of model drift can lose it.
+//!
+//! **The marker is the fallback**, for sessions ccsm merely adopted and so
+//! never launched with a hook. A short protocol instruction asks the agent to
+//! emit [`COMPLETION_MARKER`] on a line of its own once the work is finished,
+//! delivered in the system prompt ([`system_prompt_args`]) and on every
+//! continuation prompt ([`with_completion_protocol`]). It is genuinely
+//! unreliable: a probe found that the identical `--append-system-prompt` text
+//! produced the marker under `claude -p` but not in an interactive session,
+//! which is why it is no longer the thing jobs depend on.
+//!
+//! When the marker is used, the daemon looks for it in the session's **own**
 //! transcript rather than in the tmux pane, because the instruction itself is
 //! echoed into the pane the moment it is pasted; scraping the pane would
 //! match ccsm's own text and declare every job complete on dispatch. The
@@ -25,10 +37,13 @@ use std::path::{Path, PathBuf};
 pub const COMPLETION_MARKER: &str = "CCSM_JOB_COMPLETE";
 
 /// How much of the tail of a session transcript to read when looking for the
-/// marker. Transcripts reach many megabytes, and the marker can only ever be
-/// in the most recent assistant turn, so reading the whole file every poll
-/// would be pure waste.
-pub const TRANSCRIPT_TAIL_BYTES: u64 = 256 * 1024;
+/// marker. Transcripts reach many megabytes, so reading the whole file every
+/// poll would be pure waste, but the window has to be much wider than one
+/// assistant turn: while the daemon is up the marker is at EOF and any size
+/// works, and the case that matters is the daemon being *down* when the marker
+/// lands. A real 1.0 MB transcript had its marker sitting 428 KB from EOF,
+/// which the original 256 KB window would have missed forever.
+pub const TRANSCRIPT_TAIL_BYTES: u64 = 2 * 1024 * 1024;
 
 /// The protocol sentence appended to every prompt the daemon sends.
 ///
@@ -87,6 +102,88 @@ pub fn is_slash_command(prompt: &str) -> bool {
 pub fn system_prompt_args() -> Vec<String> {
     vec!["--append-system-prompt".to_string(), completion_instruction()]
 }
+
+// --- Stop hook -----------------------------------------------------------
+
+/// Directory holding one stamp file per job whose agent has finished a turn.
+/// Lives under `ccsm_dir()` alongside `schedule.json`, not in the user's
+/// config, because it is daemon state rather than settings.
+fn stamp_dir() -> Option<PathBuf> {
+    crate::config::ccsm_dir().map(|d| d.join("completions"))
+}
+
+/// Path of `job_id`'s stop stamp. Returns `None` for an id that is not a plain
+/// file name, so a malformed or hostile id can never make the hook write
+/// outside the stamp directory.
+pub fn stamp_path(job_id: &str) -> Option<PathBuf> {
+    if job_id.is_empty()
+        || job_id.contains('/')
+        || job_id.contains('\\')
+        || job_id.contains('\0')
+        || job_id == "."
+        || job_id == ".."
+    {
+        return None;
+    }
+    Some(stamp_dir()?.join(job_id))
+}
+
+/// Record that `job_id`'s agent finished responding. Called by
+/// `ccsm --job-complete <id>`, which is what the `Stop` hook runs.
+pub fn record_stop(job_id: &str) -> anyhow::Result<()> {
+    let path = stamp_path(job_id).ok_or_else(|| anyhow::anyhow!("invalid job id"))?;
+    let now = chrono::Utc::now().timestamp_millis();
+    super::store::write_atomic(&path, now.to_string().as_bytes())
+}
+
+/// Drop any recorded stop for `job_id`. The daemon calls this every time it
+/// gives the job new work (dispatch, relaunch, resume): without it a stamp
+/// left over from the previous turn would complete the job the instant it
+/// started running again, before the agent had done anything.
+pub fn clear_stop(job_id: &str) {
+    if let Some(path) = stamp_path(job_id) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Whether `job_id` has an uncleared stop stamp.
+pub fn stop_recorded(job_id: &str) -> bool {
+    stamp_path(job_id).is_some_and(|p| p.exists())
+}
+
+/// The argv fragment installing the `Stop` hook for `job_id`.
+///
+/// `--settings` takes inline JSON and *adds* to the user's settings rather than
+/// replacing them, so this cannot clobber hooks they configured themselves.
+/// Returns an empty vector when the ccsm executable cannot be located, which
+/// degrades the job to the marker fallback rather than failing the launch.
+pub fn hook_settings_args(job_id: &str) -> Vec<String> {
+    let Ok(exe) = std::env::current_exe() else {
+        return Vec::new();
+    };
+    if stamp_path(job_id).is_none() {
+        return Vec::new();
+    }
+    let command = format!(
+        "{} --job-complete {}",
+        shell_quote(&exe.to_string_lossy()),
+        shell_quote(job_id)
+    );
+    let settings = serde_json::json!({
+        "hooks": {
+            "Stop": [ { "hooks": [ { "type": "command", "command": command } ] } ]
+        }
+    });
+    vec!["--settings".to_string(), settings.to_string()]
+}
+
+/// Wrap `s` in single quotes for a POSIX shell. Hook commands are run through
+/// a shell, and the ccsm binary can sit under a path with spaces.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+// --- Completion marker ---------------------------------------------------
 
 /// Path to the session transcript backing `job`, or `None` when it does not
 /// exist yet. Dispatched jobs run under `--session-id <job id>`, so the job id

@@ -106,6 +106,15 @@ jobs:
     if: always() && (needs.resolve-version.result == 'success' || needs.resolve-version.result == 'skipped')
     env:
       RELEASE_TAG: ${{ needs.resolve-version.outputs.new_tag || github.ref_name }}
+      # Apple signing inputs. Lifted into env so the macOS-only steps can test
+      # for them in `if:` conditions; when they're unset the build still runs and
+      # simply ships unsigned binaries, so forks and first-time runs work.
+      APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+      APPLE_NOTARY_KEY: ${{ secrets.APPLE_NOTARY_KEY }}
+      APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+      APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
     strategy:
       fail-fast: false
       matrix:
@@ -161,6 +170,97 @@ jobs:
 
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
+
+      # Signing happens between build and packaging, so the archive (and the
+      # checksums computed from it in the release job) covers the signed binary.
+      # The self-updater verifies those checksums, so the two must not diverge.
+      - name: Import Apple signing certificate
+        if: runner.os == 'macOS' && env.APPLE_CERTIFICATE_P12 != ''
+        run: |
+          set -euo pipefail
+          # A throwaway keychain, unlocked for this job only, keeps the key out of
+          # the runner's login keychain and makes cleanup a single delete.
+          KEYCHAIN="$RUNNER_TEMP/codesign.keychain-db"
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          echo "KEYCHAIN=$KEYCHAIN" >> "$GITHUB_ENV"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 3600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+
+          CERT="$RUNNER_TEMP/certificate.p12"
+          printf '%s' "$APPLE_CERTIFICATE_P12" | base64 --decode > "$CERT"
+          security import "$CERT" \
+            -k "$KEYCHAIN" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign \
+            -f pkcs12
+          rm -f "$CERT"
+          # Let codesign use the key without an interactive prompt.
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" > /dev/null
+          # Put it at the front of the search list, keeping the existing entries,
+          # so certificate chains still resolve for anything else in the job.
+          EXISTING=()
+          while IFS= read -r line; do
+            entry="$(printf '%s' "$line" | tr -d '"' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+            [ -n "$entry" ] && EXISTING+=("$entry")
+          done < <(security list-keychains -d user)
+          security list-keychains -d user -s "$KEYCHAIN" "${EXISTING[@]}"
+          security find-identity -v -p codesigning "$KEYCHAIN"
+
+      - name: Sign binary
+        if: runner.os == 'macOS' && env.APPLE_CERTIFICATE_P12 != ''
+        run: |
+          set -euo pipefail
+          BIN="target/${{ matrix.target }}/release/ccsm"
+          # Hardened runtime and a secure timestamp are both required for the
+          # signature to be accepted by notarization.
+          codesign --force \
+            --sign "$APPLE_SIGNING_IDENTITY" \
+            --keychain "$KEYCHAIN" \
+            --options runtime \
+            --timestamp \
+            "$BIN"
+          codesign --verify --strict --verbose=2 "$BIN"
+
+      # Signing alone still leaves Gatekeeper unhappy about a binary downloaded
+      # through a browser; notarization is what clears that. `notarytool` only
+      # takes zip/pkg/dmg, so the binary is zipped just for submission. A bare
+      # executable can't have the ticket stapled to it, so nothing is copied
+      # back: Gatekeeper looks the ticket up online by the signature's hash.
+      - name: Notarize binary
+        if: runner.os == 'macOS' && env.APPLE_CERTIFICATE_P12 != '' && env.APPLE_NOTARY_KEY != ''
+        run: |
+          set -euo pipefail
+          KEY="$RUNNER_TEMP/notary.p8"
+          printf '%s' "$APPLE_NOTARY_KEY" | base64 --decode > "$KEY"
+          ZIP="$RUNNER_TEMP/ccsm-notarize.zip"
+          # No --keepParent: the source is a single executable, not a bundle.
+          ditto -c -k "target/${{ matrix.target }}/release/ccsm" "$ZIP"
+          xcrun notarytool submit "$ZIP" \
+            --key "$KEY" \
+            --key-id "$APPLE_NOTARY_KEY_ID" \
+            --issuer "$APPLE_NOTARY_ISSUER_ID" \
+            --wait \
+            --timeout 30m
+          rm -f "$KEY" "$ZIP"
+
+      - name: Report signing status
+        if: runner.os == 'macOS'
+        run: |
+          if [ -n "${APPLE_CERTIFICATE_P12:-}" ]; then
+            codesign --display --verbose=2 "target/${{ matrix.target }}/release/ccsm" 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            echo "APPLE_CERTIFICATE_P12 is not set: ${{ matrix.target }} is unsigned." \
+              | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # Runs even when an earlier step failed, so a signing key never outlives
+      # the job that used it.
+      - name: Remove signing keychain
+        if: always() && runner.os == 'macOS' && env.APPLE_CERTIFICATE_P12 != ''
+        run: security delete-keychain "$KEYCHAIN" || true
 
       - name: Package binary (tar.gz)
         if: matrix.archive == 'tar.gz'

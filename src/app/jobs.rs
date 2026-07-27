@@ -20,6 +20,22 @@ fn current_watch_stamp() -> Option<schedule::store::Stamp> {
     schedule::store::watch_state_path().and_then(|p| schedule::store::stamp(&p))
 }
 
+/// How often the TUI re-reads the local usage history. The file itself is
+/// rewritten every few minutes, so anything faster is wasted parsing.
+const USAGE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The usage numbers the UI should display, resolved from the two independent
+/// sources the TUI has: its own local sample and whatever the watch daemon last
+/// persisted.
+pub struct UsageReading {
+    /// 5-hour window percentage, when known.
+    pub pct: Option<f64>,
+    /// Epoch ms the reading was sampled, used to decide whether it is stale.
+    pub sampled_at_ms: Option<i64>,
+    /// Epoch ms the active window resets, when known.
+    pub reset_at_ms: Option<i64>,
+}
+
 impl App {
     /// Unconditionally reload `jobs` and `watch_state` from disk, refreshing the
     /// cached stamps that `poll_schedule_changed` compares against.
@@ -38,6 +54,110 @@ impl App {
         if current_schedule_stamp() != self.schedule_stamp || current_watch_stamp() != self.watch_stamp {
             self.reload_schedule();
         }
+    }
+
+    /// Sample account usage directly from the local history file, at most once
+    /// every `USAGE_POLL_INTERVAL`. Returns true when the reading changed and
+    /// the chip needs a redraw.
+    ///
+    /// The chip used to read only what the watch daemon persisted, which froze
+    /// it whenever no daemon was running — or, worse, when a daemon left over
+    /// from an older binary kept failing to fetch and the last good number sat
+    /// there looking current. Reading it here is a sub-millisecond parse of a
+    /// local JSON file needing no network and no credentials.
+    ///
+    /// The `api` source is deliberately never consulted from the TUI: it would
+    /// block the UI thread on an HTTP call and can raise a macOS Keychain
+    /// prompt. When the user has pinned `usage_source` to `api` this does
+    /// nothing and the chip falls back to the daemon's reading, which is the
+    /// only place that path belongs.
+    pub fn poll_usage(&mut self) -> bool {
+        if crate::usage::Source::parse(&self.config.usage_source) == crate::usage::Source::Api {
+            return false;
+        }
+        if let Some(last) = self.usage_polled_at {
+            if last.elapsed() < USAGE_POLL_INTERVAL {
+                return false;
+            }
+        }
+        self.usage_polled_at = Some(std::time::Instant::now());
+
+        let path = crate::usage::local::history_path(self.config.usage_history_override());
+        let before = self.usage.as_ref().map(|s| s.sampled_at_ms);
+        // A read failure leaves the previous sample in place rather than
+        // blanking the chip: the file is rewritten in full by Claude Desktop,
+        // so a transient partial read must not look like "usage unknown".
+        if let Ok(snapshot) =
+            crate::usage::local::load(&path, now_ms(), self.config.usage_max_age_seconds)
+        {
+            let changed = before != Some(snapshot.sampled_at_ms);
+            self.usage = Some(snapshot);
+            return changed;
+        }
+        false
+    }
+
+    /// The usage numbers the chip should display. Prefers the TUI's own local
+    /// sample, which updates whether or not a daemon is alive, and falls back to
+    /// the daemon's persisted reading (the only source when `usage_source` is
+    /// pinned to `api`).
+    pub fn usage_reading(&self) -> UsageReading {
+        if let Some(snapshot) = &self.usage {
+            let five_hour = snapshot.five_hour.as_ref();
+            return UsageReading {
+                pct: five_hour.and_then(|w| w.used_percentage),
+                sampled_at_ms: snapshot.sampled_at_ms,
+                reset_at_ms: five_hour.and_then(|w| w.reset_at_ms()),
+            };
+        }
+        match &self.watch_state {
+            Some(state) => UsageReading {
+                pct: state.last_usage_pct,
+                sampled_at_ms: state.last_usage_at_ms,
+                reset_at_ms: state.reset_at_ms,
+            },
+            None => UsageReading {
+                pct: None,
+                sampled_at_ms: None,
+                reset_at_ms: None,
+            },
+        }
+    }
+
+    /// Restart the watch daemon when it is running a different version of ccsm
+    /// than this binary. Returns true if a restart was performed.
+    ///
+    /// The daemon lives in its own tmux session and outlives every TUI process,
+    /// so a `ccsm` upgrade (including the self-updater's in-place binary swap)
+    /// leaves the old one running indefinitely. That is not academic: the
+    /// daemon that survived usage moving in-tree kept shelling out to the
+    /// deleted `claude-usage` helper once a minute, so every usage-driven pause
+    /// and resume decision silently stopped working.
+    ///
+    /// A daemon predating the `version` field reports `None`, which counts as a
+    /// mismatch — that build is by definition older than this one.
+    pub fn restart_outdated_watcher(&mut self) -> bool {
+        let tmux = self.config.tmux_bin().to_string();
+        if !crate::watch::is_running(&tmux) {
+            return false;
+        }
+        let running = self.watch_state.as_ref().and_then(|s| s.version.clone());
+        if running.as_deref() == Some(env!("CARGO_PKG_VERSION")) {
+            return false;
+        }
+
+        let was = running.unwrap_or_else(|| "pre-2.0".to_string());
+        if let Err(e) = crate::watch::stop(&tmux) {
+            self.status_error = Some(format!("Failed to restart outdated watcher: {e}"));
+            return false;
+        }
+        self.ensure_watcher_running();
+        self.reload_schedule();
+        self.status_error = Some(format!(
+            "Restarted watcher (was v{was}, now v{})",
+            env!("CARGO_PKG_VERSION")
+        ));
+        true
     }
 
     /// Enqueue a command for the watch daemon, recording the error in
@@ -130,6 +250,19 @@ impl App {
         self.main_tab = MainTab::Sessions;
     }
 
+    /// Switch the main window to the Config tab, starting at its first setting.
+    ///
+    /// The selection resets on every entry rather than being remembered, so the
+    /// tab always opens somewhere predictable instead of wherever a path edit
+    /// happened to leave it.
+    pub fn open_config_tab(&mut self) {
+        self.config_selected = 0;
+        self.config_editing = false;
+        self.config_path_input = tui_input::Input::default();
+        self.mode = AppMode::Normal;
+        self.main_tab = MainTab::Config;
+    }
+
     /// Cycle the main window to the next tab, refreshing job state when landing
     /// on the Jobs tab so it never shows a stale list.
     pub fn cycle_main_tab(&mut self, forward: bool) {
@@ -137,6 +270,7 @@ impl App {
         match next {
             MainTab::Jobs => self.open_jobs_tab(),
             MainTab::Sessions => self.open_sessions_tab(),
+            MainTab::Config => self.open_config_tab(),
         }
     }
 

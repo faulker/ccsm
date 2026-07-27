@@ -700,7 +700,7 @@ fn test_backtab_cycles_reverse() {
 #[test]
 fn test_config_selected_bounds() {
     let mut app = make_app(make_sessions(), None, Config::default());
-    app.mode = AppMode::Config;
+    app.main_tab = MainTab::Config;
     assert_eq!(app.config_selected, 0);
 
     // Can't go below 0
@@ -733,7 +733,7 @@ fn test_config_selected_bounds() {
 fn test_config_toggle_hide_empty() {
     let mut app = make_app(make_sessions_mixed_data(), None, Config::default());
     app.tree_view = false;
-    app.mode = AppMode::Config;
+    app.main_tab = MainTab::Config;
     app.config_selected = 0;
 
     // Default: hide_empty = true
@@ -752,7 +752,7 @@ fn test_config_toggle_hide_empty() {
 fn test_config_toggle_group_chains() {
     let mut app = make_app(make_chained_sessions(), None, Config::default());
     app.tree_view = false;
-    app.mode = AppMode::Config;
+    app.main_tab = MainTab::Config;
     app.config_selected = 1;
 
     // Default: group_chains = true
@@ -1320,15 +1320,22 @@ fn w_switches_to_the_jobs_tab_and_esc_returns_to_sessions() {
 }
 
 #[test]
-fn tab_cycles_between_the_two_main_tabs() {
+fn tab_cycles_through_the_three_main_tabs() {
     let mut app = make_app(make_sessions(), None, Config::default());
     assert_eq!(app.main_tab, MainTab::Sessions);
     app.cycle_main_tab(true);
     assert_eq!(app.main_tab, MainTab::Jobs);
     app.cycle_main_tab(true);
-    assert_eq!(app.main_tab, MainTab::Sessions);
+    assert_eq!(app.main_tab, MainTab::Config);
+    app.cycle_main_tab(true);
+    assert_eq!(app.main_tab, MainTab::Sessions, "and wraps around");
+
+    app.cycle_main_tab(false);
+    assert_eq!(app.main_tab, MainTab::Config, "Shift+Tab wraps the other way");
     app.cycle_main_tab(false);
     assert_eq!(app.main_tab, MainTab::Jobs);
+    app.cycle_main_tab(false);
+    assert_eq!(app.main_tab, MainTab::Sessions);
 }
 
 #[test]
@@ -1627,7 +1634,7 @@ fn file_picker_selection_only_commits_files() {
 }
 
 #[test]
-fn picking_a_binary_writes_the_config_field_and_returns_to_config() {
+fn picking_a_binary_writes_the_config_field_and_returns_to_the_config_tab() {
     let _guard = crate::config::test_lock();
     let cfg_dir = tempfile::tempdir().unwrap();
     std::env::set_var("CCSM_CONFIG_DIR", cfg_dir.path());
@@ -1637,6 +1644,7 @@ fn picking_a_binary_writes_the_config_field_and_returns_to_config() {
     std::fs::write(&bin, b"x").unwrap();
 
     let mut app = make_app(vec![], None, Config::default());
+    app.open_config_tab();
     app.open_path_picker(PickerTarget::ConfigClaude, &bin.to_string_lossy());
     assert_eq!(app.mode, AppMode::DirPicker);
     assert_eq!(
@@ -1646,7 +1654,10 @@ fn picking_a_binary_writes_the_config_field_and_returns_to_config() {
     );
 
     app.dir_picker_select();
-    assert_eq!(app.mode, AppMode::Config, "commit returns to the config popup");
+    // The Config tab is a MainTab, not a mode, and the picker never left it:
+    // closing the picker just drops back to Normal on top of it.
+    assert_eq!(app.mode, AppMode::Normal, "commit returns to the Config tab");
+    assert_eq!(app.main_tab, MainTab::Config);
     assert_eq!(app.config.claude_path, Some(bin.to_string_lossy().to_string()));
     assert!(app.dir_browser.is_none());
 
@@ -1661,9 +1672,12 @@ fn cancelling_a_picker_returns_to_whichever_mode_opened_it() {
     app.dir_picker_escape();
     assert_eq!(app.mode, AppMode::JobForm);
 
+    app.main_tab = MainTab::Config;
     app.open_path_picker(PickerTarget::ConfigTmux, "");
     app.dir_picker_escape();
-    assert_eq!(app.mode, AppMode::Config);
+    assert_eq!(app.mode, AppMode::Normal);
+    assert_eq!(app.main_tab, MainTab::Config, "and back onto the Config tab");
+    app.main_tab = MainTab::Sessions;
 
     app.open_dir_picker();
     app.dir_picker_escape();
@@ -1786,19 +1800,19 @@ fn editing_a_config_path_supports_cursor_movement() {
     std::env::set_var("CCSM_CONFIG_DIR", cfg_dir.path());
 
     let mut app = make_app(vec![], None, Config::default());
-    app.mode = AppMode::Config;
+    app.main_tab = MainTab::Config;
     app.config_selected = 3; // Claude binary
-    app.handle_config_event(key(KeyCode::Char('i')));
+    app.handle_config_tab_event(key(KeyCode::Char('i')));
     assert!(app.config_editing, "`i` types the path by hand");
 
     for c in "/bin/x".chars() {
-        app.handle_config_event(key(KeyCode::Char(c)));
+        app.handle_config_tab_event(key(KeyCode::Char(c)));
     }
-    app.handle_config_event(key(KeyCode::Left));
-    app.handle_config_event(key(KeyCode::Backspace));
+    app.handle_config_tab_event(key(KeyCode::Left));
+    app.handle_config_tab_event(key(KeyCode::Backspace));
     assert_eq!(app.config_path_input.value(), "/binx", "deleted the '/' before 'x'");
 
-    app.handle_config_event(key(KeyCode::Enter));
+    app.handle_config_tab_event(key(KeyCode::Enter));
     assert!(!app.config_editing);
     assert_eq!(app.config.claude_path, Some("/binx".to_string()));
 
@@ -1810,27 +1824,27 @@ fn enter_on_a_config_path_row_opens_the_file_picker() {
     use crossterm::event::KeyCode;
 
     let mut app = make_app(vec![], None, Config::default());
-    app.mode = AppMode::Config;
+    app.main_tab = MainTab::Config;
     app.config_selected = 5; // usage history file
-    app.handle_config_event(key(KeyCode::Enter));
+    app.handle_config_tab_event(key(KeyCode::Enter));
 
     assert_eq!(app.mode, AppMode::DirPicker);
     assert_eq!(app.dir_picker_target, PickerTarget::ConfigUsage);
     assert_eq!(app.dir_browser.as_ref().unwrap().kind, PickerKind::File);
 }
 
-// --- Config popup: default continue prompt ---
+// --- Config tab: default continue prompt ---
 
-/// Drive the config popup's continue-prompt row: select it, press Enter to
+/// Drive the Config tab's continue-prompt row: select it, press Enter to
 /// start editing, replace the text, press Enter to commit.
 fn commit_continue_prompt(app: &mut App, text: &str) {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    app.mode = AppMode::Config;
-    app.config_selected = crate::config_popup::CONTINUE_PROMPT_ROW;
-    app.handle_config_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    app.main_tab = MainTab::Config;
+    app.config_selected = crate::ui::config_tab::CONTINUE_PROMPT_ROW;
+    app.handle_config_tab_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     assert!(app.config_editing, "Enter should start editing the field");
     app.config_path_input = tui_input::Input::from(text.to_string());
-    app.handle_config_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    app.handle_config_tab_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     assert!(!app.config_editing);
 }
 
@@ -1999,4 +2013,158 @@ fn the_help_overlay_scrolls_and_resets_per_page() {
     app.handle_help_event(help_key(crossterm::event::KeyCode::Tab));
     assert_eq!(app.help_scroll, 0, "switching page resets the scroll");
     assert_eq!(app.mode, AppMode::Help, "scrolling must not close help");
+}
+
+// --- usage polling -----------------------------------------------------------
+//
+// The chip used to mirror only what the watch daemon persisted, so it froze
+// whenever no daemon was running. These cover the TUI's own reading and the
+// fallback to the daemon's.
+
+/// Writes a two-sample `plan-usage-history.json` whose newest sample is
+/// `age_seconds` old and reports `fh` percent on the 5-hour window.
+fn write_history(dir: &tempfile::TempDir, fh: f64, age_seconds: i64) -> String {
+    let now = crate::usage::now_ms();
+    let path = dir.path().join("plan-usage-history.json");
+    let json = format!(
+        r#"{{"version":2,"samples":[
+            {{"t":{},"org":"o","u":{{"fh":0,"sd":10}}}},
+            {{"t":{},"org":"o","u":{{"fh":{fh},"sd":10}}}}
+        ]}}"#,
+        now - (age_seconds + 300) * 1000,
+        now - age_seconds * 1000,
+    );
+    std::fs::write(&path, json).unwrap();
+    path.to_string_lossy().to_string()
+}
+
+/// A config pointed at a throwaway history file rather than the host machine's.
+fn usage_config(history: String) -> Config {
+    let mut config = Config::default();
+    config.usage_history_path = Some(history);
+    config
+}
+
+#[test]
+fn poll_usage_reads_the_local_history_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = make_app(vec![], None, usage_config(write_history(&dir, 42.0, 60)));
+    app.usage = None;
+    app.usage_polled_at = None;
+
+    assert!(app.poll_usage(), "first poll produces a new reading");
+    assert_eq!(app.usage_reading().pct, Some(42.0));
+}
+
+#[test]
+fn poll_usage_rate_limits_itself() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = make_app(vec![], None, usage_config(write_history(&dir, 42.0, 60)));
+    app.usage = None;
+    app.usage_polled_at = None;
+
+    assert!(app.poll_usage());
+    assert!(
+        !app.poll_usage(),
+        "a second poll inside the interval must not re-read the file"
+    );
+}
+
+#[test]
+fn poll_usage_never_touches_the_api_source() {
+    // Reaching the api source from the UI thread would block on HTTP and can
+    // raise a macOS Keychain prompt, so a pinned `api` source is the daemon's
+    // job alone.
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = usage_config(write_history(&dir, 42.0, 60));
+    config.usage_source = "api".to_string();
+    let mut app = make_app(vec![], None, config);
+    app.usage = None;
+    app.usage_polled_at = None;
+
+    assert!(!app.poll_usage());
+    assert!(app.usage.is_none());
+}
+
+#[test]
+fn poll_usage_keeps_the_last_sample_when_the_file_goes_bad() {
+    let dir = tempfile::tempdir().unwrap();
+    let history = write_history(&dir, 42.0, 60);
+    let mut app = make_app(vec![], None, usage_config(history.clone()));
+    app.usage = None;
+    app.usage_polled_at = None;
+    assert!(app.poll_usage());
+
+    std::fs::write(&history, "{ truncated").unwrap();
+    app.usage_polled_at = None;
+    assert!(!app.poll_usage(), "an unreadable file is not a new reading");
+    assert_eq!(
+        app.usage_reading().pct,
+        Some(42.0),
+        "the previous sample survives a bad read"
+    );
+}
+
+#[test]
+fn usage_reading_prefers_our_own_sample_over_the_daemons() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = make_app(vec![], None, usage_config(write_history(&dir, 42.0, 60)));
+    app.usage = None;
+    app.usage_polled_at = None;
+    app.watch_state = Some(schedule::store::WatchState {
+        pid: 1,
+        started_at_ms: 0,
+        heartbeat_ms: 0,
+        last_usage_pct: Some(99.0),
+        last_usage_at_ms: Some(0),
+        reset_at_ms: None,
+        usage_error: None,
+        version: None,
+    });
+
+    app.poll_usage();
+    assert_eq!(app.usage_reading().pct, Some(42.0));
+}
+
+#[test]
+fn usage_reading_falls_back_to_the_daemon_and_then_to_nothing() {
+    let mut app = make_app(vec![], None, Config::default());
+    app.usage = None;
+    app.watch_state = Some(schedule::store::WatchState {
+        pid: 1,
+        started_at_ms: 0,
+        heartbeat_ms: 0,
+        last_usage_pct: Some(99.0),
+        last_usage_at_ms: Some(1234),
+        reset_at_ms: Some(5678),
+        usage_error: None,
+        version: None,
+    });
+
+    let reading = app.usage_reading();
+    assert_eq!(reading.pct, Some(99.0));
+    assert_eq!(reading.sampled_at_ms, Some(1234));
+    assert_eq!(reading.reset_at_ms, Some(5678));
+
+    app.watch_state = None;
+    assert_eq!(app.usage_reading().pct, None);
+}
+
+#[test]
+fn an_up_to_date_watcher_is_not_restarted() {
+    let mut app = make_app(vec![], None, Config::default());
+    app.watch_state = Some(schedule::store::WatchState {
+        pid: 1,
+        started_at_ms: 0,
+        heartbeat_ms: 0,
+        last_usage_pct: None,
+        last_usage_at_ms: None,
+        reset_at_ms: None,
+        usage_error: None,
+        version: Some(env!("CARGO_PKG_VERSION").to_string()),
+    });
+    // No daemon runs under the test's tmux socket, so this exercises the
+    // not-running guard as well: either way it must not report a restart.
+    assert!(!app.restart_outdated_watcher());
+    assert!(app.status_error.is_none());
 }

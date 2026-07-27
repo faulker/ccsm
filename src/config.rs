@@ -89,7 +89,8 @@ pub struct Config {
     /// Seconds between usage polls while a job is active.
     #[serde(default = "default_usage_poll_seconds")]
     pub usage_poll_seconds: u64,
-    /// A usage sample older than this many seconds is treated as stale.
+    /// A usage sample older than this many seconds is treated as stale. A
+    /// stale sample can still trigger a pause, but never a resume.
     #[serde(default = "default_usage_max_age_seconds")]
     pub usage_max_age_seconds: u64,
     /// Which usage source to read: `"auto"`, `"local"`, or `"api"`.
@@ -169,9 +170,13 @@ fn default_usage_poll_seconds() -> u64 {
     60
 }
 
-/// Serde default helper for `usage_max_age_seconds`.
+/// Serde default helper for `usage_max_age_seconds`: 5 minutes. A paused job
+/// can only resume on a fresh sample, so this doubles as the longest a job
+/// waits on stale usage data before a newer reading can release it. Raising it
+/// tolerates a slower-updating local history file; lowering it makes the `auto`
+/// source fall through to the API sooner.
 fn default_usage_max_age_seconds() -> u64 {
-    900
+    300
 }
 
 /// Serde default helper for `usage_source`.
@@ -551,7 +556,7 @@ mod tests {
         assert_eq!(config.usage_pause_percent, 95.0);
         assert_eq!(config.usage_resume_percent, 50.0);
         assert_eq!(config.usage_poll_seconds, 60);
-        assert_eq!(config.usage_max_age_seconds, 900);
+        assert_eq!(config.usage_max_age_seconds, 300);
         assert_eq!(config.usage_source, "auto");
         assert_eq!(config.pause_mode, PauseMode::Soft);
         assert!(config.watch_seven_day);

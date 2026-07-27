@@ -8,6 +8,7 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, MainTab};
+use crate::ui::config_tab::{row_action, RowAction};
 use crate::update::UpdateStatus;
 use crate::theme::{
     ACCENT_AMBER, ACCENT_BLUE, ACCENT_GREEN, ACCENT_PEACH, ACCENT_RED, FG_OVERLAY, FG_SUBTEXT,
@@ -57,12 +58,13 @@ fn format_reset_duration(reset_at_ms: i64) -> Option<String> {
 
 /// Build the ambient scheduler status chip shown in the tab bar, so current
 /// usage is visible from every tab: `⏱ 78% · resets 1h12m`. Returns an empty
-/// vec when there are no jobs and the watcher has never run. Shows `⏱ off` in
-/// red when jobs exist but the watcher heartbeat is stale — a silently dead
-/// watcher is the worst failure mode and must always be visible.
+/// vec only when there is nothing at all to say: no jobs, no watcher that has
+/// ever run, and no usage reading of ccsm's own. Shows `⏱ off` in red when jobs
+/// exist but the watcher heartbeat is stale — a silently dead watcher is the
+/// worst failure mode and must always be visible.
 pub(crate) fn build_usage_status_spans(app: &App) -> Vec<Span<'static>> {
     let job_count = app.jobs.len();
-    if job_count == 0 && app.watch_state.is_none() {
+    if job_count == 0 && app.watch_state.is_none() && app.usage.is_none() {
         return Vec::new();
     }
 
@@ -76,12 +78,11 @@ pub(crate) fn build_usage_status_spans(app: &App) -> Vec<Span<'static>> {
         return spans;
     }
 
-    match app.watch_state.as_ref().and_then(|s| s.last_usage_pct) {
+    let reading = app.usage_reading();
+    match reading.pct {
         Some(pct) => {
-            let stale = app
-                .watch_state
-                .as_ref()
-                .and_then(|s| s.last_usage_at_ms)
+            let stale = reading
+                .sampled_at_ms
                 .map(|at| now_ms() - at >= (app.config.usage_max_age_seconds as i64) * 1000)
                 .unwrap_or(true);
             let style = if stale {
@@ -101,12 +102,7 @@ pub(crate) fn build_usage_status_spans(app: &App) -> Vec<Span<'static>> {
         }
     }
 
-    if let Some(reset_str) = app
-        .watch_state
-        .as_ref()
-        .and_then(|s| s.reset_at_ms)
-        .and_then(format_reset_duration)
-    {
+    if let Some(reset_str) = reading.reset_at_ms.and_then(format_reset_duration) {
         spans.push(Span::styled(
             format!(" · resets {}", reset_str),
             Style::default().fg(FG_SUBTEXT),
@@ -121,7 +117,7 @@ pub(crate) fn build_usage_status_spans(app: &App) -> Vec<Span<'static>> {
 /// `width` is the list pane's full width. The pane is only 30% of the screen —
 /// 18 columns at 60 — so the state badges are spelled out only when they fit
 /// and fall back to single glyphs (then drop entirely) as it narrows. The
-/// spelled-out state is always available in the config popup.
+/// spelled-out state is always available on the Config tab.
 pub fn build_title_spans(app: &App, width: u16) -> Vec<Span<'static>> {
     let title_style = Style::default().fg(ACCENT_BLUE).add_modifier(Modifier::BOLD);
     // Two border corners plus a trailing space.
@@ -395,6 +391,32 @@ pub(crate) fn jobs_hints() -> Vec<Hint> {
     ]
 }
 
+/// Build the Config-tab hints, in display order.
+///
+/// The primary hint follows the selected row: `i` only does something on a
+/// path row, and `Enter` on the URL row opens a browser rather than toggling
+/// anything, so a fixed `Space toggle` would be wrong on both.
+pub(crate) fn config_hints(action: RowAction) -> Vec<Hint> {
+    use HintPriority::*;
+    let mut hints = vec![Hint::new("\u{2191}\u{2193}/jk", " nav", P1)];
+    match action {
+        RowAction::Browse => {
+            hints.push(Hint::new("Enter", " browse", P1));
+            hints.push(Hint::new("i", " type path", P2));
+        }
+        RowAction::OpenUrl => hints.push(Hint::new("Enter", " open", P1)),
+        RowAction::Edit => hints.push(Hint::new("Enter", " edit", P1)),
+        RowAction::Toggle => hints.push(Hint::new("Space/Enter", " toggle", P1)),
+    }
+    hints.extend([
+        Hint::new("Tab", " sessions", P2),
+        Hint::new("Esc", " back", P3),
+        Hint::new("?", " help", P0),
+        Hint::new("q", " quit", P0),
+    ]);
+    hints
+}
+
 /// Build the Sessions-tab hints, in display order.
 ///
 /// `is_live` adds the stop hint only when a live session is selected, since it
@@ -439,7 +461,7 @@ pub(crate) fn sessions_hints(is_live: bool, shift_active: bool, is_historical: b
 /// Render the bottom status/help bar.
 ///
 /// The version label used to live here, permanently reserving 8 columns at
-/// every terminal size. It moved to the config popup's About block so that
+/// every terminal size. It moved to the Config tab's About block so that
 /// space goes to shortcuts instead.
 pub fn render_status_bar(frame: &mut Frame, app: &App, bar_area: Rect) {
     let bar_style = Style::default().bg(HIGHLIGHT_BG);
@@ -534,6 +556,7 @@ pub fn render_status_bar(frame: &mut Frame, app: &App, bar_area: Rect) {
 
         let hints = match app.main_tab {
             MainTab::Jobs => jobs_hints(),
+            MainTab::Config => config_hints(row_action(app.config_selected)),
             MainTab::Sessions => sessions_hints(
                 app.selected_live_index().is_some(),
                 app.shift_active,
@@ -573,6 +596,7 @@ mod tests {
             last_usage_at_ms: pct.map(|_| now),
             reset_at_ms: Some(now + 72 * 60_000),
             usage_error: None,
+            version: Some(env!("CARGO_PKG_VERSION").to_string()),
         }
     }
 
@@ -582,6 +606,7 @@ mod tests {
         let mut app = App::new(vec![], None, Config::default());
         app.jobs = vec![];
         app.watch_state = None;
+        app.usage = None;
         app
     }
 
@@ -607,6 +632,25 @@ mod tests {
         assert!(text.contains("resets 1h12m"), "{text}");
         // The job count lives in the tab strip, so the chip must not repeat it.
         assert!(!text.contains("job"), "{text}");
+    }
+
+    #[test]
+    fn chip_shows_our_own_reading_with_no_watcher_at_all() {
+        // The whole point of reading usage in-tree: no daemon has ever run, and
+        // the chip is still live.
+        let mut app = bare_app();
+        app.usage = Some(crate::usage::UsageSnapshot {
+            sampled_at_ms: Some(now_ms()),
+            five_hour: Some(crate::usage::UsageWindow {
+                used_percentage: Some(64.0),
+                resets_at: None,
+                resets_at_estimated_ms: Some(now_ms() + 72 * 60_000),
+            }),
+            ..Default::default()
+        });
+        let text = chip_text(&app);
+        assert!(text.contains("64%"), "{text}");
+        assert!(text.contains("resets 1h12m"), "{text}");
     }
 
     #[test]
@@ -680,6 +724,35 @@ mod tests {
             assert!(text.contains("? help"), "jobs width {width}: {text}");
             assert!(text.contains("q quit"), "jobs width {width}: {text}");
         }
+        app.main_tab = MainTab::Config;
+        for width in [40u16, 60, 80, 100, 120, 200] {
+            let text = bar_text(&app, width);
+            assert!(text.contains("? help"), "config width {width}: {text}");
+            assert!(text.contains("q quit"), "config width {width}: {text}");
+        }
+    }
+
+    /// `i` is only meaningful on a path row and `Enter` on the URL row opens a
+    /// browser, so a fixed primary hint would be wrong on both.
+    #[test]
+    fn config_hints_follow_the_selected_row() {
+        let keys = |action| -> Vec<String> {
+            config_hints(action)
+                .into_iter()
+                .map(|h| h.key.to_string())
+                .collect()
+        };
+        assert!(keys(RowAction::Browse).contains(&"i".to_string()));
+        assert!(!keys(RowAction::Toggle).contains(&"i".to_string()));
+
+        let toggles = |action| -> bool {
+            config_hints(action)
+                .into_iter()
+                .any(|h| h.label.contains("toggle"))
+        };
+        assert!(toggles(RowAction::Toggle));
+        assert!(!toggles(RowAction::OpenUrl));
+        assert!(!toggles(RowAction::Edit));
     }
 
     #[test]

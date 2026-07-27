@@ -297,6 +297,9 @@ impl App {
         self.help_tab = match self.main_tab {
             MainTab::Jobs => HelpTab::Jobs,
             MainTab::Sessions => HelpTab::Sessions,
+            // The config keys live on the General page, alongside the global
+            // ones and the directory picker they open.
+            MainTab::Config => HelpTab::General,
         };
         self.help_scroll = 0;
         self.mode = AppMode::Help;
@@ -506,11 +509,6 @@ impl App {
                 return Ok(());
             }
 
-            if self.mode == AppMode::Config {
-                self.handle_config_event(key);
-                return Ok(());
-            }
-
             if self.mode == AppMode::MissingDeps {
                 self.handle_missing_deps_event(key);
                 return Ok(());
@@ -536,10 +534,16 @@ impl App {
                 return Ok(());
             }
 
-            // The Jobs tab has its own full key map (including quit/help/config),
-            // so it is dispatched before the Sessions-tab bindings below.
+            // The Jobs and Config tabs have their own full key maps (each
+            // including quit/help/tab switching), so they are dispatched before
+            // the Sessions-tab bindings below.
             if self.main_tab == MainTab::Jobs && !self.filter_active {
                 self.handle_jobs_tab_event(key);
+                return Ok(());
+            }
+
+            if self.main_tab == MainTab::Config && !self.filter_active {
+                self.handle_config_tab_event(key);
                 return Ok(());
             }
 
@@ -638,8 +642,7 @@ impl App {
                     self.filter_active = true;
                 }
                 (KeyCode::Char('o'), KeyModifiers::NONE) => {
-                    self.config_selected = 0;
-                    self.mode = AppMode::Config;
+                    self.open_config_tab();
                 }
                 (KeyCode::Char('j'), KeyModifiers::NONE) | (KeyCode::Down, KeyModifiers::NONE) => {
                     let count = self.visible_item_count();

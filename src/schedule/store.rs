@@ -34,6 +34,13 @@ pub struct WatchState {
     /// Most recent error encountered while fetching usage, if any.
     #[serde(default)]
     pub usage_error: Option<String>,
+    /// `CARGO_PKG_VERSION` of the binary running the daemon. `None` for state
+    /// written by a build predating this field. The daemon outlives the TUI and
+    /// survives a self-update, so without this a daemon can keep running code
+    /// the installed binary no longer contains — which is exactly how the
+    /// removed `claude-usage` shell-out kept failing after usage moved in-tree.
+    #[serde(default)]
+    pub version: Option<String>,
 }
 
 /// A lightweight fingerprint of a file's contents, used to detect changes

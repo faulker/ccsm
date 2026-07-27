@@ -10,7 +10,7 @@ Sessions grouped by project with an expanded group showing individual sessions. 
 ![Tree view with session preview](screenshots/sessions-tree-view.png)
 
 ### Flat view
-The same sessions as one flat, newest-first list instead of project groups. Start ccsm with `--flat`, or switch views from the config popup.
+The same sessions as one flat, newest-first list instead of project groups. Start ccsm with `--flat`, or switch views from the Config tab.
 
 ![Flat session list](screenshots/sessions-flat-view.png)
 
@@ -29,10 +29,10 @@ Every path the app needs can be browsed instead of typed, whether it is a new se
 
 ![Directory browser](screenshots/directory-picker.png)
 
-### Config popup
-Press `o` for settings, grouped so it is clear which ones drive the scheduler.
+### Config tab
+Settings on the left, grouped so it is clear which ones drive the scheduler, and an explanation of the selected setting on the right. Reach it with `Tab` from the Jobs tab, or jump straight to it with `o`.
 
-![Config popup](screenshots/config-popup.png)
+![Config tab](screenshots/config-popup.png)
 
 ### Tabbed help
 Press `?` for the keybinding reference. It opens on the page matching the tab you are on and switches pages with `Tab`.
@@ -41,8 +41,8 @@ Press `?` for the keybinding reference. It opens on the page matching the tab yo
 
 ## Features
 
-- **Tabbed main window** — `Tab` switches between the Sessions browser and the Jobs manager; both use the same list + detail layout
-- **Tree & flat views** — browse sessions grouped by project or as a flat list; cycle display modes from the config popup (`o`, then `Tab`)
+- **Tabbed main window** — `Tab` cycles the Sessions browser, the Jobs manager, and Config; all three use the same list + detail layout
+- **Tree & flat views** — browse sessions grouped by project or as a flat list; cycle display modes with `v`, or from the Config tab's **View** row
 - **Conversation preview** — scrollable preview of the last 20 turns with working directory and git branch in the info bar
 - **Resume anywhere** — resume a session in tmux (`Enter`) or directly in the foreground (`Shift+Enter`)
 - **Live sessions** — start, attach, detach, rename, and stop tmux-backed Claude sessions; running sessions surface at the top with activity indicators (● active, ● idle, ▶ waiting) and real-time pane preview
@@ -50,13 +50,13 @@ Press `?` for the keybinding reference. It opens on the page matching the tab yo
 - **Usage-aware scheduling** — dispatch sessions with a prompt, pause them automatically before your 5-hour budget runs out, and continue them when it resets, all without being at the keyboard (Jobs tab, `Tab`)
 - **Jobs know when they are finished** — every dispatched prompt asks the agent to sign off with `CCSM_JOB_COMPLETE`, which the watcher reads from the session transcript; a job that reports it (or sits idle past a configurable window) is marked done, its session stopped, and it is never re-dispatched
 - **Usage always in view** — the tab strip shows your current usage percentage, the time until the window resets, and a red `⏱ off` if the watcher daemon has died, on every tab
-- **Directory browser** — browse for any path the app needs: a new session's directory (`b`), a job's working directory, or the `claude`/`tmux` binaries and the usage history file in the config popup — and type it by hand instead if you prefer
+- **Directory browser** — browse for any path the app needs: a new session's directory (`b`), a job's working directory, or the `claude`/`tmux` binaries and the usage history file on the Config tab — and type it by hand instead if you prefer
 - **Full cursor editing** — every text field supports `←`/`→`, `Ctrl+←`/`→` by word, `Home`/`End`, `Ctrl+W`, and `Ctrl+U`
 - **Duplicate detection** — catches duplicate session names with options to open, rename, or cancel
 - **Search & filter** — filter by project name or path; toggle live-only mode with `l`
 - **Favorites** — pin projects to the top of the list with `f`
 - **Mouse scroll** — scroll the preview pane with the mouse wheel; auto-scrolls to bottom for live sessions
-- **Config popup** — press `o` for settings grouped into **Sessions**, **Jobs manager**, and **About** sections, so it is clear which settings drive the scheduler
+- **Config tab** — settings grouped into **Sessions**, **Jobs manager**, and **About** sections, with the selected one explained in the pane beside it; `o` jumps straight there
 - **Auto-update** — background update checks with one-key install, SHA256 checksum verification, and automatic restart
 - **Tabbed help** — press `?` for a keybinding reference split into Sessions / Jobs / General pages; it opens on the page matching the tab you are on
 - **Persistent config** — preferences saved to `~/.config/ccsm/config.json`
@@ -202,11 +202,11 @@ Back in the TUI, live sessions appear at the top of the list with activity indic
 | `←` | Collapse group or jump to parent header (tree view) |
 | `Enter` | Resume session in tmux / attach to live session / toggle group |
 | `Shift+Enter` | Resume historical session directly in the foreground (no tmux) |
-| `Tab` / `Shift+Tab` | Switch between the Sessions and Jobs tabs |
+| `Tab` / `Shift+Tab` | Cycle the Sessions, Jobs and Config tabs |
 | `Shift+J` / `Mouse wheel ↓` | Scroll preview down |
 | `Shift+K` / `Mouse wheel ↑` | Scroll preview up (disables auto-scroll for live sessions) |
 | `/` | Activate search/filter mode |
-| `o` | Open config popup (Sessions / Jobs manager / About sections) |
+| `o` | Jump to the Config tab (Sessions / Jobs manager / About sections) |
 | `Space` | Toggle favorite — pins project to top of list (shown with ★) |
 | `n` | New session popup — `Tab` cycles plain / danger / worktree / direct |
 | `v` | Cycle the view mode (tree / flat / grouped) |
@@ -219,8 +219,22 @@ Back in the TUI, live sessions appear at the top of the list with activity indic
 | `q` / `Ctrl+C` | Quit |
 | `Esc` | Back out of a popup or clear the filter — never quits |
 
-In the config popup, `Tab` / `Shift+Tab` still cycles the session view mode
-(tree [name] → tree [short dir] → tree [full dir] → flat).
+### The Config tab
+
+`j` / `k` move between settings and the pane on the right explains whichever one
+is selected: what it does, the value it holds now, and the keys that act on it.
+
+| Key | Action |
+|-----|--------|
+| `j` / `k`, `↑` / `↓` | Move between settings |
+| `Home` / `End` | Jump to the first / last setting |
+| `Space` / `Enter` | Toggle a setting, edit a value, or browse for a path |
+| `i` | Type a path by hand instead of browsing |
+| `←` / `→` | On **View**: cycle the session view mode either way (tree [name] → tree [short dir] → tree [full dir] → flat) |
+| `Esc` | Back to the Sessions tab |
+
+Changes are saved to `~/.config/ccsm/config.json` as you make them; there is no
+save step.
 
 ### The new-session popup
 
@@ -324,6 +338,11 @@ amber, or red as you approach the pause threshold. A `?` after the percentage me
 sample is stale, and the whole chip reads `⏱ off` in red when jobs exist but the watcher
 is not running, since a silently dead watcher is the one failure that strands every job.
 
+The TUI reads the local usage history itself every 30 seconds, so the chip stays live
+whether or not the watcher daemon is running. It only falls back to the daemon's last
+reading when `usage_source` is pinned to `api`, which is the one path that has to touch
+credentials and so belongs in the background process rather than on the UI thread.
+
 | Key | Action (on the Jobs tab) |
 |---|---|
 | `j` / `k` | Navigate |
@@ -352,7 +371,7 @@ need looking up. Two fields behave specially:
 **Continue prompt** is what the watcher pastes to wake a paused session. Leaving it blank
 on a job inherits the global default (`Continue where you left off.`), which the form and
 detail pane both show in full rather than hiding behind "(default)". Change the global
-default under **Jobs manager → Continue prompt** in the config popup (`o`); clearing it
+default under **Jobs manager → Continue prompt** on the Config tab (`o`); clearing it
 restores the built-in text rather than storing an empty string.
 
 ### How a job finishes
@@ -360,35 +379,48 @@ restores the built-in text rather than storing an empty string.
 A dispatched session has no natural end. Claude finishes the work, prints its summary,
 and sits at an idle prompt looking exactly like a session that has merely paused, so
 without a completion signal the watcher would keep waking it and relaunching it against
-work that is already done. Two things stop that.
+work that is already done. Three things stop that.
 
-**The completion marker.** Every session the watcher launches carries a short
-instruction in its system prompt (`--append-system-prompt`): when the task is completely
-finished, make the last line of the final message exactly `CCSM_JOB_COMPLETE`. Every
-continuation prompt repeats it, so a session ccsm adopted rather than launched learns the
-protocol too. The instruction goes in the system prompt rather than being appended to the
-job's prompt because Claude Code hands everything after a slash command to that command
-as its arguments: a job whose prompt is `/goal @PLAN.md` would have swallowed the whole
-protocol paragraph into the goal instead of hearing it. The watcher looks for
-that line in the session's own transcript under `~/.claude/projects/`, not in the tmux
-pane, because the instruction itself is echoed into the pane the moment it is pasted —
-scraping the pane would match ccsm's own words and finish every job on dispatch. Only
-`assistant` messages count, only whole lines match, and the marker written into a file
-through a tool call is ignored, so an agent cannot end its job by talking about the
-marker.
+**The stop hook.** Every session the watcher launches gets a `Stop` hook installed
+through `--settings`, which Claude Code runs when the agent finishes responding. The hook
+is just `ccsm --job-complete <job id>`, and it drops a stamp file the watcher reads on its
+next poll. This is the signal jobs actually rely on, because the harness fires it rather
+than the model choosing to: no amount of drift over a long session can lose it. Inline
+`--settings` adds to your own settings rather than replacing them, so hooks you have
+configured yourself still run alongside it.
+
+If you are attached to the job's session, your own turns fire the hook too, so the
+watcher holds the completion until you detach rather than closing the job out from under
+you. Turn that off with **Jobs manager → Defer while attached** on the Config tab (`o`).
+
+**The completion marker.** A session ccsm adopted rather than launched has no hook, so it
+also carries a short instruction: when the task is completely finished, make the last line
+of the final message exactly `CCSM_JOB_COMPLETE`. It rides the system prompt
+(`--append-system-prompt`) and every continuation prompt. It goes in the system prompt
+rather than being appended to the job's prompt because Claude Code hands everything after
+a slash command to that command as its arguments: a job whose prompt is `/goal @PLAN.md`
+would have swallowed the whole protocol paragraph into the goal instead of hearing it.
+The watcher looks for that line in the session's own transcript under
+`~/.claude/projects/`, not in the tmux pane, because the instruction itself is echoed into
+the pane the moment it is pasted — scraping the pane would match ccsm's own words and
+finish every job on dispatch. Only `assistant` messages count, only whole lines match, and
+the marker written into a file through a tool call is ignored, so an agent cannot end its
+job by talking about the marker.
+
+Treat the marker as a backstop, not a guarantee. Models do not reliably emit it at the end
+of a long interactive session, which is exactly why the hook exists.
 
 Once a job reports completion it moves to `done`: its tmux session is stopped, and
 nothing dispatches, resumes, or relaunches it again. That holds no matter what state it
 was in — a job that finishes and then exits on its own is caught in `stopped` before the
 relaunch timer fires.
 
-**The idle fallback.** An agent can forget the instruction, and an adopted session was
-never told it in the first place. So a job whose pane has looked idle for an unbroken
-stretch (default 15 minutes) is also marked done, with the reason recorded in its
-history so it is never confused with a self-reported completion. A pane sitting on a
-permission prompt reads as *waiting*, not idle, and is never swept up by this. Change
-the window under **Jobs manager → Idle completion** in the config popup (`o`), or set it
-to `0` to turn the fallback off and rely on the marker alone.
+**The idle fallback.** For anything both other signals miss, a job whose pane has looked
+idle for an unbroken stretch (default 15 minutes) is also marked done, with the reason
+recorded in its history so it is never confused with a reported completion. A pane sitting
+on a permission prompt reads as *waiting*, not idle, and is never swept up by this. Change
+the window under **Jobs manager → Idle completion** on the Config tab (`o`), or set it
+to `0` to turn the fallback off.
 
 Press `f` on the Jobs tab to mark a job done by hand, which stops its session the same
 way a self-reported completion does.
@@ -418,8 +450,11 @@ ccsm --usage          # print the current 5-hour and 7-day usage reading
 ```
 
 It normally starts on its own the first time you create a job (`Auto-start watcher` in
-the config popup), living in its own `ccsm-watch` tmux session on the same `ccsm` socket.
-It survives closing the TUI and is hidden from the session list. `tmux -L ccsm attach -t
+the Config tab), living in its own `ccsm-watch` tmux session on the same `ccsm` socket.
+It survives closing the TUI and is hidden from the session list. Because it also survives
+an upgrade, it records the ccsm version it is running and the TUI restarts it on startup
+whenever that no longer matches the installed binary; otherwise a daemon from an older
+release keeps executing code the current one no longer contains. `tmux -L ccsm attach -t
 ccsm-watch` gives you a live log tail, and the same log is written to
 `~/Library/Application Support/ccsm/watch.log`.
 
@@ -458,10 +493,16 @@ source: local, sampled 55s ago
 ```
 
 If Claude Desktop is not installed, set `usage_source` to `"api"`, or point
-`usage_history_path` at the file in the config popup if it lives somewhere non-standard.
+`usage_history_path` at the file on the Config tab if it lives somewhere non-standard.
 
 ccsm is deliberately conservative about stale readings: a stale sample can still trigger
 a pause (erring toward stopping), but never a resume.
+
+Because of that, **Usage sample stale after** (`usage_max_age_seconds`, default 5 minutes)
+is also the longest a paused job waits on an old reading before a newer one can release
+it. Raise it if your usage history file updates slowly and jobs are sitting paused longer
+than they should; lower it to insist on fresher numbers, at the cost of the `auto` source
+falling through to the API more often.
 
 ## Configuration
 
@@ -494,7 +535,7 @@ Settings are persisted to `~/.config/ccsm/config.json` and automatically saved w
 | `last_update_check` | Unix timestamp | When the last update check was performed (auto-managed) |
 | `claude_path` / `tmux_path` | Path or unset | Override binary locations; unset means look on `PATH` |
 
-Scheduler settings, all editable under **Jobs manager** in the config popup (`o`):
+Scheduler settings, all editable under **Jobs manager** on the Config tab (`o`):
 
 | Field | Default | Description |
 |---|---|---|
@@ -504,7 +545,7 @@ Scheduler settings, all editable under **Jobs manager** in the config popup (`o`
 | `watch_autostart` | `true` | Start the watcher daemon automatically when a job is created |
 | `watch_seven_day` | `true` | Also pause on the 7-day window, not just the 5-hour one |
 | `usage_poll_seconds` | `60` | How often to sample usage while a job is active |
-| `usage_max_age_seconds` | `900` | A usage sample older than this counts as stale |
+| `usage_max_age_seconds` | `300` | A usage sample older than this counts as stale; shown as **Usage sample stale after** in minutes |
 | `usage_source` | `"auto"` | Where to read usage from: `auto`, `local` (Claude Desktop history), or `api` (OAuth endpoint) |
 | `usage_history_path` | `null` | Override the path to Claude Desktop's `plan-usage-history.json` |
 | `defer_while_attached` | `true` | Skip automated keystrokes while you have the session attached |
@@ -526,6 +567,11 @@ Scheduler settings, all editable under **Jobs manager** in the config popup (`o`
 10. With `--new`, skips the TUI, creates a live tmux session in the current directory, attaches immediately, and re-execs ccsm when Claude exits
 11. If the user accepts an update, the TUI suspends, downloads the new binary, verifies the SHA256 checksum against the release's `checksums-sha256.txt`, replaces the current executable, and automatically restarts
 12. After Claude exits, the TUI resumes and reloads the session list
+
+The macOS binaries are codesigned, and notarized, when the Apple secrets are
+configured in the release workflow; without them the release still ships
+unsigned. See [docs/macos-signing.md](docs/macos-signing.md) for which
+secrets to add and how to get them from Apple.
 
 ## Dependencies
 

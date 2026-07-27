@@ -1,6 +1,5 @@
 mod app;
 mod config;
-mod config_popup;
 mod data;
 mod keys;
 mod live;
@@ -99,6 +98,11 @@ fn run_app(
         });
     }
 
+    // A daemon left over from an older ccsm keeps running code this binary no
+    // longer contains, so replace it before the event loop starts rather than
+    // letting it quietly mis-manage jobs for the rest of the session.
+    app.restart_outdated_watcher();
+
     // Always spawn background update check (non-blocking)
     {
         let (tx, rx) = std::sync::mpsc::channel();
@@ -171,6 +175,14 @@ fn run_app(
             if before != (app.jobs.len(), app.schedule_stamp.clone(), app.watch_stamp.clone()) {
                 app.needs_redraw = true;
             }
+        }
+
+        // Read account usage ourselves rather than only mirroring what the watch
+        // daemon persisted. The daemon may not be running at all, and the chip
+        // must not freeze on its last write when it isn't. Self-rate-limited, so
+        // calling it every tick is cheap.
+        if app.poll_usage() {
+            app.needs_redraw = true;
         }
 
         // Check for background update result
@@ -298,6 +310,17 @@ fn main() -> Result<()> {
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|_| arg.clone())
     });
+
+    // The `Stop` hook ccsm installs on every job it launches. Runs in the
+    // agent's own process tree when a turn ends, so it must stay silent and
+    // always exit 0: a hook that fails or writes to stderr surfaces as an
+    // error inside the user's session.
+    if let Some(idx) = args.iter().position(|a| a == "--job-complete") {
+        if let Some(job_id) = args.get(idx + 1) {
+            let _ = schedule::completion::record_stop(job_id);
+        }
+        return Ok(());
+    }
 
     if watch_daemon {
         return watch::run();
