@@ -80,7 +80,7 @@ pub fn start(tmux: &str) -> Result<()> {
     let home = dirs::home_dir()
         .map(|h| h.to_string_lossy().to_string())
         .unwrap_or_else(|| ".".to_string());
-    live::start_live_session(tmux, live::WATCH_SESSION, &home, &[&exe_str, "--watch"])
+    live::start_live_session(tmux, live::WATCH_SESSION, &home, &[&exe_str, "--watch"], None)
 }
 
 /// Ask the daemon to shut down via the command queue, waiting up to 3s for

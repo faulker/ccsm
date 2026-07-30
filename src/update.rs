@@ -53,6 +53,14 @@ pub struct UpdateInfo {
     pub tag: String,
 }
 
+/// True when this binary should check GitHub for updates.
+///
+/// Debug builds (`cargo run` / `cargo build` without `--release`) skip the
+/// check so local development is never interrupted by a release prompt.
+pub fn updates_enabled() -> bool {
+    !cfg!(debug_assertions)
+}
+
 /// Tracks the state of the background update check and download lifecycle.
 #[derive(Debug, Clone)]
 pub enum UpdateStatus {
@@ -450,6 +458,12 @@ mod tests {
             patch: 3,
         };
         assert_eq!(format!("{}", v), "1.2.3");
+    }
+
+    #[test]
+    fn updates_enabled_is_false_in_debug_builds() {
+        // `cargo test` and `cargo run` use debug_assertions; release installs do not.
+        assert_eq!(updates_enabled(), !cfg!(debug_assertions));
     }
 
     #[test]

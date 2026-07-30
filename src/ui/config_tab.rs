@@ -19,7 +19,7 @@ use crate::keys::normalize_key;
 use crossterm::event::{KeyCode, KeyModifiers};
 
 /// Maximum row index in the config list (0-based).
-pub const CONFIG_MAX_ROW: usize = 14;
+pub const CONFIG_MAX_ROW: usize = 15;
 
 /// Row index of the hide-empty-projects toggle.
 const HIDE_EMPTY_ROW: usize = 0;
@@ -33,42 +33,45 @@ const VIEW_ROW: usize = 2;
 /// Row index of the `claude` binary path.
 const CLAUDE_PATH_ROW: usize = 3;
 
+/// Row index of the Cursor `agent` binary path.
+const AGENT_PATH_ROW: usize = 4;
+
 /// Row index of the `tmux` binary path.
-const TMUX_PATH_ROW: usize = 4;
+const TMUX_PATH_ROW: usize = 5;
 
 /// Row index of the usage history file path.
-const USAGE_PATH_ROW: usize = 5;
+const USAGE_PATH_ROW: usize = 6;
 
 /// Row index of the usage percentage at which jobs pause.
-const PAUSE_PERCENT_ROW: usize = 6;
+const PAUSE_PERCENT_ROW: usize = 7;
 
 /// Row index of the usage percentage at which jobs resume.
-const RESUME_PERCENT_ROW: usize = 7;
+const RESUME_PERCENT_ROW: usize = 8;
 
 /// Row index of the usage-staleness window, in minutes.
-pub(crate) const USAGE_STALE_ROW: usize = 8;
+pub(crate) const USAGE_STALE_ROW: usize = 9;
 
 /// Row index of the pause-mode toggle.
-const PAUSE_MODE_ROW: usize = 9;
+const PAUSE_MODE_ROW: usize = 10;
 
 /// Row index of the watcher auto-start toggle.
-const WATCH_AUTOSTART_ROW: usize = 10;
+const WATCH_AUTOSTART_ROW: usize = 11;
 
 /// Row index of the idle-completion timeout, in minutes.
-pub(crate) const IDLE_COMPLETE_ROW: usize = 11;
+pub(crate) const IDLE_COMPLETE_ROW: usize = 12;
 
 /// Row index of the default continue-prompt text field.
-pub(crate) const CONTINUE_PROMPT_ROW: usize = 12;
+pub(crate) const CONTINUE_PROMPT_ROW: usize = 13;
 
 /// Row index of the developer credit, which is highlightable but inert.
-const CREDIT_ROW: usize = 13;
+const CREDIT_ROW: usize = 14;
 
 /// Row index of the project URL, which opens in a browser rather than editing.
-pub(crate) const URL_ROW: usize = 14;
+pub(crate) const URL_ROW: usize = 15;
 
-/// Rows 3..=5 are file paths (the two binaries and the usage history file):
+/// Rows 3..=6 are file paths (three binaries and the usage history file):
 /// they open the file picker, and can also be typed by hand.
-const PATH_ROWS: std::ops::RangeInclusive<usize> = 3..=5;
+const PATH_ROWS: std::ops::RangeInclusive<usize> = 3..=6;
 use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
@@ -126,6 +129,9 @@ impl App {
                     match self.config_selected {
                         CLAUDE_PATH_ROW => {
                             self.config.claude_path = optional_from_input(value);
+                        }
+                        AGENT_PATH_ROW => {
+                            self.config.agent_path = optional_from_input(value);
                         }
                         TMUX_PATH_ROW => {
                             self.config.tmux_path = optional_from_input(value);
@@ -209,6 +215,13 @@ impl App {
                     if commit_ok {
                         if let Err(e) = self.config.save() {
                             self.status_error = Some(format!("Failed to save config: {e}"));
+                        }
+                        if PATH_ROWS.contains(&self.config_selected) {
+                            self.refresh_bin_availability();
+                            self.missing_usage = crate::usage::source_unavailable(
+                                &self.config.usage_source,
+                                self.config.usage_history_override(),
+                            );
                         }
                     }
                     self.config_editing = false;
@@ -300,6 +313,7 @@ impl App {
                     }
                     // Binary paths open the file picker; `i` (below) types one by hand.
                     CLAUDE_PATH_ROW => self.browse_config_path(PickerTarget::ConfigClaude),
+                    AGENT_PATH_ROW => self.browse_config_path(PickerTarget::ConfigAgent),
                     TMUX_PATH_ROW => self.browse_config_path(PickerTarget::ConfigTmux),
                     USAGE_PATH_ROW => self.browse_config_path(PickerTarget::ConfigUsage),
                     PAUSE_PERCENT_ROW => {
@@ -350,6 +364,7 @@ impl App {
                 self.config_editing = true;
                 let current = match self.config_selected {
                     CLAUDE_PATH_ROW => self.config.claude_path.clone(),
+                    AGENT_PATH_ROW => self.config.agent_path.clone(),
                     TMUX_PATH_ROW => self.config.tmux_path.clone(),
                     _ => self.config.usage_history_path.clone(),
                 }
@@ -360,19 +375,16 @@ impl App {
         }
     }
 
-    /// Re-check the required binaries on the way out of the Config tab.
+    /// Re-check binaries on the way out of the Config tab.
     ///
-    /// Returns `false` when one is still missing, having raised the blocking
-    /// dialog: leaving the tab with an unusable `claude` or `tmux` path would
-    /// drop the user onto a session list where nothing can launch.
+    /// Returns `false` when the blocking dialog must come back: tmux missing,
+    /// or both agent binaries missing. Exactly one of claude/agent missing is
+    /// soft and does not block leaving.
     fn leave_config_tab(&mut self) -> bool {
-        if self.missing_claude || self.missing_tmux {
-            self.missing_claude = !Config::is_bin_available(self.config.claude_bin());
-            self.missing_tmux = !Config::is_bin_available(self.config.tmux_bin());
-            if self.missing_claude || self.missing_tmux {
-                self.mode = AppMode::MissingDeps;
-                return false;
-            }
+        self.refresh_bin_availability();
+        if self.deps_blocking() {
+            self.mode = AppMode::MissingDeps;
+            return false;
         }
         true
     }
@@ -382,6 +394,7 @@ impl App {
     fn browse_config_path(&mut self, target: PickerTarget) {
         let current = match target {
             PickerTarget::ConfigClaude => self.config.claude_path.clone(),
+            PickerTarget::ConfigAgent => self.config.agent_path.clone(),
             PickerTarget::ConfigTmux => self.config.tmux_path.clone(),
             _ => self.config.usage_history_path.clone(),
         }
@@ -489,6 +502,12 @@ fn draw_settings_list(frame: &mut Frame, app: &App, area: Rect) {
         "Claude binary",
         app.config.claude_path.as_ref(),
         "claude (default)".to_string(),
+    ));
+    content.push(path_row(
+        AGENT_PATH_ROW,
+        "Agent binary",
+        app.config.agent_path.as_ref(),
+        "agent (default)".to_string(),
     ));
     content.push(path_row(
         TMUX_PATH_ROW,
@@ -748,6 +767,10 @@ fn setting_help(row: usize) -> SettingHelp {
             "Claude binary",
             &["Which claude executable ccsm launches. Leave it empty to use whatever claude is on PATH. Set it when claude lives somewhere your login shell does not export."],
         ),
+        AGENT_PATH_ROW => (
+            "Agent binary",
+            &["Which Cursor agent executable ccsm launches. Leave it empty to use whatever agent is on PATH. Listing and previewing Cursor chats needs no binary at all."],
+        ),
         TMUX_PATH_ROW => (
             "Tmux binary",
             &["Which tmux executable runs live sessions and the watcher. Leave it empty to use whatever tmux is on PATH."],
@@ -828,6 +851,7 @@ fn current_value(app: &App, row: usize) -> Option<String> {
             app.display_mode.label()
         ),
         CLAUDE_PATH_ROW => path_value(app.config.claude_path.as_ref(), "claude".to_string()),
+        AGENT_PATH_ROW => path_value(app.config.agent_path.as_ref(), "agent".to_string()),
         TMUX_PATH_ROW => path_value(app.config.tmux_path.as_ref(), "tmux".to_string()),
         USAGE_PATH_ROW => path_value(
             app.config.usage_history_path.as_ref(),
@@ -891,28 +915,32 @@ fn key_hints(row: usize, editing: bool) -> Vec<(&'static str, &'static str)> {
 /// Render the missing-dependencies dialog.
 pub fn draw_missing_deps_popup(frame: &mut Frame, app: &App) {
     let area = centered_rect(50, 30, frame.area());
-    let area = Rect { height: 9.min(area.height), ..area };
+    // Three binary lines (claude / agent / tmux) plus the key hints.
+    let area = Rect { height: 10.min(area.height), ..area };
     frame.render_widget(Clear, area);
 
     let key_style = Style::default().fg(ACCENT_PEACH).add_modifier(Modifier::BOLD);
     let hint_style = Style::default().fg(FG_SUBTEXT);
 
-    let claude_line = if app.missing_claude {
-        Line::from(Span::styled("  ✗ claude not found", Style::default().fg(ACCENT_RED)))
-    } else {
-        Line::from(Span::styled("  ✓ claude found", Style::default().fg(ACCENT_GREEN)))
-    };
-
-    let tmux_line = if app.missing_tmux {
-        Line::from(Span::styled("  ✗ tmux not found", Style::default().fg(ACCENT_RED)))
-    } else {
-        Line::from(Span::styled("  ✓ tmux found", Style::default().fg(ACCENT_GREEN)))
+    let bin_line = |ok: bool, name: &str| -> Line<'static> {
+        if ok {
+            Line::from(Span::styled(
+                format!("  ✓ {name} found"),
+                Style::default().fg(ACCENT_GREEN),
+            ))
+        } else {
+            Line::from(Span::styled(
+                format!("  ✗ {name} not found"),
+                Style::default().fg(ACCENT_RED),
+            ))
+        }
     };
 
     let content = vec![
         Line::from(""),
-        claude_line,
-        tmux_line,
+        bin_line(!app.missing_claude, "claude"),
+        bin_line(!app.missing_agent, "agent"),
+        bin_line(!app.missing_tmux, "tmux"),
         Line::from(""),
         Line::from(vec![
             Span::styled("  s", key_style),
@@ -1178,6 +1206,45 @@ mod tests {
         app.handle_config_tab_event(key(KeyCode::Esc));
         assert_eq!(app.mode, AppMode::MissingDeps);
         assert_eq!(app.main_tab, MainTab::Config, "and stays on the tab behind it");
+    }
+
+    /// Exactly one of claude/agent missing is soft: leaving Config must not
+    /// re-raise the blocking dialog when tmux and the other agent are fine.
+    #[test]
+    fn leaving_config_with_only_claude_missing_is_not_blocking() {
+        let mut app = App::new(vec![], None, Config::default());
+        app.open_config_tab();
+        app.config.claude_path = Some("/nonexistent/ccsm-test-claude".to_string());
+        // Point agent and tmux at a binary that exists on every Unix CI image.
+        app.config.agent_path = Some("/bin/sh".to_string());
+        app.config.tmux_path = Some("/bin/sh".to_string());
+        app.handle_config_tab_event(key(KeyCode::Esc));
+        assert_eq!(app.mode, AppMode::Normal);
+        assert!(app.missing_claude);
+        assert!(!app.missing_agent);
+        assert!(!app.missing_tmux);
+    }
+
+    #[test]
+    fn leaving_config_with_both_agents_missing_is_blocking() {
+        let mut app = App::new(vec![], None, Config::default());
+        app.open_config_tab();
+        app.config.claude_path = Some("/nonexistent/ccsm-test-claude".to_string());
+        app.config.agent_path = Some("/nonexistent/ccsm-test-agent".to_string());
+        app.config.tmux_path = Some("/bin/sh".to_string());
+        app.handle_config_tab_event(key(KeyCode::Esc));
+        assert_eq!(app.mode, AppMode::MissingDeps);
+    }
+
+    #[test]
+    fn the_settings_list_includes_the_agent_binary_row() {
+        let mut app = App::new(vec![], None, Config::default());
+        app.jobs = vec![];
+        app.watch_state = None;
+        app.open_config_tab();
+        let text = config_screen(&mut app, 120, 40);
+        assert!(text.contains("Agent binary"), "{text}");
+        assert!(text.contains("Claude binary"), "{text}");
     }
 
     #[test]
@@ -1485,9 +1552,9 @@ mod tests {
 
         let mut app = App::new(vec![], None, Config::default());
         app.main_tab = MainTab::Config;
-        app.config_selected = 5;
+        app.config_selected = USAGE_PATH_ROW;
         app.handle_config_tab_event(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
-        assert!(app.config_editing, "row 5 must be typeable");
+        assert!(app.config_editing, "usage history row must be typeable");
 
         app.config_path_input = tui_input::Input::from("/tmp/plan-usage-history.json".to_string());
         app.handle_config_tab_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));

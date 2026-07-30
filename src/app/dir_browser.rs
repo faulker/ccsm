@@ -23,6 +23,8 @@ pub enum PickerTarget {
     JobCwd,
     /// Path to the `claude` binary.
     ConfigClaude,
+    /// Path to the Cursor `agent` binary.
+    ConfigAgent,
     /// Path to the `tmux` binary.
     ConfigTmux,
     /// Path to Claude Desktop's `plan-usage-history.json`.
@@ -34,9 +36,10 @@ impl PickerTarget {
     pub fn kind(self) -> PickerKind {
         match self {
             PickerTarget::NewSession | PickerTarget::JobCwd => PickerKind::Directory,
-            PickerTarget::ConfigClaude | PickerTarget::ConfigTmux | PickerTarget::ConfigUsage => {
-                PickerKind::File
-            }
+            PickerTarget::ConfigClaude
+            | PickerTarget::ConfigAgent
+            | PickerTarget::ConfigTmux
+            | PickerTarget::ConfigUsage => PickerKind::File,
         }
     }
 
@@ -46,6 +49,7 @@ impl PickerTarget {
             PickerTarget::NewSession => " New Session \u{2014} Directory ",
             PickerTarget::JobCwd => " Job \u{2014} Working Directory ",
             PickerTarget::ConfigClaude => " Config \u{2014} claude Binary ",
+            PickerTarget::ConfigAgent => " Config \u{2014} agent Binary ",
             PickerTarget::ConfigTmux => " Config \u{2014} tmux Binary ",
             PickerTarget::ConfigUsage => " Config \u{2014} Usage History File ",
         }
@@ -60,9 +64,10 @@ impl PickerTarget {
         match self {
             PickerTarget::NewSession => AppMode::Normal,
             PickerTarget::JobCwd => AppMode::JobForm,
-            PickerTarget::ConfigClaude | PickerTarget::ConfigTmux | PickerTarget::ConfigUsage => {
-                AppMode::Normal
-            }
+            PickerTarget::ConfigClaude
+            | PickerTarget::ConfigAgent
+            | PickerTarget::ConfigTmux
+            | PickerTarget::ConfigUsage => AppMode::Normal,
         }
     }
 }
@@ -350,8 +355,10 @@ impl App {
         match target {
             PickerTarget::NewSession => {
                 self.naming_placeholder = live::generate_auto_name(&path, &self.live_sessions);
+                self.naming_backend = self.default_naming_backend(&path);
                 self.naming_cwd = Some(path);
                 self.naming_input = Input::default();
+                self.naming_focus = NamingFocus::Name;
                 self.mode = AppMode::NamingSession;
             }
             PickerTarget::JobCwd => {
@@ -360,6 +367,10 @@ impl App {
             }
             PickerTarget::ConfigClaude => {
                 self.config.claude_path = Some(path);
+                self.commit_config_path_change();
+            }
+            PickerTarget::ConfigAgent => {
+                self.config.agent_path = Some(path);
                 self.commit_config_path_change();
             }
             PickerTarget::ConfigTmux => {
@@ -379,8 +390,7 @@ impl App {
         if let Err(e) = self.config.save() {
             self.status_error = Some(format!("Failed to save config: {e}"));
         }
-        self.missing_claude = !Config::is_bin_available(self.config.claude_bin());
-        self.missing_tmux = !Config::is_bin_available(self.config.tmux_bin());
+        self.refresh_bin_availability();
         self.missing_usage = crate::usage::source_unavailable(
             &self.config.usage_source,
             self.config.usage_history_override(),

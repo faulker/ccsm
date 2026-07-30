@@ -7,12 +7,12 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::{App, MainTab};
+use crate::app::{App, MainTab, SourceFilter};
 use crate::ui::config_tab::{row_action, RowAction};
 use crate::update::UpdateStatus;
 use crate::theme::{
-    ACCENT_AMBER, ACCENT_BLUE, ACCENT_GREEN, ACCENT_PEACH, ACCENT_RED, FG_OVERLAY, FG_SUBTEXT,
-    FG_TEXT, HIGHLIGHT_BG,
+    ACCENT_AMBER, ACCENT_BLUE, ACCENT_GREEN, ACCENT_PEACH, ACCENT_RED, ACCENT_TEAL, FG_OVERLAY,
+    FG_SUBTEXT, FG_TEXT, HIGHLIGHT_BG,
 };
 
 use super::util::{activity_count_spans, input_spans};
@@ -63,6 +63,13 @@ fn format_reset_duration(reset_at_ms: i64) -> Option<String> {
 /// exist but the watcher heartbeat is stale — a silently dead watcher is the
 /// worst failure mode and must always be visible.
 pub(crate) fn build_usage_status_spans(app: &App) -> Vec<Span<'static>> {
+    // Usage windows are Claude-only; hide the chip when browsing Cursor alone.
+    if app.source_filter == crate::app::SourceFilter::Cursor {
+        return vec![
+            Span::styled(" ⏱ ", Style::default().fg(FG_SUBTEXT)),
+            Span::styled("Claude-only", Style::default().fg(FG_OVERLAY)),
+        ];
+    }
     let job_count = app.jobs.len();
     if job_count == 0 && app.watch_state.is_none() && app.usage.is_none() {
         return Vec::new();
@@ -147,6 +154,19 @@ pub fn build_title_spans(app: &App, width: u16) -> Vec<Span<'static>> {
             " \u{26a1}".into(),
             Style::default().fg(ACCENT_GREEN),
         ));
+    }
+    match app.source_filter {
+        SourceFilter::Both => {}
+        SourceFilter::Claude => badges.push((
+            " [claude]".into(),
+            " C".into(),
+            Style::default().fg(ACCENT_PEACH),
+        )),
+        SourceFilter::Cursor => badges.push((
+            " [cursor]".into(),
+            " A".into(),
+            Style::default().fg(ACCENT_TEAL),
+        )),
     }
 
     let long_total: usize = badges.iter().map(|(l, _, _)| l.width()).sum();
@@ -370,8 +390,16 @@ fn render_hint_row(frame: &mut Frame, hints: &[Hint], area: Rect, styles: &HintS
 }
 
 /// Build the Jobs-tab hints, in display order.
-pub(crate) fn jobs_hints() -> Vec<Hint> {
+///
+/// When the watcher is stopped, `s start` is promoted to P1 so the recovery
+/// key survives the same narrow terminals that used to clip the list banner.
+pub(crate) fn jobs_hints(watch_running: bool) -> Vec<Hint> {
     use HintPriority::*;
+    let watcher = if watch_running {
+        Hint::new("s", " watcher", P3)
+    } else {
+        Hint::new("s", " start", P1)
+    };
     vec![
         Hint::new("↑↓/jk", " nav", P1),
         Hint::new("Enter", " attach", P1),
@@ -383,7 +411,7 @@ pub(crate) fn jobs_hints() -> Vec<Hint> {
         Hint::new("d", " delete", P3),
         Hint::new("f", " done", P3),
         Hint::new("Space", " auto", P3),
-        Hint::new("s", " watcher", P3),
+        watcher,
         Hint::new("L", " log", P3),
         Hint::new("Tab", " sessions", P2),
         Hint::new("?", " help", P0),
@@ -422,7 +450,12 @@ pub(crate) fn config_hints(action: RowAction) -> Vec<Hint> {
 /// `is_live` adds the stop hint only when a live session is selected, since it
 /// is the only one that does nothing otherwise. While Shift is held, the two
 /// hints that change meaning say so rather than silently doing something else.
-pub(crate) fn sessions_hints(is_live: bool, shift_active: bool, is_historical: bool) -> Vec<Hint> {
+pub(crate) fn sessions_hints(
+    is_live: bool,
+    shift_active: bool,
+    is_historical: bool,
+    source_filter: SourceFilter,
+) -> Vec<Hint> {
     use HintPriority::*;
     let nav = if shift_active {
         Hint::new("↑↓/JK", " scroll", P1).shifted()
@@ -433,6 +466,11 @@ pub(crate) fn sessions_hints(is_live: bool, shift_active: bool, is_historical: b
         Hint::new("Enter", " open direct", P1).shifted()
     } else {
         Hint::new("Enter", " open", P1)
+    };
+    let source_label = match source_filter {
+        SourceFilter::Both => " source",
+        SourceFilter::Claude => " claude",
+        SourceFilter::Cursor => " cursor",
     };
     let mut hints = vec![
         nav,
@@ -450,7 +488,13 @@ pub(crate) fn sessions_hints(is_live: bool, shift_active: bool, is_historical: b
         Hint::new("v", " view", P3),
         Hint::new("b", " browse", P3),
         Hint::new("l", " live only", P3),
-        Hint::new("m", " job", P3),
+        Hint::new("s", source_label, P3),
+    ]);
+    // Jobs and usage tracking are Claude-only.
+    if source_filter != SourceFilter::Cursor {
+        hints.push(Hint::new("m", " job", P3));
+    }
+    hints.extend([
         Hint::new("o", " config", P3),
         Hint::new("?", " help", P0),
         Hint::new("q", " quit", P0),
@@ -555,12 +599,13 @@ pub fn render_status_bar(frame: &mut Frame, app: &App, bar_area: Rect) {
         }
 
         let hints = match app.main_tab {
-            MainTab::Jobs => jobs_hints(),
+            MainTab::Jobs => jobs_hints(app.watch_running),
             MainTab::Config => config_hints(row_action(app.config_selected)),
             MainTab::Sessions => sessions_hints(
                 app.selected_live_index().is_some(),
                 app.shift_active,
                 app.is_historical_selected(),
+                app.source_filter,
             ),
         };
 
@@ -756,6 +801,26 @@ mod tests {
     }
 
     #[test]
+    fn jobs_hints_promote_start_when_the_watcher_is_off() {
+        let off = jobs_hints(false);
+        let start = off.iter().find(|h| h.key == "s").expect("s hint");
+        assert_eq!(start.label, " start");
+        assert_eq!(start.priority, HintPriority::P1);
+
+        let on = jobs_hints(true);
+        let watcher = on.iter().find(|h| h.key == "s").expect("s hint");
+        assert_eq!(watcher.label, " watcher");
+        assert_eq!(watcher.priority, HintPriority::P3);
+
+        // At 60 columns the promoted start hint must survive; the old P3
+        // "s watcher" was routinely dropped by select_hints.
+        let mut app = bare_app();
+        app.main_tab = MainTab::Jobs;
+        app.watch_running = false;
+        assert!(bar_text(&app, 60).contains("s start"), "{}", bar_text(&app, 60));
+    }
+
+    #[test]
     fn a_narrow_bar_admits_that_it_dropped_hints() {
         let app = bare_app();
         assert!(bar_text(&app, 60).contains(OVERFLOW_MARKER));
@@ -782,7 +847,7 @@ mod tests {
 
     #[test]
     fn selection_drops_the_lowest_priority_hints_first() {
-        let hints = sessions_hints(false, false, false);
+        let hints = sessions_hints(false, false, false, SourceFilter::Both);
         // Wide enough for the essentials but not for all the P3 extras.
         let chosen = select_hints(&hints, 60).chosen;
         let kept: Vec<HintPriority> = chosen.iter().map(|&i| hints[i].priority).collect();
@@ -801,7 +866,7 @@ mod tests {
 
     #[test]
     fn selection_never_exceeds_the_available_width() {
-        let hints = sessions_hints(true, false, false);
+        let hints = sessions_hints(true, false, false, SourceFilter::Both);
         for width in 1u16..=200 {
             let HintLayout { chosen, overflow } = select_hints(&hints, width);
             let gap = 2usize;
@@ -861,5 +926,45 @@ mod tests {
             .map(|s| s.content.as_ref())
             .collect();
         assert!(title.contains("[live only]"), "{title}");
+    }
+
+    #[test]
+    fn source_filter_badge_appears_when_narrowed() {
+        let mut app = bare_app();
+        app.source_filter = SourceFilter::Claude;
+        let title: String = build_title_spans(&app, 120)
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(title.contains("[claude]"), "{title}");
+        assert!(!title.contains("[cursor]"), "{title}");
+
+        app.source_filter = SourceFilter::Cursor;
+        let title: String = build_title_spans(&app, 120)
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(title.contains("[cursor]"), "{title}");
+
+        app.source_filter = SourceFilter::Both;
+        let title: String = build_title_spans(&app, 120)
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(!title.contains("[claude]"), "{title}");
+        assert!(!title.contains("[cursor]"), "{title}");
+    }
+
+    #[test]
+    fn sessions_hints_include_the_source_filter_key() {
+        let both = sessions_hints(false, false, false, SourceFilter::Both);
+        assert!(both.iter().any(|h| h.key == "s" && h.label.contains("source")));
+
+        let claude = sessions_hints(false, false, false, SourceFilter::Claude);
+        assert!(claude.iter().any(|h| h.key == "s" && h.label.contains("claude")));
+
+        let cursor = sessions_hints(false, false, false, SourceFilter::Cursor);
+        assert!(cursor.iter().any(|h| h.key == "s" && h.label.contains("cursor")));
+        assert!(!cursor.iter().any(|h| h.key == "m"), "job hint hidden when Cursor-only");
     }
 }

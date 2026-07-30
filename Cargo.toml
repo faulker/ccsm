@@ -21,3 +21,6 @@ tui-input = "0.10"
 regex = "1"
 sha2 = "0.10"
 uuid = { version = "1.24.0", features = ["v4"] }
+# Pin 0.37: 0.40 pulls libsqlite3-sys 0.38 whose build script uses unstable
+# cfg_select! and fails on rustc 1.93.0.
+rusqlite = { version = "0.37", features = ["bundled"] }

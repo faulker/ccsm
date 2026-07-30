@@ -67,12 +67,18 @@ pub struct Config {
     /// When true, only projects with active live sessions are shown.
     #[serde(default)]
     pub live_filter: bool,
+    /// Which agent backends to show: `"both"`, `"claude"`, or `"cursor"`.
+    #[serde(default = "default_source_filter")]
+    pub source_filter: String,
     /// Set of project paths that are pinned to the top of the list.
     #[serde(default)]
     pub favorites: HashSet<String>,
     /// Custom path to the `claude` binary (None = look up "claude" on PATH).
     #[serde(default)]
     pub claude_path: Option<String>,
+    /// Custom path to the Cursor `agent` binary (None = look up "agent" on PATH).
+    #[serde(default)]
+    pub agent_path: Option<String>,
     /// Custom path to the `tmux` binary (None = look up "tmux" on PATH).
     #[serde(default)]
     pub tmux_path: Option<String>,
@@ -130,8 +136,10 @@ impl Default for Config {
             group_chains: true,
             last_update_check: None,
             live_filter: false,
+            source_filter: default_source_filter(),
             favorites: HashSet::new(),
             claude_path: None,
+            agent_path: None,
             tmux_path: None,
             usage_history_path: None,
             usage_pause_percent: default_pause_percent(),
@@ -182,6 +190,11 @@ fn default_usage_max_age_seconds() -> u64 {
 /// Serde default helper for `usage_source`.
 fn default_usage_source() -> String {
     "auto".to_string()
+}
+
+/// Serde default helper for `source_filter`.
+fn default_source_filter() -> String {
+    "both".to_string()
 }
 
 /// Serde default helper for `continue_prompt`.
@@ -248,6 +261,11 @@ impl Config {
         self.claude_path.as_deref().unwrap_or("claude")
     }
 
+    /// Returns the configured Cursor agent binary path, or `"agent"` if unset.
+    pub fn agent_bin(&self) -> &str {
+        self.agent_path.as_deref().unwrap_or("agent")
+    }
+
     /// Returns the configured tmux binary path, or `"tmux"` if unset.
     pub fn tmux_bin(&self) -> &str {
         self.tmux_path.as_deref().unwrap_or("tmux")
@@ -308,6 +326,14 @@ mod tests {
         assert_eq!(config.display_mode, DisplayMode::Name);
         assert!(config.hide_empty);
         assert!(config.group_chains);
+        assert_eq!(config.source_filter, "both");
+    }
+
+    #[test]
+    fn test_config_backward_compat_without_source_filter() {
+        let json = r#"{"tree_view": true, "display_mode": "name"}"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(config.source_filter, "both");
     }
 
     #[test]
@@ -493,6 +519,7 @@ mod tests {
         let json = r#"{"tree_view": true, "display_mode": "name"}"#;
         let config: Config = serde_json::from_str(json).unwrap();
         assert_eq!(config.claude_path, None);
+        assert_eq!(config.agent_path, None);
         assert_eq!(config.tmux_path, None);
     }
 
@@ -500,6 +527,12 @@ mod tests {
     fn test_claude_bin_default() {
         let config = Config::default();
         assert_eq!(config.claude_bin(), "claude");
+    }
+
+    #[test]
+    fn test_agent_bin_default() {
+        let config = Config::default();
+        assert_eq!(config.agent_bin(), "agent");
     }
 
     #[test]
@@ -516,6 +549,13 @@ mod tests {
     }
 
     #[test]
+    fn test_agent_bin_custom() {
+        let mut config = Config::default();
+        config.agent_path = Some("/usr/local/bin/agent".to_string());
+        assert_eq!(config.agent_bin(), "/usr/local/bin/agent");
+    }
+
+    #[test]
     fn test_tmux_bin_custom() {
         let mut config = Config::default();
         config.tmux_path = Some("/opt/bin/tmux".to_string());
@@ -526,6 +566,7 @@ mod tests {
     fn test_config_paths_roundtrip() {
         let mut config = Config::default();
         config.claude_path = Some("/usr/local/bin/claude".to_string());
+        config.agent_path = Some("/usr/local/bin/agent".to_string());
         config.tmux_path = Some("/opt/bin/tmux".to_string());
         let json = serde_json::to_string_pretty(&config).unwrap();
         let loaded: Config = serde_json::from_str(&json).unwrap();
@@ -533,6 +574,7 @@ mod tests {
             loaded.claude_path,
             Some("/usr/local/bin/claude".to_string())
         );
+        assert_eq!(loaded.agent_path, Some("/usr/local/bin/agent".to_string()));
         assert_eq!(loaded.tmux_path, Some("/opt/bin/tmux".to_string()));
     }
 

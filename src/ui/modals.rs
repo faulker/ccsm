@@ -6,7 +6,8 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::{HelpTab, NewSessionMode};
+use crate::app::{HelpTab, NamingFocus, NewSessionMode};
+use crate::data::AgentBackend;
 use crate::theme::{
     ACCENT_BLUE, ACCENT_GREEN, ACCENT_MAUVE, ACCENT_PEACH, ACCENT_RED, BG_SURFACE, FG_OVERLAY,
     FG_SUBTEXT, FG_TEXT,
@@ -14,58 +15,113 @@ use crate::theme::{
 
 use super::util::{centered_rect_min, input_spans, input_spans_with_placeholder};
 
+/// Style for a naming-popup switcher value: reversed when that row is focused.
+fn switcher_value_style(focused: bool, accent: ratatui::style::Color) -> Style {
+    if focused {
+        Style::default()
+            .fg(accent)
+            .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+    } else {
+        Style::default().fg(FG_SUBTEXT)
+    }
+}
+
 /// Render the centered popup for naming a new live session, showing a placeholder when the buffer is empty.
 ///
-/// The popup owns the launch mode: a mode row lists plain / danger / worktree /
-/// direct, Tab cycles between them, and the title and border colour follow the
-/// selection. `cwd_is_repo` dims `worktree` when it cannot apply.
+/// Focus starts on the name. Down moves to Agent (when `show_backend_choice`)
+/// then Type; Left/Right cycle the focused switcher. The title and border
+/// colour follow the selected launch mode. `cwd_is_repo` dims worktree when
+/// it cannot apply (cycle_naming_mode already skips it).
 pub fn draw_naming_popup(
     frame: &mut Frame,
     input: &tui_input::Input,
     placeholder: &str,
     mode: NewSessionMode,
-    cwd_is_repo: bool,
+    _cwd_is_repo: bool,
+    backend: AgentBackend,
+    show_backend_choice: bool,
+    focus: NamingFocus,
 ) {
-    // Two content rows now (the name and the mode row) plus the border. The
-    // minimum width is set by the mode row, which must show all four labels:
-    // a popup that clips "direct" off the end is worse than no mode row.
-    let area = centered_rect_min(56, 4, 48, 4, frame.area());
+    let min_h = if show_backend_choice { 5 } else { 4 };
+    let area = centered_rect_min(56, min_h, 48, min_h, frame.area());
     frame.render_widget(Clear, area);
 
+    let name_focused = focus == NamingFocus::Name;
     let name_line = if mode.needs_name() {
-        Line::from(input_spans_with_placeholder(
-            input,
-            Style::default().fg(FG_TEXT),
-            placeholder,
-        ))
+        let mut spans = if name_focused {
+            input_spans_with_placeholder(input, Style::default().fg(FG_TEXT), placeholder)
+        } else {
+            let value = if input.value().is_empty() {
+                placeholder.to_string()
+            } else {
+                input.value().to_string()
+            };
+            vec![Span::styled(value, Style::default().fg(FG_OVERLAY))]
+        };
+        spans.insert(
+            0,
+            Span::styled(
+                if name_focused { "> " } else { "  " },
+                Style::default().fg(if name_focused {
+                    ACCENT_PEACH
+                } else {
+                    FG_OVERLAY
+                }),
+            ),
+        );
+        Line::from(spans)
     } else {
-        // A direct session never reaches tmux, so it has no name to give.
-        Line::from(Span::styled(
-            "(no tmux session — name unused)",
-            Style::default().fg(FG_OVERLAY),
-        ))
+        Line::from(vec![
+            Span::styled(
+                if name_focused { "> " } else { "  " },
+                Style::default().fg(FG_OVERLAY),
+            ),
+            Span::styled(
+                "(no tmux session — name unused)",
+                Style::default().fg(FG_OVERLAY),
+            ),
+        ])
     };
 
-    // The mode row doubles as the list of choices, so the available modes are
-    // always visible rather than being something you have to Tab through blind.
-    let mut mode_spans: Vec<Span> = vec![Span::styled("  ", Style::default())];
-    for m in NewSessionMode::ALL {
-        let selectable = m != NewSessionMode::Worktree || cwd_is_repo;
-        let style = if m == mode {
-            Style::default()
-                .fg(ACCENT_PEACH)
-                .add_modifier(Modifier::BOLD | Modifier::REVERSED)
-        } else if selectable {
-            Style::default().fg(FG_SUBTEXT)
-        } else {
-            Style::default().fg(FG_OVERLAY).add_modifier(Modifier::DIM)
-        };
-        mode_spans.push(Span::styled(format!(" {} ", m.label()), style));
-        mode_spans.push(Span::raw(" "));
-    }
-    mode_spans.push(Span::styled("Tab", Style::default().fg(FG_OVERLAY)));
+    let mut content = vec![name_line];
 
-    let content = vec![name_line, Line::from(mode_spans)];
+    if show_backend_choice {
+        let agent_focused = focus == NamingFocus::Agent;
+        content.push(Line::from(vec![
+            Span::styled(
+                if agent_focused { "> " } else { "  " },
+                Style::default().fg(if agent_focused {
+                    ACCENT_BLUE
+                } else {
+                    FG_OVERLAY
+                }),
+            ),
+            Span::styled("Agent: ", Style::default().fg(FG_SUBTEXT)),
+            Span::styled(
+                format!(" {} ", backend.label()),
+                switcher_value_style(agent_focused, ACCENT_BLUE),
+            ),
+            Span::styled(" ←/→", Style::default().fg(FG_OVERLAY)),
+        ]));
+    }
+
+    let type_focused = focus == NamingFocus::Type;
+    content.push(Line::from(vec![
+        Span::styled(
+            if type_focused { "> " } else { "  " },
+            Style::default().fg(if type_focused {
+                ACCENT_PEACH
+            } else {
+                FG_OVERLAY
+            }),
+        ),
+        Span::styled("Type: ", Style::default().fg(FG_SUBTEXT)),
+        Span::styled(
+            format!(" {} ", mode.label()),
+            switcher_value_style(type_focused, ACCENT_PEACH),
+        ),
+        Span::styled(" ←/→", Style::default().fg(FG_OVERLAY)),
+    ]));
 
     let (title, border_color) = match mode {
         NewSessionMode::Dangerous => {
@@ -360,23 +416,38 @@ fn sessions_help_lines() -> Vec<Line<'static>> {
         help_row("Enter", "Open selected session (via tmux)"),
         help_row("Shift+Enter", "Open historical session directly (no tmux)"),
         Line::from(""),
+        help_header("Session marks"),
+        help_row("C", "Claude Code session"),
+        help_row("A", "Cursor Agent session"),
+        help_row(
+            "",
+            "The preview info bar names the agent as Claude or Cursor",
+        ),
+        Line::from(""),
         help_header("Actions"),
-        help_row("n", "New session popup (Tab picks plain/danger/worktree/direct)"),
+        help_row("n", "New session popup (↓ then ←/→ pick agent and type)"),
         help_row("b", "Browse filesystem to choose a directory for a new session"),
-        help_row("m", "Create/edit a job prefilled from the current selection"),
+        help_row("m", "Create/edit a job prefilled from the current selection (Claude only)"),
         help_row("x", "Stop selected live session (asks first)"),
         help_row("l", "Toggle live-only filter"),
+        help_row("s", "Cycle source filter: both → Claude → Cursor"),
         help_row("v", "Cycle view mode (tree / flat / grouped)"),
-        help_row("r", "Rename selected session or live session"),
+        help_row("r", "Rename selected Claude session or live tmux session"),
         help_row("Space", "Toggle favorite — pins project to top of list (★)"),
         help_row("o", "Jump to the Config tab"),
         Line::from(""),
         help_header("New session popup"),
-        help_row("Tab", "Cycle launch mode: plain, danger, worktree, direct"),
+        help_row("↓/↑", "Move focus: name → Agent → Type"),
+        help_row("←/→", "On Agent: cycle Claude Code / Cursor Agent"),
+        help_row("←/→", "On Type: cycle plain, danger, worktree, direct"),
         help_row("", "  plain     normal live session in tmux"),
-        help_row("", "  danger    adds --dangerously-skip-permissions"),
+        help_row("", "  danger    adds --dangerously-skip-permissions (Claude) or --force (Cursor)"),
         help_row("", "  worktree  its own git worktree (git repos only)"),
         help_row("", "  direct    no tmux; the name is unused"),
+        help_row(
+            "Agent",
+            "Both backends: defaults to last used in that directory",
+        ),
         help_row("Enter", "Launch (an empty name uses the suggested one)"),
         help_row("Esc", "Cancel"),
         Line::from(""),
@@ -391,6 +462,10 @@ fn sessions_help_lines() -> Vec<Line<'static>> {
         help_row("←/→  Home/End", "Move the cursor within the name"),
         help_row("Enter", "Save new name"),
         help_row("Esc", "Cancel rename"),
+        help_row(
+            "Cursor",
+            "Chat titles can't be renamed here — use /rename inside the agent",
+        ),
     ]
 }
 
@@ -398,6 +473,10 @@ fn sessions_help_lines() -> Vec<Line<'static>> {
 fn jobs_help_lines() -> Vec<Line<'static>> {
     vec![
         help_header("Jobs tab"),
+        help_row(
+            "scope",
+            "Scheduler jobs are Claude-only — Cursor chats cannot be managed as jobs",
+        ),
         help_row("j/k  ↑/↓", "Move between jobs"),
         help_row("Enter", "Attach to the job's tmux session"),
         help_row("n / e", "New / edit job"),
@@ -423,7 +502,7 @@ fn jobs_help_lines() -> Vec<Line<'static>> {
         help_header("How the watcher works"),
         help_row("pause", "Jobs pause once usage reaches the configured pause %"),
         help_row("resume", "Auto-resume jobs restart when usage falls or resets"),
-        help_row("state", "The tab title shows watcher on/off; off means nothing runs"),
+        help_row("state", "List title shows watcher on/off; OFF banner means nothing runs"),
         help_row("done", "Agents end with CCSM_JOB_COMPLETE; that job stops for good"),
         help_row("idle", "A job idle past the Config tab's idle-completion time also finishes"),
     ]

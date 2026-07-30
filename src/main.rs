@@ -48,7 +48,7 @@ fn restore_terminal() -> Result<()> {
     Ok(())
 }
 
-/// Build the argv for a brand-new claude session. The worktree name is given
+/// Build the argv for a brand-new Claude session. The worktree name is given
 /// explicitly rather than relying on `-w`'s optional value, so the following
 /// `--name` is never parsed as the worktree's name.
 fn new_session_argv(claude: &str, name: &str, dangerous: bool, worktree: bool) -> Vec<String> {
@@ -63,6 +63,33 @@ fn new_session_argv(claude: &str, name: &str, dangerous: bool, worktree: bool) -
     argv.push("--name".to_string());
     argv.push(name.to_string());
     argv
+}
+
+/// Build the argv for a brand-new Cursor Agent session.
+///
+/// Always includes `--trust`: without it an unseen workspace prints
+/// "Workspace Trust Required" and waits, which looks like a hang in tmux.
+/// Cursor has no `--name` flag; `name` is only used for `--worktree`.
+fn cursor_new_session_argv(agent: &str, name: &str, dangerous: bool, worktree: bool) -> Vec<String> {
+    let mut argv = vec![agent.to_string(), "--trust".to_string()];
+    if dangerous {
+        argv.push("--force".to_string());
+    }
+    if worktree {
+        argv.push("--worktree".to_string());
+        argv.push(name.to_string());
+    }
+    argv
+}
+
+/// Build the argv to resume a Cursor chat (`agent --trust --resume <id>`).
+fn cursor_resume_argv(agent: &str, session_id: &str) -> Vec<String> {
+    vec![
+        agent.to_string(),
+        "--trust".to_string(),
+        "--resume".to_string(),
+        session_id.to_string(),
+    ]
 }
 
 /// Run the main TUI event loop. Spawns a background update check, handles session
@@ -90,11 +117,13 @@ fn run_app(
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|_| ".".to_string());
         let name = live::generate_auto_name(&cwd, &app.live_sessions);
+        // `--new` stays Claude-only for backward compatibility.
         app.launch_session = Some(app::LaunchRequest::NewLive {
             name,
             cwd,
             dangerous: false,
             worktree: false,
+            backend: data::AgentBackend::ClaudeCode,
         });
     }
 
@@ -103,8 +132,9 @@ fn run_app(
     // letting it quietly mis-manage jobs for the rest of the session.
     app.restart_outdated_watcher();
 
-    // Always spawn background update check (non-blocking)
-    {
+    // Skip update checks in debug builds (`cargo run`) so local development
+    // is never interrupted by a release prompt against a different binary.
+    if update::updates_enabled() {
         let (tx, rx) = std::sync::mpsc::channel();
         app.update_receiver = Some(rx);
         std::thread::spawn(move || {
@@ -221,40 +251,105 @@ fn run_app(
             let cfg = config::Config::load();
             let tmux = cfg.tmux_bin().to_string();
             let claude = cfg.claude_bin().to_string();
+            let agent = cfg.agent_bin().to_string();
             // A launch failure (most often attaching to a session that died
             // between selecting it and exiting the TUI) must not take the whole
             // app down: report it in the status bar and stay in the TUI.
             let outcome: anyhow::Result<()> = (|| {
                 match req {
-                    app::LaunchRequest::Resume { session_id, cwd } => {
+                    app::LaunchRequest::Resume {
+                        session_id,
+                        cwd,
+                        backend,
+                    } => {
                         let dir = if std::path::Path::new(&cwd).exists() { &cwd } else { "." };
                         let live_sessions = live::discover_live_sessions(&tmux);
                         let tmux_name = live::generate_auto_name(dir, &live_sessions);
-                        live::start_live_session(&tmux, &tmux_name, dir, &[&claude, "--resume", &session_id])?;
+                        match backend {
+                            data::AgentBackend::ClaudeCode => {
+                                live::start_live_session(
+                                    &tmux,
+                                    &tmux_name,
+                                    dir,
+                                    &[&claude, "--resume", &session_id],
+                                    Some(backend),
+                                )?;
+                            }
+                            data::AgentBackend::CursorAgent => {
+                                let argv = cursor_resume_argv(&agent, &session_id);
+                                let argv_refs: Vec<&str> =
+                                    argv.iter().map(|s| s.as_str()).collect();
+                                live::start_live_session(
+                                    &tmux,
+                                    &tmux_name,
+                                    dir,
+                                    &argv_refs,
+                                    Some(backend),
+                                )?;
+                            }
+                        }
                         live::attach_to_session(&tmux, &tmux_name)?;
                     }
-                    app::LaunchRequest::Direct { session_id, cwd } => {
+                    app::LaunchRequest::Direct {
+                        session_id,
+                        cwd,
+                        backend,
+                    } => {
                         let dir = if std::path::Path::new(&cwd).exists() { &cwd } else { "." };
-                        std::process::Command::new(&claude)
-                            .arg("--resume")
-                            .arg(&session_id)
-                            .current_dir(dir)
-                            .status()?;
+                        match backend {
+                            data::AgentBackend::ClaudeCode => {
+                                std::process::Command::new(&claude)
+                                    .arg("--resume")
+                                    .arg(&session_id)
+                                    .current_dir(dir)
+                                    .status()?;
+                            }
+                            data::AgentBackend::CursorAgent => {
+                                let argv = cursor_resume_argv(&agent, &session_id);
+                                std::process::Command::new(&argv[0])
+                                    .args(&argv[1..])
+                                    .current_dir(dir)
+                                    .status()?;
+                            }
+                        }
                     }
                     app::LaunchRequest::AttachLive { tmux_name } => {
                         live::attach_to_session(&tmux, &tmux_name)?;
                     }
-                    app::LaunchRequest::NewLive { name, cwd, dangerous, worktree } => {
-                        let argv = new_session_argv(&claude, &name, dangerous, worktree);
+                    app::LaunchRequest::NewLive {
+                        name,
+                        cwd,
+                        dangerous,
+                        worktree,
+                        backend,
+                    } => {
+                        let argv = match backend {
+                            data::AgentBackend::ClaudeCode => {
+                                new_session_argv(&claude, &name, dangerous, worktree)
+                            }
+                            data::AgentBackend::CursorAgent => {
+                                cursor_new_session_argv(&agent, &name, dangerous, worktree)
+                            }
+                        };
                         let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
-                        live::start_live_session(&tmux, &name, &cwd, &argv_refs)?;
+                        live::start_live_session(&tmux, &name, &cwd, &argv_refs, Some(backend))?;
                         live::attach_to_session(&tmux, &name)?;
                     }
-                    app::LaunchRequest::NewDirect { cwd } => {
+                    app::LaunchRequest::NewDirect { cwd, backend } => {
                         let dir = if std::path::Path::new(&cwd).exists() { &cwd } else { "." };
-                        std::process::Command::new(&claude)
-                            .current_dir(dir)
-                            .status()?;
+                        match backend {
+                            data::AgentBackend::ClaudeCode => {
+                                std::process::Command::new(&claude)
+                                    .current_dir(dir)
+                                    .status()?;
+                            }
+                            data::AgentBackend::CursorAgent => {
+                                std::process::Command::new(&agent)
+                                    .arg("--trust")
+                                    .current_dir(dir)
+                                    .status()?;
+                            }
+                        }
                     }
                 }
                 Ok(())
@@ -263,7 +358,7 @@ fn run_app(
                 app.status_error = Some(format!("{e:#}"));
             }
             // Reload sessions after returning from any launch
-            if let Ok(sessions) = data::load_sessions(filter_path.as_deref()) {
+            if let Ok(sessions) = data::load_all_sessions(filter_path.as_deref()) {
                 app.reload_sessions(sessions);
             }
             app.reload_live_sessions();
@@ -358,22 +453,32 @@ fn main() -> Result<()> {
         let live_sessions = live::discover_live_sessions(&tmux);
         let tmux_name = live::generate_auto_name(&cwd, &live_sessions);
         let claude = cfg.claude_bin().to_string();
-        live::start_live_session(&tmux, &tmux_name, &cwd, &[&claude])?;
+        live::start_live_session(
+            &tmux,
+            &tmux_name,
+            &cwd,
+            &[&claude],
+            Some(data::AgentBackend::ClaudeCode),
+        )?;
         live::switch_to_session(&tmux, &tmux_name)?;
         return Ok(());
     }
 
-    let sessions = data::load_sessions(filter_path.as_deref())?;
+    let sessions = data::load_all_sessions(filter_path.as_deref())?;
     if sessions.is_empty() && !live::is_server_running(&config::Config::load().tmux_bin().to_string()) {
         if filter_path.is_some() {
-            eprintln!("No Claude Code sessions found for the specified path");
+            eprintln!("No agent sessions found for the specified path");
         } else {
-            let history_path = dirs::home_dir()
+            let claude_history = dirs::home_dir()
                 .map(|h| h.join(".claude").join("history.jsonl"))
                 .unwrap_or_else(|| PathBuf::from("~/.claude/history.jsonl"));
+            let cursor_chats = dirs::home_dir()
+                .map(|h| h.join(".cursor").join("chats"))
+                .unwrap_or_else(|| PathBuf::from("~/.cursor/chats"));
             eprintln!(
-                "No Claude Code sessions found in {}",
-                history_path.display()
+                "No agent sessions found in {} or {}",
+                claude_history.display(),
+                cursor_chats.display()
             );
         }
         return Ok(());
@@ -418,7 +523,7 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::new_session_argv;
+    use super::{cursor_new_session_argv, cursor_resume_argv, new_session_argv};
 
     #[test]
     fn plain_new_session_only_names_itself() {
@@ -459,5 +564,50 @@ mod tests {
                 "x"
             ]
         );
+    }
+
+    #[test]
+    fn cursor_plain_new_session_always_trusts() {
+        assert_eq!(
+            cursor_new_session_argv("agent", "ccsm-A", false, false),
+            vec!["agent", "--trust"]
+        );
+    }
+
+    #[test]
+    fn cursor_danger_uses_force() {
+        assert_eq!(
+            cursor_new_session_argv("agent", "ccsm-A", true, false),
+            vec!["agent", "--trust", "--force"]
+        );
+    }
+
+    #[test]
+    fn cursor_worktree_names_the_worktree() {
+        assert_eq!(
+            cursor_new_session_argv("agent", "ccsm-A", false, true),
+            vec!["agent", "--trust", "--worktree", "ccsm-A"]
+        );
+    }
+
+    #[test]
+    fn cursor_resume_always_trusts() {
+        assert_eq!(
+            cursor_resume_argv("agent", "275655ab-96cf-4235-8df0-5b3890b431da"),
+            vec![
+                "agent",
+                "--trust",
+                "--resume",
+                "275655ab-96cf-4235-8df0-5b3890b431da"
+            ]
+        );
+    }
+
+    #[test]
+    fn cursor_trust_is_present_on_every_new_mode() {
+        for (dangerous, worktree) in [(false, false), (true, false), (false, true), (true, true)] {
+            let argv = cursor_new_session_argv("/opt/agent", "n", dangerous, worktree);
+            assert_eq!(argv[1], "--trust", "missing --trust for d={dangerous} w={worktree}");
+        }
     }
 }

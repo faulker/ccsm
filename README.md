@@ -1,6 +1,6 @@
 # ccsm — Claude Code Session Manager
 
-A terminal UI that puts all your Claude Code sessions in one place. Browse past conversations, resume where you left off, and spin up new sessions — all without leaving the terminal. If you juggle multiple projects or frequently context-switch between Claude sessions, ccsm keeps everything organized and a keystroke away so you can stay in flow.
+A terminal UI that puts your Claude Code and Cursor Agent CLI sessions in one place. Browse past conversations, resume where you left off, and spin up new sessions — all without leaving the terminal. If you juggle multiple projects or frequently context-switch between agent sessions, ccsm keeps everything organized and a keystroke away so you can stay in flow.
 
 ## Screenshots
 
@@ -42,19 +42,20 @@ Press `?` for the keybinding reference. It opens on the page matching the tab yo
 ## Features
 
 - **Tabbed main window** — `Tab` cycles the Sessions browser, the Jobs manager, and Config; all three use the same list + detail layout
+- **Claude + Cursor** — one merged list of Claude Code sessions (`~/.claude/`) and Cursor Agent CLI chats (`~/.cursor/chats/`); rows are marked `C` (Claude Code) / `A` (Cursor Agent), the preview info bar shows `Claude` or `Cursor`, and `s` cycles both → Claude → Cursor
 - **Tree & flat views** — browse sessions grouped by project or as a flat list; cycle display modes with `v`, or from the Config tab's **View** row
 - **Conversation preview** — scrollable preview of the last 20 turns with working directory and git branch in the info bar
 - **Resume anywhere** — resume a session in tmux (`Enter`) or directly in the foreground (`Shift+Enter`)
-- **Live sessions** — start, attach, detach, rename, and stop tmux-backed Claude sessions; running sessions surface at the top with activity indicators (● active, ● idle, ▶ waiting) and real-time pane preview
-- **Quick launch** — `n` opens one popup for every launch mode (`Tab` cycles plain, skip-permissions, git worktree, and foreground session, or `ccsm --new` / `ccsm --spawn` to skip the TUI entirely
-- **Usage-aware scheduling** — dispatch sessions with a prompt, pause them automatically before your 5-hour budget runs out, and continue them when it resets, all without being at the keyboard (Jobs tab, `Tab`)
+- **Live sessions** — start, attach, detach, rename, and stop tmux-backed agent sessions; running sessions surface at the top with activity indicators (● active, ● idle, ▶ waiting) and real-time pane preview
+- **Quick launch** — `n` opens one popup for every launch mode (`↓` moves to Agent / Type, `←`/`→` cycle the focused row; when showing both backends, Agent defaults to the last agent used in that directory). `ccsm --new` / `ccsm --spawn` stay Claude-only
+- **Usage-aware scheduling** — Claude-only for now: dispatch sessions with a prompt, pause them automatically before your 5-hour budget runs out, and continue them when it resets (Jobs tab, `Tab`). Cursor chats cannot be managed as jobs
 - **Jobs know when they are finished** — every dispatched prompt asks the agent to sign off with `CCSM_JOB_COMPLETE`, which the watcher reads from the session transcript; a job that reports it (or sits idle past a configurable window) is marked done, its session stopped, and it is never re-dispatched
-- **Usage always in view** — the tab strip shows your current usage percentage, the time until the window resets, and a red `⏱ off` if the watcher daemon has died, on every tab
-- **Directory browser** — browse for any path the app needs: a new session's directory (`b`), a job's working directory, or the `claude`/`tmux` binaries and the usage history file on the Config tab — and type it by hand instead if you prefer
+- **Usage always in view** — the tab strip shows your current Claude usage percentage (hidden when the source filter is Cursor-only), the time until the window resets, and a red `⏱ off` if the watcher daemon has died
+- **Directory browser** — browse for any path the app needs: a new session's directory (`b`), a job's working directory, or the `claude` / `agent` / `tmux` binaries and the usage history file on the Config tab — and type it by hand instead if you prefer
 - **Full cursor editing** — every text field supports `←`/`→`, `Ctrl+←`/`→` by word, `Home`/`End`, `Ctrl+W`, and `Ctrl+U`
 - **Duplicate detection** — catches duplicate session names with options to open, rename, or cancel
-- **Search & filter** — filter by project name or path; toggle live-only mode with `l`
-- **Favorites** — pin projects to the top of the list with `f`
+- **Search & filter** — filter by project name or path; toggle live-only mode with `l`; cycle the Claude/Cursor source filter with `s`
+- **Favorites** — pin projects to the top of the list with `Space`
 - **Mouse scroll** — scroll the preview pane with the mouse wheel; auto-scrolls to bottom for live sessions
 - **Config tab** — settings grouped into **Sessions**, **Jobs manager**, and **About** sections, with the selected one explained in the pane beside it; `o` jumps straight there
 - **Auto-update** — background update checks with one-key install, SHA256 checksum verification, and automatic restart
@@ -65,8 +66,8 @@ Press `?` for the keybinding reference. It opens on the page matching the tab yo
 ## Requirements
 
 - **macOS** (ARM64, x86_64), **Linux** (x86_64, ARM64), or **Windows** (x86_64)
-- [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) installed and on your `PATH`
-- Existing session history in `~/.claude/`
+- At least one agent CLI on your `PATH`: [Claude Code](https://docs.anthropic.com/en/docs/claude-code) (`claude`) and/or [Cursor Agent CLI](https://cursor.com/docs/cli/overview) (`agent`). Having only one installed is fine — listing and previewing Cursor chats needs no binary at all
+- Session history in `~/.claude/` and/or Cursor chats in `~/.cursor/chats/`
 - `tmux` installed for live session support (optional — history browsing works without it)
   - **macOS:** `brew install tmux` (requires [Homebrew](https://brew.sh))
   - **Linux:** `sudo apt install tmux` / `sudo dnf install tmux` / your distro's package manager
@@ -208,13 +209,14 @@ Back in the TUI, live sessions appear at the top of the list with activity indic
 | `/` | Activate search/filter mode |
 | `o` | Jump to the Config tab (Sessions / Jobs manager / About sections) |
 | `Space` | Toggle favorite — pins project to top of list (shown with ★) |
-| `n` | New session popup — `Tab` cycles plain / danger / worktree / direct |
+| `n` | New session popup — `Tab` cycles plain / danger / worktree / direct; with both sources, empty-name `a` cycles Claude / Cursor |
 | `v` | Cycle the view mode (tree / flat / grouped) |
 | `l` | Toggle live-only filter (show only running sessions) |
-| `r` | Rename selected session or live session |
+| `s` | Cycle source filter: both → Claude only → Cursor only |
+| `r` | Rename selected Claude session or live tmux session (Cursor titles: `/rename` inside the agent) |
 | `x` | Stop selected live session (asks for confirmation) |
 | `b` | Browse for a directory to start a new session in |
-| `m` | Manage the selected session as a job (adopt live or historical) |
+| `m` | Manage the selected Claude session as a job (Cursor chats are not job-eligible) |
 | `?` | Open help overlay |
 | `q` / `Ctrl+C` | Quit |
 | `Esc` | Back out of a popup or clear the filter — never quits |
@@ -287,6 +289,8 @@ When naming a new live session (after selecting a directory):
 | Key | Action |
 |---|---|
 | Type characters | Enter session name (placeholder shown if left blank) |
+| `↓` / `↑` | Move focus between name, Agent (when both backends), and Type |
+| `←` / `→` | On Agent: cycle Claude Code / Cursor Agent; on Type: cycle plain / danger / worktree / direct; on name: move the cursor |
 | `Enter` | Confirm name and launch session |
 | `Esc` | Cancel |
 
@@ -309,8 +313,8 @@ Live sessions are tmux-backed Claude Code sessions managed through a dedicated t
 - **● Amber** — idle (waiting at the prompt)
 - **▶ Red** — waiting (Claude is asking for user input/approval)
 
-- **Start**: press `n`, then `Tab` to pick the launch mode (`plain` for a named live tmux session in the current project dir, `direct` for claude in the foreground with no tmux)
-- **Start in a worktree**: press `n` and `Tab` to the `worktree` mode, which launches with `claude --worktree <session name>` so the session gets its own git worktree and branch instead of sharing your checkout. The mode is dimmed and unselectable outside a git repository, so ccsm refuses up front rather than letting claude fail inside a tmux session you would have to attach to first.
+- **Start**: press `n`, then `↓` to the `Type` row and `←`/`→` to pick the launch mode (`plain` for a named live tmux session in the current project dir, `direct` for the agent in the foreground with no tmux)
+- **Start in a worktree**: press `n`, focus `Type`, and cycle to `worktree`, which launches with `claude --worktree <session name>` so the session gets its own git worktree and branch instead of sharing your checkout. The mode is skipped outside a git repository, so ccsm refuses up front rather than letting the agent fail inside a tmux session you would have to attach to first.
 - **Attach**: press `Enter` on any live session to attach
 - **Detach**: press `Ctrl+\` inside a live session to return to ccsm
 - **Navigate**: use `Ctrl+n` / `Ctrl+p` to cycle between live sessions without detaching

@@ -1,9 +1,63 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-/// Summary record for one Claude session, built from `~/.claude/history.jsonl`.
+/// Which agent CLI produced a session listed in ccsm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentBackend {
+    /// Claude Code sessions under `~/.claude/`.
+    #[default]
+    ClaudeCode,
+    /// Cursor Agent CLI chats under `~/.cursor/chats/`.
+    CursorAgent,
+}
+
+impl AgentBackend {
+    /// Full display name for the info bar, help, and naming popup.
+    pub fn label(self) -> &'static str {
+        match self {
+            AgentBackend::ClaudeCode => "Claude Code",
+            AgentBackend::CursorAgent => "Cursor Agent",
+        }
+    }
+
+    /// Short name for the preview info bar (`Claude` / `Cursor`).
+    pub fn short_label(self) -> &'static str {
+        match self {
+            AgentBackend::ClaudeCode => "Claude",
+            AgentBackend::CursorAgent => "Cursor",
+        }
+    }
+
+    /// One-letter session-list mark (`C` Claude Code, `A` Cursor Agent).
+    pub fn mark(self) -> &'static str {
+        match self {
+            AgentBackend::ClaudeCode => "C",
+            AgentBackend::CursorAgent => "A",
+        }
+    }
+
+    /// Value stored on a live tmux session as `@ccsm_backend`.
+    pub fn tmux_tag(self) -> &'static str {
+        match self {
+            AgentBackend::ClaudeCode => "claude",
+            AgentBackend::CursorAgent => "cursor",
+        }
+    }
+
+    /// Parse a `@ccsm_backend` tag from `discover_live_sessions`.
+    pub fn from_tmux_tag(tag: &str) -> Option<Self> {
+        match tag {
+            "claude" => Some(AgentBackend::ClaudeCode),
+            "cursor" => Some(AgentBackend::CursorAgent),
+            _ => None,
+        }
+    }
+}
+
+/// Summary record for one agent session (Claude or Cursor).
 #[derive(Debug, Clone)]
 pub struct SessionInfo {
-    /// Unique session identifier (UUID-like string from Claude).
+    /// Unique session identifier (UUID-like string from the agent).
     pub session_id: String,
     /// Absolute path of the project directory.
     pub project: String,
@@ -15,12 +69,33 @@ pub struct SessionInfo {
     pub last_timestamp: i64,
     /// Number of history entries belonging to this session.
     pub entry_count: usize,
-    /// True if a corresponding JSONL session file exists on disk.
+    /// True if a corresponding session store exists on disk with conversation data.
     pub has_data: bool,
     /// Optional custom title set by the user via the rename feature.
     pub name: Option<String>,
     /// Optional slug read from the session JSONL, used to group chained sessions.
+    /// Always `None` for Cursor sessions (no chain concept).
     pub slug: Option<String>,
+    /// Which agent backend owns this session. Defaults to Claude for older callers.
+    pub backend: AgentBackend,
+}
+
+impl Default for SessionInfo {
+    /// Empty Claude session used as a `..Default::default()` base in tests.
+    fn default() -> Self {
+        Self {
+            session_id: String::new(),
+            project: String::new(),
+            project_name: String::new(),
+            first_timestamp: 0,
+            last_timestamp: 0,
+            entry_count: 0,
+            has_data: false,
+            name: None,
+            slug: None,
+            backend: AgentBackend::ClaudeCode,
+        }
+    }
 }
 
 /// Metadata extracted from a session JSONL file used to populate the details bar.
@@ -41,7 +116,7 @@ pub struct SessionMeta {
 /// A single conversation turn shown in the preview pane.
 #[derive(Debug, Clone)]
 pub struct PreviewMessage {
-    /// Role of the speaker: `"user"`, `"assistant"`, or `"system"`.
+    /// Role of the speaker: `"user"`, `"assistant"`, `"system"`, or `"tool"`.
     pub role: String,
     /// Plain text content of the message (XML tags stripped).
     pub text: String,

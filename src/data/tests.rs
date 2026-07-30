@@ -230,6 +230,7 @@ fn make_session_info(id: &str, first_ts: i64, last_ts: i64, slug: Option<&str>) 
         has_data: false,
         name: None,
         slug: slug.map(|s| s.to_string()),
+        ..Default::default()
     }
 }
 

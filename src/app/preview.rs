@@ -11,24 +11,44 @@ impl App {
             None => return (EMPTY_META.get_or_init(SessionMeta::default), &[]),
         };
 
-        let chain_indices: Option<Vec<usize>> = self.chain_map.get(&idx).cloned();
-        let cache_key = match &chain_indices {
+        let backend = self.sessions[idx].backend;
+        // Prefix the cache key with the backend so ids cannot collide across stores.
+        let chain_indices: Option<Vec<usize>> = if backend == AgentBackend::ClaudeCode {
+            self.chain_map.get(&idx).cloned()
+        } else {
+            // Cursor has no chains; never enter load_chain_preview.
+            None
+        };
+        let id_key = match &chain_indices {
             Some(_) => self.sessions[idx]
                 .slug
                 .clone()
                 .unwrap_or_else(|| self.sessions[idx].session_id.clone()),
             None => self.sessions[idx].session_id.clone(),
         };
+        let cache_key = match backend {
+            AgentBackend::ClaudeCode => format!("claude:{id_key}"),
+            AgentBackend::CursorAgent => format!("cursor:{id_key}"),
+        };
 
         if !self.preview_cache.contains_key(&cache_key) {
-            let result = if let Some(ref indices) = chain_indices {
-                let chain_sessions: Vec<&SessionInfo> =
-                    indices.iter().map(|&i| &self.sessions[i]).collect();
-                data::load_chain_preview(&chain_sessions)
-            } else {
-                let project = self.sessions[idx].project.clone();
-                let session_id = self.sessions[idx].session_id.clone();
-                data::load_preview(&project, &session_id)
+            let result = match backend {
+                AgentBackend::CursorAgent => {
+                    let project = self.sessions[idx].project.clone();
+                    let session_id = self.sessions[idx].session_id.clone();
+                    data::load_cursor_preview(&project, &session_id)
+                }
+                AgentBackend::ClaudeCode => {
+                    if let Some(ref indices) = chain_indices {
+                        let chain_sessions: Vec<&SessionInfo> =
+                            indices.iter().map(|&i| &self.sessions[i]).collect();
+                        data::load_chain_preview(&chain_sessions)
+                    } else {
+                        let project = self.sessions[idx].project.clone();
+                        let session_id = self.sessions[idx].session_id.clone();
+                        data::load_preview(&project, &session_id)
+                    }
+                }
             };
             self.preview_cache.insert(cache_key.clone(), result);
         }

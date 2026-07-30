@@ -7,6 +7,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::LazyLock;
 use std::time::Duration;
 
+use crate::data::AgentBackend;
+
 pub const TMUX_SOCKET: &str = "ccsm";
 
 /// The tmux session name reserved for the ccsm scheduler daemon. Filtered out
@@ -28,6 +30,9 @@ pub struct LiveSession {
     /// Scheduler job id tagged on this session via `set_job_tag`, if any.
     /// Survives `rename-session`, unlike matching on `tmux_name`.
     pub job_id: Option<String>,
+    /// Agent backend tagged via `set_backend_tag` when the session was started.
+    /// `None` for sessions created before tagging existed (or untagged spawns).
+    pub backend: Option<AgentBackend>,
 }
 
 /// Returns true if the ccsm tmux server is currently running (i.e. `tmux -L ccsm list-sessions` succeeds).
@@ -51,7 +56,7 @@ pub fn discover_live_sessions(tmux: &str) -> Vec<LiveSession> {
             TMUX_SOCKET,
             "list-sessions",
             "-F",
-            "#{session_name}\t#{session_path}\t#{@ccsm_job}",
+            "#{session_name}\t#{session_path}\t#{@ccsm_job}\t#{@ccsm_backend}\t#{pane_start_command}",
         ])
         .output();
     let output = match output {
@@ -62,15 +67,17 @@ pub fn discover_live_sessions(tmux: &str) -> Vec<LiveSession> {
     parse_session_lines(&text)
 }
 
-/// Parse `list-sessions -F "#{session_name}\t#{session_path}\t#{@ccsm_job}"`
-/// output into `LiveSession` values. Tolerant of a missing third column so
-/// nothing breaks if the format string is ever wrong: an unset `@ccsm_job`
-/// (or a missing column) maps to `job_id: None`. Excludes `WATCH_SESSION`,
-/// the scheduler daemon's own session.
+/// Parse list-sessions output into `LiveSession` values.
+///
+/// Columns: `name`, `path`, `@ccsm_job`, `@ccsm_backend`, `pane_start_command`.
+/// Trailing columns may be missing. An explicit `@ccsm_backend` tag wins; when
+/// it is unset (sessions started before tagging), fall back to inferring from
+/// the pane's start command so the preview info bar still names the agent.
+/// Excludes `WATCH_SESSION`.
 fn parse_session_lines(text: &str) -> Vec<LiveSession> {
     text.lines()
         .filter_map(|line| {
-            let mut parts = line.splitn(3, '\t');
+            let mut parts = line.splitn(5, '\t');
             let name = parts.next()?.to_string();
             let path = parts.next()?.to_string();
             if name == WATCH_SESSION {
@@ -83,6 +90,11 @@ fn parse_session_lines(text: &str) -> Vec<LiveSession> {
                     Some(tag.to_string())
                 }
             });
+            let tagged = parts
+                .next()
+                .and_then(|tag| AgentBackend::from_tmux_tag(tag));
+            let start_cmd = parts.next().unwrap_or("");
+            let backend = tagged.or_else(|| infer_backend_from_start_command(start_cmd));
             let project_name = std::path::Path::new(&path)
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
@@ -93,9 +105,26 @@ fn parse_session_lines(text: &str) -> Vec<LiveSession> {
                 cwd: path,
                 project_name,
                 job_id,
+                backend,
             })
         })
         .collect()
+}
+
+/// Infer Claude vs Cursor from the pane's start command when `@ccsm_backend`
+/// was never set. Matches the executable basename only (`claude`, `agent`).
+fn infer_backend_from_start_command(cmd: &str) -> Option<AgentBackend> {
+    let first = cmd.split_whitespace().next()?;
+    let base = std::path::Path::new(first)
+        .file_name()
+        .and_then(|n| n.to_str())?;
+    if base == "agent" {
+        Some(AgentBackend::CursorAgent)
+    } else if base == "claude" {
+        Some(AgentBackend::ClaudeCode)
+    } else {
+        None
+    }
 }
 
 /// Returns the path to the ccsm tmux configuration file (`~/.config/ccsm/tmux.conf`).
@@ -172,7 +201,16 @@ pub fn is_tmux_available(tmux: &str) -> bool {
 
 /// Create a new detached tmux session named `name` with working directory `cwd`,
 /// running `cmd` as the initial command. Starts the ccsm tmux server if needed.
-pub fn start_live_session(tmux: &str, name: &str, cwd: &str, cmd: &[&str]) -> anyhow::Result<()> {
+///
+/// When `backend` is `Some`, tags the session with `@ccsm_backend` so the TUI
+/// can show which agent is running after a rename or restart.
+pub fn start_live_session(
+    tmux: &str,
+    name: &str,
+    cwd: &str,
+    cmd: &[&str],
+    backend: Option<AgentBackend>,
+) -> anyhow::Result<()> {
     if !is_tmux_available(tmux) {
         anyhow::bail!("tmux is not installed — live sessions require tmux");
     }
@@ -200,6 +238,9 @@ pub fn start_live_session(tmux: &str, name: &str, cwd: &str, cmd: &[&str]) -> an
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!("Failed to create session '{}': {}", name, stderr.trim());
+    }
+    if let Some(backend) = backend {
+        set_backend_tag(tmux, name, backend)?;
     }
     Ok(())
 }
@@ -880,8 +921,37 @@ pub fn set_job_tag(tmux: &str, name: &str, job_id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Build argv for `set-option -t =name: @ccsm_backend <tag>`.
+fn set_backend_tag_args(name: &str, backend: AgentBackend) -> Vec<String> {
+    vec![
+        "-L".to_string(),
+        TMUX_SOCKET.to_string(),
+        "set-option".to_string(),
+        "-t".to_string(),
+        pane_target(name),
+        "@ccsm_backend".to_string(),
+        backend.tmux_tag().to_string(),
+    ]
+}
+
+/// Tag a tmux session with the agent backend that is running in it.
+pub fn set_backend_tag(tmux: &str, name: &str, backend: AgentBackend) -> anyhow::Result<()> {
+    let output = std::process::Command::new(tmux)
+        .args(set_backend_tag_args(name, backend))
+        .output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "Failed to tag session '{}' with backend: {}",
+            name,
+            stderr.trim()
+        );
+    }
+    Ok(())
+}
+
 /// `start_live_session` followed by `set_job_tag`, so a newly dispatched
-/// session is immediately findable by job id.
+/// session is immediately findable by job id. Jobs are Claude-only.
 pub fn start_managed_session(
     tmux: &str,
     name: &str,
@@ -889,7 +959,7 @@ pub fn start_managed_session(
     job_id: &str,
     cmd: &[&str],
 ) -> anyhow::Result<()> {
-    start_live_session(tmux, name, cwd, cmd)?;
+    start_live_session(tmux, name, cwd, cmd, Some(AgentBackend::ClaudeCode))?;
     set_job_tag(tmux, name, job_id)
 }
 
@@ -1245,39 +1315,90 @@ mod tests {
     }
 
     #[test]
-    fn parse_session_lines_splits_three_columns() {
-        let text = "sess-a\t/home/sess-a\tjob-1\n";
+    fn parse_session_lines_splits_tagged_backend() {
+        let text = "sess-a\t/home/sess-a\tjob-1\tcursor\tagent --trust\n";
         let sessions = parse_session_lines(text);
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].tmux_name, "sess-a");
         assert_eq!(sessions[0].cwd, "/home/sess-a");
         assert_eq!(sessions[0].job_id, Some("job-1".to_string()));
+        assert_eq!(sessions[0].backend, Some(AgentBackend::CursorAgent));
     }
 
     #[test]
-    fn parse_session_lines_empty_job_tag_is_none() {
-        let text = "sess-a\t/home/sess-a\t\n";
+    fn parse_session_lines_infers_backend_from_start_command_when_untagged() {
+        let text = "sess-a\t/home/sess-a\t\t\tagent --trust\n";
         let sessions = parse_session_lines(text);
-        assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].job_id, None);
+        assert_eq!(sessions[0].backend, Some(AgentBackend::CursorAgent));
+
+        let text = "sess-b\t/home/sess-b\t\t\t/opt/bin/claude --resume abc\n";
+        let sessions = parse_session_lines(text);
+        assert_eq!(sessions[0].backend, Some(AgentBackend::ClaudeCode));
+    }
+
+    #[test]
+    fn parse_session_lines_tag_wins_over_start_command() {
+        // Tag says Claude even if the start command looks like agent.
+        let text = "sess-a\t/home/sess-a\t\tclaude\tagent --trust\n";
+        let sessions = parse_session_lines(text);
+        assert_eq!(sessions[0].backend, Some(AgentBackend::ClaudeCode));
     }
 
     #[test]
     fn parse_session_lines_excludes_watch_session() {
-        let text = "ccsm-watch\t/home/watch\t\nsess-a\t/home/sess-a\tjob-1\n";
+        let text = "ccsm-watch\t/home/watch\t\t\t\nsess-a\t/home/sess-a\tjob-1\tclaude\tclaude\n";
         let sessions = parse_session_lines(text);
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].tmux_name, "sess-a");
     }
 
     #[test]
-    fn parse_session_lines_missing_third_column_defaults_to_none() {
+    fn parse_session_lines_missing_trailing_columns_default_to_none() {
         let text = "sess-a\t/home/sess-a\n";
         let sessions = parse_session_lines(text);
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].tmux_name, "sess-a");
         assert_eq!(sessions[0].cwd, "/home/sess-a");
         assert_eq!(sessions[0].job_id, None);
+        assert_eq!(sessions[0].backend, None);
+    }
+
+    #[test]
+    fn parse_session_lines_unknown_backend_tag_falls_back_to_start_command() {
+        let text = "sess-a\t/home/sess-a\t\twat\tagent --trust\n";
+        let sessions = parse_session_lines(text);
+        assert_eq!(sessions[0].backend, Some(AgentBackend::CursorAgent));
+    }
+
+    #[test]
+    fn infer_backend_from_start_command_matches_basename() {
+        assert_eq!(
+            infer_backend_from_start_command("agent --trust"),
+            Some(AgentBackend::CursorAgent)
+        );
+        assert_eq!(
+            infer_backend_from_start_command("/usr/local/bin/claude"),
+            Some(AgentBackend::ClaudeCode)
+        );
+        assert_eq!(infer_backend_from_start_command("node"), None);
+        assert_eq!(infer_backend_from_start_command(""), None);
+    }
+
+    #[test]
+    fn set_backend_tag_args_shape() {
+        assert_eq!(
+            set_backend_tag_args("my-sess", AgentBackend::CursorAgent),
+            vec![
+                "-L",
+                "ccsm",
+                "set-option",
+                "-t",
+                "=my-sess:",
+                "@ccsm_backend",
+                "cursor"
+            ]
+        );
     }
 
     #[test]

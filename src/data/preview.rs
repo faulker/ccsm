@@ -1,6 +1,8 @@
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 
+use super::cursor_history::find_cursor_store;
+use super::cursor_store;
 use super::history::strip_xml_tags;
 use super::io::{format_session_boundary_date, session_file_path};
 use super::types::*;
@@ -155,4 +157,22 @@ pub fn load_preview(project: &str, session_id: &str) -> (SessionMeta, Vec<Previe
     // Keep last 20 turns
     let start = messages.len().saturating_sub(20);
     (meta, messages[start..].to_vec())
+}
+
+/// Load the most recent 20 messages from a Cursor Agent chat's `store.db`.
+pub fn load_cursor_preview(project: &str, session_id: &str) -> (SessionMeta, Vec<PreviewMessage>) {
+    match find_cursor_store(session_id) {
+        Some(path) => cursor_store::load_cursor_preview(project, &path),
+        None => (
+            SessionMeta {
+                cwd: Some(project.to_string()),
+                session_id: Some(session_id.to_string()),
+                ..Default::default()
+            },
+            vec![PreviewMessage {
+                role: "system".to_string(),
+                text: "Cursor store.db not found".to_string(),
+            }],
+        ),
+    }
 }

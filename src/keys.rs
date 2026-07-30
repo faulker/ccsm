@@ -1,7 +1,8 @@
 use crate::app::{
-    App, AppMode, DuplicateSource, FlatRow, HelpTab, LaunchRequest, MainTab, NewSessionMode,
-    TreeRow,
+    App, AppMode, DuplicateSource, FlatRow, HelpTab, LaunchRequest, MainTab, NamingFocus,
+    NewSessionMode, TreeRow,
 };
+use crate::data::AgentBackend;
 use crate::{data, live};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, ModifierKeyCode, MouseEventKind};
 
@@ -184,8 +185,10 @@ impl App {
 
     /// Handle a key event while the new-session naming popup is open.
     ///
-    /// Esc cancels, Enter confirms (using the placeholder if empty), all other
-    /// editing keys are delegated to `naming_input` via `tui_input`.
+    /// Focus starts on the name. Down moves to Agent (when both backends are
+    /// shown) then Type; Left/Right cycle the focused switcher. Esc cancels,
+    /// Enter confirms (using the placeholder if empty). Letter keys only reach
+    /// the name field while it is focused.
     pub(crate) fn handle_naming_event(&mut self, key: crossterm::event::KeyEvent) {
         use crossterm::event::Event;
         use tui_input::backend::crossterm::EventHandler;
@@ -196,22 +199,48 @@ impl App {
                 self.naming_input = tui_input::Input::default();
                 self.naming_cwd = None;
                 self.naming_mode = NewSessionMode::Plain;
+                self.naming_backend = AgentBackend::ClaudeCode;
+                self.naming_focus = NamingFocus::Name;
             }
-            // Tab / Shift+Tab cycle the launch mode. Deliberately *not* the
-            // arrow keys: Left/Right belong to `tui_input` for moving the
-            // cursor within the name being typed.
-            KeyCode::Tab => self.cycle_naming_mode(true),
-            KeyCode::BackTab => self.cycle_naming_mode(false),
+            KeyCode::Down => self.naming_focus_down(),
+            KeyCode::Up => self.naming_focus_up(),
+            KeyCode::Left | KeyCode::Right
+                if self.naming_focus == NamingFocus::Agent =>
+            {
+                self.cycle_naming_backend();
+            }
+            KeyCode::Left | KeyCode::Right
+                if self.naming_focus == NamingFocus::Type =>
+            {
+                self.cycle_naming_mode(key.code == KeyCode::Right);
+            }
+            // Left/Right on the name row still move the text cursor.
+            KeyCode::Left | KeyCode::Right
+                if self.naming_focus == NamingFocus::Name && self.naming_mode.needs_name() =>
+            {
+                self.naming_input
+                    .handle_event(&Event::Key(normalize_key(key)));
+            }
             // A direct session never reaches tmux, so there is no name to take
             // and no duplicate to check for.
             KeyCode::Enter if self.naming_mode == NewSessionMode::Direct => {
+                let backend = self.naming_backend;
+                if !self.ensure_backend_available(backend) {
+                    return;
+                }
                 let cwd = self.naming_cwd.take().unwrap_or_else(|| ".".to_string());
                 self.mode = AppMode::Normal;
                 self.naming_input = tui_input::Input::default();
                 self.naming_mode = NewSessionMode::Plain;
-                self.launch_session = Some(LaunchRequest::NewDirect { cwd });
+                self.naming_backend = AgentBackend::ClaudeCode;
+                self.naming_focus = NamingFocus::Name;
+                self.launch_session = Some(LaunchRequest::NewDirect { cwd, backend });
             }
             KeyCode::Enter => {
+                let backend = self.naming_backend;
+                if !self.ensure_backend_available(backend) {
+                    return;
+                }
                 let raw = if self.naming_input.value().is_empty() {
                     self.naming_placeholder.clone()
                 } else {
@@ -242,16 +271,22 @@ impl App {
                 self.mode = AppMode::Normal;
                 self.naming_input = tui_input::Input::default();
                 let mode = std::mem::replace(&mut self.naming_mode, NewSessionMode::Plain);
+                self.naming_backend = AgentBackend::ClaudeCode;
+                self.naming_focus = NamingFocus::Name;
                 self.launch_session = Some(LaunchRequest::NewLive {
                     name,
                     cwd,
                     dangerous: mode == NewSessionMode::Dangerous,
                     worktree: mode == NewSessionMode::Worktree,
+                    backend,
                 });
             }
-            _ => {
-                self.naming_input.handle_event(&Event::Key(normalize_key(key)));
+            // Typing only edits the name while that row is focused.
+            _ if self.naming_focus == NamingFocus::Name && self.naming_mode.needs_name() => {
+                self.naming_input
+                    .handle_event(&Event::Key(normalize_key(key)));
             }
+            _ => {}
         }
     }
 
@@ -694,6 +729,13 @@ impl App {
                     self.recompute_tree();
                     self.save_config();
                 }
+                (KeyCode::Char('s'), KeyModifiers::NONE) => {
+                    self.source_filter = self.source_filter.cycle();
+                    self.recompute_filter();
+                    self.preview_scroll = u16::MAX;
+                    self.preview_auto_scroll = true;
+                    self.save_config();
+                }
                 // Confirmed, to match `x` on the Jobs tab. Stopping a session
                 // is not recoverable, so both tabs ask first.
                 (KeyCode::Char('x'), KeyModifiers::NONE) => {
@@ -725,6 +767,15 @@ impl App {
                             })
                             .unwrap_or(idx);
                         let session = &self.sessions[resume_idx];
+                        // Cursor titles are changed with `/rename` inside the agent;
+                        // writing Claude-shaped JSONL into store.db would corrupt it.
+                        if session.backend == AgentBackend::CursorAgent {
+                            self.status_error = Some(
+                                "Cursor chat titles can't be renamed here — use /rename inside the agent"
+                                    .to_string(),
+                            );
+                            return;
+                        }
                         self.rename_session_id = Some(session.session_id.clone());
                         self.rename_project = Some(session.project.clone());
                         // Pre-fill with the chain's effective name (may come from any member)
@@ -746,14 +797,22 @@ impl App {
                         {
                             let session_id = self.resume_session_id_for(session_index).to_string();
                             let cwd = self.sessions[session_index].project.clone();
-                            self.launch_session = Some(LaunchRequest::Direct { session_id, cwd });
+                            let backend = self.sessions[session_index].backend;
+                            if self.ensure_backend_available(backend) {
+                                self.launch_session =
+                                    Some(LaunchRequest::Direct { session_id, cwd, backend });
+                            }
                         }
                     } else if let Some(FlatRow::HistoryItem { session_index }) =
                         self.flat_rows.get(self.selected).cloned()
                     {
                         let session_id = self.resume_session_id_for(session_index).to_string();
                         let cwd = self.sessions[session_index].project.clone();
-                        self.launch_session = Some(LaunchRequest::Direct { session_id, cwd });
+                        let backend = self.sessions[session_index].backend;
+                        if self.ensure_backend_available(backend) {
+                            self.launch_session =
+                                Some(LaunchRequest::Direct { session_id, cwd, backend });
+                        }
                     }
                 }
                 (KeyCode::Enter, _) => {
@@ -770,7 +829,11 @@ impl App {
                             Some(TreeRow::Session { session_index }) => {
                                 let session_id = self.resume_session_id_for(session_index).to_string();
                                 let cwd = self.sessions[session_index].project.clone();
-                                self.launch_session = Some(LaunchRequest::Resume { session_id, cwd });
+                                let backend = self.sessions[session_index].backend;
+                                if self.ensure_backend_available(backend) {
+                                    self.launch_session =
+                                        Some(LaunchRequest::Resume { session_id, cwd, backend });
+                                }
                             }
                             Some(TreeRow::LiveItem { live_index }) => {
                                 let name = self.live_sessions[live_index].tmux_name.clone();
@@ -805,7 +868,11 @@ impl App {
                             Some(FlatRow::HistoryItem { session_index }) => {
                                 let session_id = self.resume_session_id_for(session_index).to_string();
                                 let cwd = self.sessions[session_index].project.clone();
-                                self.launch_session = Some(LaunchRequest::Resume { session_id, cwd });
+                                let backend = self.sessions[session_index].backend;
+                                if self.ensure_backend_available(backend) {
+                                    self.launch_session =
+                                        Some(LaunchRequest::Resume { session_id, cwd, backend });
+                                }
                             }
                             _ => {}
                         }

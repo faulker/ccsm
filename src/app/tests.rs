@@ -1,5 +1,6 @@
 use super::*;
 use crate::config::Config;
+use crate::data::AgentBackend;
 use std::path::PathBuf;
 use tui_input::Input;
 
@@ -25,6 +26,7 @@ fn make_sessions() -> Vec<SessionInfo> {
             has_data: true,
             name: None,
             slug: None,
+            ..Default::default()
         },
         SessionInfo {
             session_id: "s2".into(),
@@ -36,6 +38,7 @@ fn make_sessions() -> Vec<SessionInfo> {
             has_data: true,
             name: None,
             slug: None,
+            ..Default::default()
         },
         SessionInfo {
             session_id: "s3".into(),
@@ -47,6 +50,7 @@ fn make_sessions() -> Vec<SessionInfo> {
             has_data: true,
             name: None,
             slug: None,
+            ..Default::default()
         },
     ]
 }
@@ -199,6 +203,7 @@ fn make_sessions_with_shared_projects() -> Vec<SessionInfo> {
             has_data: true,
             name: None,
             slug: None,
+            ..Default::default()
         },
         SessionInfo {
             session_id: "s2".into(),
@@ -210,6 +215,7 @@ fn make_sessions_with_shared_projects() -> Vec<SessionInfo> {
             has_data: true,
             name: None,
             slug: None,
+            ..Default::default()
         },
         SessionInfo {
             session_id: "s3".into(),
@@ -221,6 +227,7 @@ fn make_sessions_with_shared_projects() -> Vec<SessionInfo> {
             has_data: true,
             name: None,
             slug: None,
+            ..Default::default()
         },
         SessionInfo {
             session_id: "s4".into(),
@@ -232,6 +239,7 @@ fn make_sessions_with_shared_projects() -> Vec<SessionInfo> {
             has_data: true,
             name: None,
             slug: None,
+            ..Default::default()
         },
     ]
 }
@@ -346,6 +354,7 @@ fn make_sessions_with_projects() -> Vec<SessionInfo> {
             has_data: true,
             name: None,
             slug: None,
+            ..Default::default()
         },
         SessionInfo {
             session_id: "s2".into(),
@@ -357,6 +366,7 @@ fn make_sessions_with_projects() -> Vec<SessionInfo> {
             has_data: true,
             name: None,
             slug: None,
+            ..Default::default()
         },
         SessionInfo {
             session_id: "s3".into(),
@@ -368,6 +378,7 @@ fn make_sessions_with_projects() -> Vec<SessionInfo> {
             has_data: true,
             name: None,
             slug: None,
+            ..Default::default()
         },
         SessionInfo {
             session_id: "s4".into(),
@@ -379,6 +390,7 @@ fn make_sessions_with_projects() -> Vec<SessionInfo> {
             has_data: true,
             name: None,
             slug: None,
+            ..Default::default()
         },
     ]
 }
@@ -485,6 +497,7 @@ fn test_launch_request_resume_variant() {
             app.launch_session = Some(LaunchRequest::Resume {
                 session_id: session.session_id.clone(),
                 cwd: session.project.clone(),
+                backend: AgentBackend::ClaudeCode,
             });
         }
     }
@@ -510,7 +523,8 @@ fn test_reload_sessions_updates_list() {
         has_data: true,
         name: None,
         slug: None,
-    });
+            ..Default::default()
+        });
 
     app.reload_sessions(updated);
     assert_eq!(app.sessions.len(), original_count + 1);
@@ -533,6 +547,7 @@ fn make_sessions_mixed_data() -> Vec<SessionInfo> {
             has_data: true,
             name: None,
             slug: None,
+            ..Default::default()
         },
         SessionInfo {
             session_id: "s2".into(),
@@ -544,6 +559,7 @@ fn make_sessions_mixed_data() -> Vec<SessionInfo> {
             has_data: false,
             name: None,
             slug: None,
+            ..Default::default()
         },
         SessionInfo {
             session_id: "s3".into(),
@@ -555,6 +571,7 @@ fn make_sessions_mixed_data() -> Vec<SessionInfo> {
             has_data: true,
             name: None,
             slug: None,
+            ..Default::default()
         },
     ]
 }
@@ -699,34 +716,27 @@ fn test_backtab_cycles_reverse() {
 
 #[test]
 fn test_config_selected_bounds() {
+    use crate::ui::config_tab::CONFIG_MAX_ROW;
     let mut app = make_app(make_sessions(), None, Config::default());
     app.main_tab = MainTab::Config;
     assert_eq!(app.config_selected, 0);
 
     // Can't go below 0
     app.config_selected = 0;
-    if app.config_selected > 0 { app.config_selected -= 1; }
+    if app.config_selected > 0 {
+        app.config_selected -= 1;
+    }
     assert_eq!(app.config_selected, 0);
 
-    // Navigate down
-    app.config_selected = 1;
-    assert_eq!(app.config_selected, 1);
-    app.config_selected = 2;
-    assert_eq!(app.config_selected, 2);
+    // Navigate to the last settings row (About URL)
+    app.config_selected = CONFIG_MAX_ROW;
+    assert_eq!(app.config_selected, CONFIG_MAX_ROW);
 
-    // Navigate to all items including about section
-    app.config_selected = 3;
-    assert_eq!(app.config_selected, 3);
-    app.config_selected = 4;
-    assert_eq!(app.config_selected, 4);
-    app.config_selected = 5;
-    assert_eq!(app.config_selected, 5);
-    app.config_selected = 6;
-    assert_eq!(app.config_selected, 6);
-
-    // Can't go above 6
-    if app.config_selected < 6 { app.config_selected += 1; }
-    assert_eq!(app.config_selected, 6);
+    // Can't go above CONFIG_MAX_ROW
+    if app.config_selected < CONFIG_MAX_ROW {
+        app.config_selected += 1;
+    }
+    assert_eq!(app.config_selected, CONFIG_MAX_ROW);
 }
 
 #[test]
@@ -827,6 +837,7 @@ fn make_chained_sessions() -> Vec<SessionInfo> {
             has_data: true,
             name: None,
             slug: Some("cool-flying-cat".into()),
+            ..Default::default()
         },
         SessionInfo {
             session_id: "chain-b".into(),
@@ -838,6 +849,7 @@ fn make_chained_sessions() -> Vec<SessionInfo> {
             has_data: true,
             name: None,
             slug: Some("cool-flying-cat".into()),
+            ..Default::default()
         },
         // Standalone session without a slug
         SessionInfo {
@@ -850,6 +862,7 @@ fn make_chained_sessions() -> Vec<SessionInfo> {
             has_data: true,
             name: None,
             slug: None,
+            ..Default::default()
         },
     ]
 }
@@ -910,7 +923,8 @@ fn test_single_slug_session_not_chained() {
         has_data: true,
         name: None,
         slug: Some("lone-slug".into()),
-    }];
+            ..Default::default()
+        }];
     let mut app = make_app(sessions, None, Config::default());
     app.tree_view = false;
     app.group_chains = true;
@@ -1306,6 +1320,7 @@ fn make_live(tmux_name: &str, cwd: &str, job_id: Option<&str>) -> crate::live::L
         cwd: cwd.to_string(),
         project_name: "proj".to_string(),
         job_id: job_id.map(|s| s.to_string()),
+        backend: None,
     }
 }
 
@@ -1825,7 +1840,7 @@ fn enter_on_a_config_path_row_opens_the_file_picker() {
 
     let mut app = make_app(vec![], None, Config::default());
     app.main_tab = MainTab::Config;
-    app.config_selected = 5; // usage history file
+    app.config_selected = 6; // usage history file (after agent path row)
     app.handle_config_tab_event(key(KeyCode::Enter));
 
     assert_eq!(app.mode, AppMode::DirPicker);
@@ -1996,7 +2011,10 @@ fn a_direct_new_session_ignores_the_name() {
         crossterm::event::KeyModifiers::NONE,
     ));
     match &app.launch_session {
-        Some(LaunchRequest::NewDirect { cwd }) => assert_eq!(cwd, "/tmp"),
+        Some(LaunchRequest::NewDirect { cwd, backend }) => {
+            assert_eq!(cwd, "/tmp");
+            assert_eq!(*backend, AgentBackend::ClaudeCode);
+        }
         other => panic!("expected NewDirect, got {other:?}"),
     }
 }
@@ -2167,4 +2185,501 @@ fn an_up_to_date_watcher_is_not_restarted() {
     // not-running guard as well: either way it must not report a restart.
     assert!(!app.restart_outdated_watcher());
     assert!(app.status_error.is_none());
+}
+
+#[test]
+fn source_filter_hides_backends_before_other_filters() {
+    let sessions = vec![
+        SessionInfo {
+            session_id: "claude-1".into(),
+            project: "/p/claude".into(),
+            project_name: "claude".into(),
+            first_timestamp: 1,
+            last_timestamp: 3000,
+            entry_count: 1,
+            has_data: true,
+            name: None,
+            slug: None,
+            backend: AgentBackend::ClaudeCode,
+        },
+        SessionInfo {
+            session_id: "cursor-1".into(),
+            project: "/p/cursor".into(),
+            project_name: "cursor".into(),
+            first_timestamp: 1,
+            last_timestamp: 4000,
+            entry_count: 1,
+            has_data: true,
+            name: None,
+            slug: None,
+            backend: AgentBackend::CursorAgent,
+        },
+    ];
+    let mut app = make_app(sessions, None, Config::default());
+    app.tree_view = false;
+    app.hide_empty = false;
+    app.group_chains = false;
+
+    app.source_filter = SourceFilter::Both;
+    app.recompute_filter();
+    assert_eq!(app.filtered_indices.len(), 2);
+
+    app.source_filter = SourceFilter::Claude;
+    app.recompute_filter();
+    assert_eq!(app.filtered_indices, vec![0]);
+
+    app.source_filter = SourceFilter::Cursor;
+    app.recompute_filter();
+    assert_eq!(app.filtered_indices, vec![1]);
+}
+
+#[test]
+fn cursor_session_never_enters_chain_map() {
+    let sessions = vec![
+        SessionInfo {
+            session_id: "c1".into(),
+            project: "/p".into(),
+            project_name: "p".into(),
+            first_timestamp: 1000,
+            last_timestamp: 2000,
+            entry_count: 1,
+            has_data: true,
+            name: None,
+            // Even if a slug were somehow set, Cursor loaders always use None.
+            slug: None,
+            backend: AgentBackend::CursorAgent,
+        },
+        SessionInfo {
+            session_id: "c2".into(),
+            project: "/p".into(),
+            project_name: "p".into(),
+            first_timestamp: 1500,
+            last_timestamp: 2500,
+            entry_count: 1,
+            has_data: true,
+            name: None,
+            slug: None,
+            backend: AgentBackend::CursorAgent,
+        },
+    ];
+    let mut app = make_app(sessions, None, Config::default());
+    app.tree_view = false;
+    app.group_chains = true;
+    app.recompute_filter();
+    assert!(app.chain_map.is_empty());
+    assert_eq!(app.filtered_indices.len(), 2);
+}
+
+#[test]
+fn source_filter_key_s_cycles_and_persists() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let _guard = crate::config::test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("CCSM_CONFIG_DIR", dir.path());
+
+    let mut app = make_app(make_sessions(), None, Config::default());
+    assert_eq!(app.source_filter, SourceFilter::Both);
+
+    let key = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE);
+    app.dispatch_normal_key_with_shift(key, false);
+    assert_eq!(app.source_filter, SourceFilter::Claude);
+    assert_eq!(app.config.source_filter, "claude");
+
+    app.dispatch_normal_key_with_shift(key, false);
+    assert_eq!(app.source_filter, SourceFilter::Cursor);
+    assert_eq!(app.config.source_filter, "cursor");
+
+    app.dispatch_normal_key_with_shift(key, false);
+    assert_eq!(app.source_filter, SourceFilter::Both);
+    assert_eq!(app.config.source_filter, "both");
+
+    std::env::remove_var("CCSM_CONFIG_DIR");
+}
+
+#[test]
+fn source_filter_cycle_order() {
+    assert_eq!(SourceFilter::Both.cycle(), SourceFilter::Claude);
+    assert_eq!(SourceFilter::Claude.cycle(), SourceFilter::Cursor);
+    assert_eq!(SourceFilter::Cursor.cycle(), SourceFilter::Both);
+}
+
+#[test]
+fn deps_blocking_matrix() {
+    let mut app = make_app(vec![], None, Config::default());
+    app.missing_claude = false;
+    app.missing_agent = false;
+    app.missing_tmux = false;
+    assert!(!app.deps_blocking(), "all present");
+
+    app.missing_claude = true;
+    assert!(!app.deps_blocking(), "claude-only missing is soft");
+
+    app.missing_claude = false;
+    app.missing_agent = true;
+    assert!(!app.deps_blocking(), "agent-only missing is soft");
+
+    app.missing_claude = true;
+    app.missing_agent = true;
+    assert!(app.deps_blocking(), "both agents missing blocks");
+
+    app.missing_claude = false;
+    app.missing_agent = false;
+    app.missing_tmux = true;
+    assert!(app.deps_blocking(), "tmux missing always blocks");
+}
+
+#[test]
+fn ensure_backend_available_sets_status_error() {
+    let mut app = make_app(vec![], None, Config::default());
+    app.config.claude_path = Some("/nonexistent/ccsm-no-claude".into());
+    app.config.agent_path = Some("/nonexistent/ccsm-no-agent".into());
+    assert!(!app.ensure_backend_available(AgentBackend::ClaudeCode));
+    assert!(app.status_error.as_deref().unwrap().contains("claude"));
+    app.status_error = None;
+    assert!(!app.ensure_backend_available(AgentBackend::CursorAgent));
+    assert!(app.status_error.as_deref().unwrap().contains("agent"));
+}
+
+#[test]
+fn rename_refuses_cursor_history_rows() {
+    let sessions = vec![SessionInfo {
+        session_id: "cursor-1".into(),
+        project: "/p".into(),
+        project_name: "p".into(),
+        first_timestamp: 1,
+        last_timestamp: 2,
+        entry_count: 2,
+        has_data: true,
+        name: None,
+        slug: None,
+        backend: AgentBackend::CursorAgent,
+    }];
+    let mut app = make_app(sessions, None, Config::default());
+    app.tree_view = false;
+    app.recompute_filter();
+    app.selected = 0;
+    app.dispatch_normal_key_with_shift(
+        crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('r'),
+            crossterm::event::KeyModifiers::NONE,
+        ),
+        false,
+    );
+    assert_eq!(app.mode, AppMode::Normal);
+    assert!(
+        app.status_error
+            .as_deref()
+            .unwrap()
+            .contains("/rename"),
+        "{:?}",
+        app.status_error
+    );
+}
+
+#[test]
+fn job_form_refuses_cursor_rows() {
+    let sessions = vec![SessionInfo {
+        session_id: "cursor-1".into(),
+        project: "/p".into(),
+        project_name: "p".into(),
+        first_timestamp: 1,
+        last_timestamp: 2,
+        entry_count: 2,
+        has_data: true,
+        name: None,
+        slug: None,
+        backend: AgentBackend::CursorAgent,
+    }];
+    let mut app = make_app(sessions, None, Config::default());
+    app.tree_view = false;
+    app.recompute_filter();
+    app.selected = 0;
+    app.job_form_from_selection();
+    assert_ne!(app.mode, AppMode::JobForm);
+    assert!(
+        app.status_error
+            .as_deref()
+            .unwrap()
+            .contains("Claude-only"),
+        "{:?}",
+        app.status_error
+    );
+}
+
+#[test]
+fn naming_backend_follows_source_filter_and_cycles_when_both() {
+    let mut app = make_app(make_sessions(), None, Config::default());
+    app.source_filter = SourceFilter::Cursor;
+    assert!(app.open_naming_popup(NewSessionMode::Plain));
+    assert_eq!(app.naming_backend, AgentBackend::CursorAgent);
+
+    app.mode = AppMode::Normal;
+    app.source_filter = SourceFilter::Both;
+    assert!(app.open_naming_popup(NewSessionMode::Plain));
+    // make_sessions are all Claude, so Both falls back to that last-used backend.
+    assert_eq!(app.naming_backend, AgentBackend::ClaudeCode);
+    app.cycle_naming_backend();
+    assert_eq!(app.naming_backend, AgentBackend::CursorAgent);
+    app.cycle_naming_backend();
+    assert_eq!(app.naming_backend, AgentBackend::ClaudeCode);
+}
+
+#[test]
+fn naming_backend_defaults_to_last_used_in_directory() {
+    let sessions = vec![
+        SessionInfo {
+            session_id: "old-claude".into(),
+            project: "/Users/sane/Dev/alpha".into(),
+            project_name: "alpha".into(),
+            first_timestamp: 1000,
+            last_timestamp: 2000,
+            entry_count: 5,
+            has_data: true,
+            name: None,
+            slug: None,
+            backend: AgentBackend::ClaudeCode,
+        },
+        SessionInfo {
+            session_id: "newer-cursor".into(),
+            project: "/Users/sane/Dev/alpha".into(),
+            project_name: "alpha".into(),
+            first_timestamp: 1500,
+            last_timestamp: 5000,
+            entry_count: 3,
+            has_data: true,
+            name: None,
+            slug: None,
+            backend: AgentBackend::CursorAgent,
+        },
+        SessionInfo {
+            session_id: "other-dir".into(),
+            project: "/Users/sane/Dev/beta".into(),
+            project_name: "beta".into(),
+            first_timestamp: 1000,
+            last_timestamp: 9000,
+            entry_count: 1,
+            has_data: true,
+            name: None,
+            slug: None,
+            backend: AgentBackend::ClaudeCode,
+        },
+    ];
+    let mut app = make_app(sessions, None, Config::default());
+    app.source_filter = SourceFilter::Both;
+    // Select the alpha project (most recent overall is beta, so find alpha).
+    app.selected = app
+        .tree_rows
+        .iter()
+        .position(|r| matches!(r, TreeRow::Header { project, .. } if project == "/Users/sane/Dev/alpha"))
+        .expect("alpha header");
+    assert!(app.open_naming_popup(NewSessionMode::Plain));
+    assert_eq!(app.naming_backend, AgentBackend::CursorAgent);
+
+    // Claude-only filter still forces Claude even when last-used was Cursor.
+    app.mode = AppMode::Normal;
+    app.source_filter = SourceFilter::Claude;
+    assert!(app.open_naming_popup(NewSessionMode::Plain));
+    assert_eq!(app.naming_backend, AgentBackend::ClaudeCode);
+}
+
+#[test]
+fn naming_backend_falls_back_to_claude_for_unknown_directory() {
+    let mut app = make_app(make_sessions(), None, Config::default());
+    app.source_filter = SourceFilter::Both;
+    assert_eq!(
+        app.default_naming_backend("/tmp/brand-new-project"),
+        AgentBackend::ClaudeCode
+    );
+}
+
+#[test]
+fn naming_focus_down_up_and_arrows_cycle_switchers() {
+    let mut app = make_app(make_sessions(), None, Config::default());
+    app.source_filter = SourceFilter::Both;
+    assert!(app.open_naming_popup(NewSessionMode::Plain));
+    assert_eq!(app.naming_focus, NamingFocus::Name);
+    assert_eq!(app.naming_backend, AgentBackend::ClaudeCode);
+
+    let down = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Down,
+        crossterm::event::KeyModifiers::NONE,
+    );
+    let up = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Up,
+        crossterm::event::KeyModifiers::NONE,
+    );
+    let right = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Right,
+        crossterm::event::KeyModifiers::NONE,
+    );
+    let left = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Left,
+        crossterm::event::KeyModifiers::NONE,
+    );
+    let a = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('a'),
+        crossterm::event::KeyModifiers::NONE,
+    );
+
+    // `a` always types into the name while Name is focused.
+    app.handle_naming_event(a);
+    assert_eq!(app.naming_input.value(), "a");
+    assert_eq!(app.naming_backend, AgentBackend::ClaudeCode);
+
+    app.handle_naming_event(down);
+    assert_eq!(app.naming_focus, NamingFocus::Agent);
+    app.handle_naming_event(right);
+    assert_eq!(app.naming_backend, AgentBackend::CursorAgent);
+    app.handle_naming_event(left);
+    assert_eq!(app.naming_backend, AgentBackend::ClaudeCode);
+
+    app.handle_naming_event(down);
+    assert_eq!(app.naming_focus, NamingFocus::Type);
+    assert_eq!(app.naming_mode, NewSessionMode::Plain);
+    app.handle_naming_event(right);
+    assert_eq!(app.naming_mode, NewSessionMode::Dangerous);
+
+    // Typing on Type does not edit the name.
+    app.handle_naming_event(a);
+    assert_eq!(app.naming_input.value(), "a");
+
+    app.handle_naming_event(up);
+    assert_eq!(app.naming_focus, NamingFocus::Agent);
+    app.handle_naming_event(up);
+    assert_eq!(app.naming_focus, NamingFocus::Name);
+}
+
+#[test]
+fn naming_focus_skips_agent_when_filter_is_not_both() {
+    let mut app = make_app(make_sessions(), None, Config::default());
+    app.source_filter = SourceFilter::Claude;
+    assert!(app.open_naming_popup(NewSessionMode::Plain));
+    app.handle_naming_event(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Down,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    assert_eq!(app.naming_focus, NamingFocus::Type);
+}
+
+#[test]
+fn naming_carries_backend_into_launch_request() {
+    let mut app = make_app(make_sessions(), None, Config::default());
+    app.source_filter = SourceFilter::Both;
+    app.naming_backend = AgentBackend::CursorAgent;
+    confirm_naming(&mut app, NewSessionMode::Plain);
+    match &app.launch_session {
+        Some(LaunchRequest::NewLive { backend, .. }) => {
+            assert_eq!(*backend, AgentBackend::CursorAgent);
+        }
+        other => panic!("expected NewLive, got {other:?}"),
+    }
+}
+
+#[test]
+fn enter_on_cursor_row_resumes_with_cursor_backend() {
+    let sessions = vec![SessionInfo {
+        session_id: "cursor-resume-1".into(),
+        project: "/p".into(),
+        project_name: "p".into(),
+        first_timestamp: 1,
+        last_timestamp: 2,
+        entry_count: 2,
+        has_data: true,
+        name: None,
+        slug: None,
+        backend: AgentBackend::CursorAgent,
+    }];
+    let mut app = make_app(sessions, None, Config::default());
+    // Point agent at a real binary so ensure_backend_available does not block.
+    app.config.agent_path = Some("/bin/sh".into());
+    app.tree_view = false;
+    app.recompute_filter();
+    app.selected = 0;
+    app.dispatch_normal_key_with_shift(
+        crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        ),
+        false,
+    );
+    match &app.launch_session {
+        Some(LaunchRequest::Resume {
+            session_id,
+            cwd,
+            backend,
+        }) => {
+            assert_eq!(session_id, "cursor-resume-1");
+            assert_eq!(cwd, "/p");
+            assert_eq!(*backend, AgentBackend::CursorAgent);
+        }
+        other => panic!("expected Resume with CursorAgent, got {other:?}"),
+    }
+}
+
+#[test]
+fn shift_enter_on_cursor_row_opens_direct_with_cursor_backend() {
+    let sessions = vec![SessionInfo {
+        session_id: "cursor-direct-1".into(),
+        project: "/p".into(),
+        project_name: "p".into(),
+        first_timestamp: 1,
+        last_timestamp: 2,
+        entry_count: 2,
+        has_data: true,
+        name: None,
+        slug: None,
+        backend: AgentBackend::CursorAgent,
+    }];
+    let mut app = make_app(sessions, None, Config::default());
+    app.config.agent_path = Some("/bin/sh".into());
+    app.tree_view = false;
+    app.recompute_filter();
+    app.selected = 0;
+    app.dispatch_normal_key_with_shift(
+        crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::SHIFT,
+        ),
+        true,
+    );
+    match &app.launch_session {
+        Some(LaunchRequest::Direct {
+            session_id,
+            cwd,
+            backend,
+        }) => {
+            assert_eq!(session_id, "cursor-direct-1");
+            assert_eq!(cwd, "/p");
+            assert_eq!(*backend, AgentBackend::CursorAgent);
+        }
+        other => panic!("expected Direct with CursorAgent, got {other:?}"),
+    }
+}
+
+#[test]
+fn apply_session_names_fills_cursor_title_and_entry_count() {
+    let sessions = vec![SessionInfo {
+        session_id: "cursor-1".into(),
+        project: "/p".into(),
+        project_name: "p".into(),
+        first_timestamp: 1,
+        last_timestamp: 2,
+        entry_count: 0,
+        has_data: true,
+        name: None,
+        slug: None,
+        backend: AgentBackend::CursorAgent,
+    }];
+    let mut app = make_app(sessions, None, Config::default());
+    let mut updates = std::collections::HashMap::new();
+    updates.insert(
+        "cursor-1".into(),
+        crate::app::SessionMetaUpdate {
+            name: Some("Fixture Chat".into()),
+            entry_count: Some(4),
+        },
+    );
+    app.apply_session_names(updates);
+    assert_eq!(app.sessions[0].name.as_deref(), Some("Fixture Chat"));
+    assert_eq!(app.sessions[0].entry_count, 4);
 }

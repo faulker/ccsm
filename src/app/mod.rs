@@ -13,16 +13,66 @@ mod tree;
 mod tests;
 
 use crate::config::{Config, DisplayMode, PauseMode};
-use crate::data::{self, PreviewMessage, SessionInfo, SessionMeta};
+use crate::data::{self, AgentBackend, PreviewMessage, SessionInfo, SessionMeta};
 use crate::live::{self, ActivityState, LiveSession};
 use crate::models;
 use crate::schedule::{self, Job};
 use crate::update;
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::time::Instant;
 use tui_input::Input;
 
 pub use dir_browser::{DirBrowser, PickerKind, PickerTarget};
+
+/// Enrichment from the background session-meta loader.
+#[derive(Debug, Clone)]
+pub struct SessionMetaUpdate {
+    /// Custom title, when known. Cursor may send `None` for untitled chats.
+    pub name: Option<String>,
+    /// Cursor turn count from `store.db`. Claude leaves this `None`.
+    pub entry_count: Option<usize>,
+}
+
+/// Which agent backends are visible in the Sessions list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceFilter {
+    /// Show Claude Code and Cursor Agent sessions.
+    Both,
+    /// Show only Claude Code sessions.
+    Claude,
+    /// Show only Cursor Agent sessions.
+    Cursor,
+}
+
+impl SourceFilter {
+    /// Parse the persisted config string (`"both"` / `"claude"` / `"cursor"`).
+    pub fn from_config(s: &str) -> Self {
+        match s {
+            "claude" => Self::Claude,
+            "cursor" => Self::Cursor,
+            _ => Self::Both,
+        }
+    }
+
+    /// Persistable config value for this filter.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Both => "both",
+            Self::Claude => "claude",
+            Self::Cursor => "cursor",
+        }
+    }
+
+    /// Cycle Both → Claude → Cursor → Both.
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::Both => Self::Claude,
+            Self::Claude => Self::Cursor,
+            Self::Cursor => Self::Both,
+        }
+    }
+}
 
 /// Which top-level tab of the main window is currently showing.
 ///
@@ -133,28 +183,40 @@ pub enum TreeRow {
     FavoritesSeparator,
 }
 
-/// Describes how to launch or attach to a Claude session after the TUI exits.
+/// Describes how to launch or attach to an agent session after the TUI exits.
 #[derive(Debug, Clone)]
 pub enum LaunchRequest {
     /// Resume a historical session inside a new tmux live session.
-    Resume { session_id: String, cwd: String },
+    Resume {
+        session_id: String,
+        cwd: String,
+        backend: AgentBackend,
+    },
     /// Resume a historical session directly in the foreground (no tmux).
-    Direct { session_id: String, cwd: String },
+    Direct {
+        session_id: String,
+        cwd: String,
+        backend: AgentBackend,
+    },
     /// Attach the terminal to an already-running live tmux session.
     AttachLive { tmux_name: String },
-    /// Create and attach to a new live tmux session running claude.
+    /// Create and attach to a new live tmux session running an agent.
     NewLive {
-        /// tmux session name, also passed to claude as `--name`.
+        /// tmux session name (also passed to Claude as `--name`; Cursor has no name flag).
         name: String,
         /// Working directory the session starts in.
         cwd: String,
-        /// Launch with `--dangerously-skip-permissions`.
+        /// Launch with `--dangerously-skip-permissions` (Claude) or `--force` (Cursor).
         dangerous: bool,
-        /// Launch with `--worktree <name>`, so claude creates a git worktree for the session.
+        /// Launch with `--worktree <name>`.
         worktree: bool,
+        backend: AgentBackend,
     },
-    /// Start a new claude session directly in the foreground (no tmux).
-    NewDirect { cwd: String },
+    /// Start a new agent session directly in the foreground (no tmux).
+    NewDirect {
+        cwd: String,
+        backend: AgentBackend,
+    },
 }
 
 /// One visible row in the flat-view session list.
@@ -197,6 +259,21 @@ pub enum AppMode {
     JobConfirm,
     /// Stopping a live session is awaiting y/n confirmation (reached only from the Sessions tab).
     StopSessionConfirm,
+}
+
+/// Which row of the new-session naming popup has keyboard focus.
+///
+/// Focus starts on the name. Down moves to Agent (when both backends are
+/// shown) then Type; Left/Right cycle the focused switcher. The name field
+/// keeps Left/Right for the text cursor, so agent/type never steal letter keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NamingFocus {
+    /// The session name input (or the "name unused" note in direct mode).
+    Name,
+    /// Agent backend switcher (only when the source filter is Both).
+    Agent,
+    /// Launch-mode switcher (plain / danger / worktree / direct).
+    Type,
 }
 
 /// How a new session launched from the naming popup should be started.
@@ -348,7 +425,7 @@ pub struct App {
     /// Receiver end of the background update-check thread channel.
     pub update_receiver: Option<std::sync::mpsc::Receiver<update::UpdateInfo>>,
     /// Receiver end of the background session-name loading thread channel.
-    pub names_receiver: Option<std::sync::mpsc::Receiver<HashMap<String, String>>>,
+    pub names_receiver: Option<std::sync::mpsc::Receiver<HashMap<String, SessionMetaUpdate>>>,
     /// Set to true when the process should exec-restart itself after an update.
     pub should_restart: bool,
     /// Set to true whenever state changes require the screen to be redrawn.
@@ -357,6 +434,8 @@ pub struct App {
     pub live_sessions: Vec<LiveSession>,
     /// When true, only projects with active live sessions are shown.
     pub live_filter: bool,
+    /// Which agent backends are shown in the Sessions list.
+    pub source_filter: SourceFilter,
     /// Input state for the new-session naming popup.
     pub naming_input: Input,
     /// Auto-generated placeholder shown when `naming_text` is empty.
@@ -378,9 +457,11 @@ pub struct App {
     pub duplicate_cwd: Option<String>,
     /// Currently selected row in the Config tab's settings list (0..=CONFIG_MAX_ROW).
     pub config_selected: usize,
-    /// True when the `claude` binary cannot be found at startup.
+    /// True when the `claude` binary cannot be found (soft unless agent is also missing).
     pub missing_claude: bool,
-    /// True when the `tmux` binary cannot be found at startup.
+    /// True when the `agent` binary cannot be found (soft unless claude is also missing).
+    pub missing_agent: bool,
+    /// True when the `tmux` binary cannot be found (always blocking).
     pub missing_tmux: bool,
     /// True when editing a text field on the Config tab (paths, percentages, prompts).
     pub config_editing: bool,
@@ -392,9 +473,16 @@ pub struct App {
     pub activity_last_poll: HashMap<String, Instant>,
     /// Monotonic tick counter, incremented each redraw to drive pulse animation.
     pub tick: u64,
-    /// Which launch mode the open naming popup will use. Cycled with Tab/←/→
-    /// inside the popup rather than chosen by the key that opened it.
+    /// Which launch mode the open naming popup will use. Focus the Type row
+    /// and cycle with Left/Right rather than choosing by the key that opened it.
     pub naming_mode: NewSessionMode,
+    /// Which agent backend a new session from the naming popup will launch.
+    /// Follows the source filter when it is Claude/Cursor-only; when Both,
+    /// defaults to the last agent used in that directory (else Claude) and is
+    /// cycled on the Agent focus row.
+    pub naming_backend: AgentBackend,
+    /// Which naming-popup row receives Up/Down focus and Left/Right cycling.
+    pub naming_focus: NamingFocus,
     /// The live session awaiting stop confirmation in `AppMode::StopSessionConfirm`.
     pub stop_confirm_name: Option<String>,
     /// Vertical scroll offset for the help overlay, in lines.
@@ -479,6 +567,7 @@ impl App {
         let filtered_indices: Vec<usize> = (0..sessions.len()).collect();
         let group_chains = config.group_chains;
         let live_filter = config.live_filter;
+        let source_filter = SourceFilter::from_config(&config.source_filter);
         let favorites = config.favorites.clone();
         let live_sessions = live::discover_live_sessions(config.tmux_bin());
         let mut app = Self {
@@ -516,6 +605,7 @@ impl App {
             needs_redraw: true,
             live_sessions,
             live_filter,
+            source_filter,
             naming_input: Input::default(),
             naming_placeholder: String::new(),
             naming_cwd: None,
@@ -527,6 +617,7 @@ impl App {
             duplicate_cwd: None,
             config_selected: 0,
             missing_claude: false,
+            missing_agent: false,
             missing_tmux: false,
             config_editing: false,
             config_path_input: Input::default(),
@@ -534,6 +625,8 @@ impl App {
             activity_last_poll: HashMap::new(),
             tick: 0,
             naming_mode: NewSessionMode::Plain,
+            naming_backend: AgentBackend::ClaudeCode,
+            naming_focus: NamingFocus::Name,
             stop_confirm_name: None,
             help_scroll: 0,
             status_error: None,
@@ -565,12 +658,9 @@ impl App {
             model_options: models::available(),
         };
 
-        // Check for required binaries
-        let claude_ok = Config::is_bin_available(app.config.claude_bin());
-        let tmux_ok = Config::is_bin_available(app.config.tmux_bin());
-        if !claude_ok || !tmux_ok {
-            app.missing_claude = !claude_ok;
-            app.missing_tmux = !tmux_ok;
+        // tmux missing always blocks. Exactly one of claude/agent missing is soft.
+        app.refresh_bin_availability();
+        if app.deps_blocking() {
             app.mode = AppMode::MissingDeps;
         }
         app.missing_usage = crate::usage::source_unavailable(
@@ -585,34 +675,74 @@ impl App {
         app
     }
 
-    /// Spawn a background thread that loads custom titles for all sessions with data.
+    /// Spawn a background thread that loads titles (and Cursor entry counts).
+    ///
+    /// Claude titles come from JSONL `custom-title` entries. Cursor titles and
+    /// message counts come from `store.db`, which is deliberately not opened
+    /// during the list scan so startup stays fast with many chats.
     pub fn spawn_load_session_names(&mut self) {
-        let sessions: Vec<(String, String)> = self
+        let sessions: Vec<(AgentBackend, String, String)> = self
             .sessions
             .iter()
             .filter(|s| s.has_data)
-            .map(|s| (s.project.clone(), s.session_id.clone()))
+            .map(|s| (s.backend, s.project.clone(), s.session_id.clone()))
             .collect();
 
         let (tx, rx) = std::sync::mpsc::channel();
         self.names_receiver = Some(rx);
 
         std::thread::spawn(move || {
-            let mut names = HashMap::new();
-            for (project, session_id) in sessions {
-                if let Some(title) = data::load_custom_title(&project, &session_id) {
-                    names.insert(session_id, title);
+            let mut updates = HashMap::new();
+            for (backend, project, session_id) in sessions {
+                match backend {
+                    AgentBackend::ClaudeCode => {
+                        if let Some(title) = data::load_custom_title(&project, &session_id) {
+                            updates.insert(
+                                session_id,
+                                SessionMetaUpdate {
+                                    name: Some(title),
+                                    entry_count: None,
+                                },
+                            );
+                        }
+                    }
+                    AgentBackend::CursorAgent => {
+                        if let Some(path) = data::cursor_history::find_cursor_store(&session_id) {
+                            if let Some(meta) = data::cursor_store::read_store_meta(&path) {
+                                updates.insert(
+                                    session_id,
+                                    SessionMetaUpdate {
+                                        name: meta.name,
+                                        entry_count: Some(meta.entry_count),
+                                    },
+                                );
+                            }
+                        }
+                    }
                 }
             }
-            let _ = tx.send(names);
+            let _ = tx.send(updates);
         });
     }
 
-    /// Apply custom titles received from the background loader, then refresh all views.
-    pub fn apply_session_names(&mut self, names: HashMap<String, String>) {
+    /// Apply titles / Cursor counts from the background loader, then refresh views.
+    pub fn apply_session_names(&mut self, updates: HashMap<String, SessionMetaUpdate>) {
         for session in &mut self.sessions {
-            if let Some(title) = names.get(&session.session_id) {
-                session.name = Some(title.clone());
+            let Some(update) = updates.get(&session.session_id) else {
+                continue;
+            };
+            match session.backend {
+                AgentBackend::ClaudeCode => {
+                    if let Some(ref title) = update.name {
+                        session.name = Some(title.clone());
+                    }
+                }
+                AgentBackend::CursorAgent => {
+                    session.name = update.name.clone();
+                    if let Some(count) = update.entry_count {
+                        session.entry_count = count;
+                    }
+                }
             }
         }
 
@@ -636,6 +766,97 @@ impl App {
         }
     }
 
+    /// Re-check whether the configured claude, agent, and tmux binaries exist.
+    pub(crate) fn refresh_bin_availability(&mut self) {
+        self.missing_claude = !Config::is_bin_available(self.config.claude_bin());
+        self.missing_agent = !Config::is_bin_available(self.config.agent_bin());
+        self.missing_tmux = !Config::is_bin_available(self.config.tmux_bin());
+    }
+
+    /// True when the missing-deps dialog must block the app.
+    ///
+    /// tmux missing always blocks. Exactly one of claude/agent missing does not;
+    /// both agents missing does.
+    pub(crate) fn deps_blocking(&self) -> bool {
+        self.missing_tmux || (self.missing_claude && self.missing_agent)
+    }
+
+    /// Default agent for a new session in `dir`.
+    ///
+    /// Claude/Cursor-only source filters force that backend. When Both, pick
+    /// the most recently active historical session in `dir`, falling back to
+    /// Claude when the directory has no history yet.
+    pub(crate) fn default_naming_backend(&self, dir: &str) -> AgentBackend {
+        match self.source_filter {
+            SourceFilter::Cursor => AgentBackend::CursorAgent,
+            SourceFilter::Claude => AgentBackend::ClaudeCode,
+            SourceFilter::Both => self
+                .last_backend_for_dir(dir)
+                .unwrap_or(AgentBackend::ClaudeCode),
+        }
+    }
+
+    /// Backend of the most recent historical session whose project matches `dir`.
+    fn last_backend_for_dir(&self, dir: &str) -> Option<AgentBackend> {
+        let dir = Path::new(dir);
+        self.sessions
+            .iter()
+            .filter(|s| Path::new(&s.project) == dir)
+            .max_by_key(|s| s.last_timestamp)
+            .map(|s| s.backend)
+    }
+
+    /// Cycle the naming popup's backend when the source filter is Both.
+    pub(crate) fn cycle_naming_backend(&mut self) {
+        if self.source_filter != SourceFilter::Both {
+            return;
+        }
+        self.naming_backend = match self.naming_backend {
+            AgentBackend::ClaudeCode => AgentBackend::CursorAgent,
+            AgentBackend::CursorAgent => AgentBackend::ClaudeCode,
+        };
+    }
+
+    /// Move naming-popup focus down: Name → Agent (if Both) → Type.
+    pub(crate) fn naming_focus_down(&mut self) {
+        let show_agent = self.source_filter == SourceFilter::Both;
+        self.naming_focus = match self.naming_focus {
+            NamingFocus::Name if show_agent => NamingFocus::Agent,
+            NamingFocus::Name | NamingFocus::Agent => NamingFocus::Type,
+            NamingFocus::Type => NamingFocus::Type,
+        };
+    }
+
+    /// Move naming-popup focus up: Type → Agent (if Both) → Name.
+    pub(crate) fn naming_focus_up(&mut self) {
+        let show_agent = self.source_filter == SourceFilter::Both;
+        self.naming_focus = match self.naming_focus {
+            NamingFocus::Type if show_agent => NamingFocus::Agent,
+            NamingFocus::Type | NamingFocus::Agent => NamingFocus::Name,
+            NamingFocus::Name => NamingFocus::Name,
+        };
+    }
+
+    /// Return false (and set `status_error`) when `backend`'s binary is missing.
+    pub(crate) fn ensure_backend_available(&mut self, backend: AgentBackend) -> bool {
+        self.refresh_bin_availability();
+        match backend {
+            AgentBackend::ClaudeCode if self.missing_claude => {
+                self.status_error = Some(
+                    "claude binary not found — set the path on the Config tab".to_string(),
+                );
+                false
+            }
+            AgentBackend::CursorAgent if self.missing_agent => {
+                self.status_error = Some(
+                    "agent binary not found — set the path on the Config tab".to_string(),
+                );
+                false
+            }
+            _ => true,
+        }
+    }
+
     /// Open the new-session naming popup for the selected row's project,
     /// starting in `mode`.
     ///
@@ -648,7 +869,10 @@ impl App {
         let Some(cwd) = self.selected_cwd() else {
             return false;
         };
-        let dir = if std::path::Path::new(&cwd).exists() {
+        // Prefer the selected project for agent defaulting even when the path
+        // is gone from disk (launch then falls back to ".").
+        let naming_backend = self.default_naming_backend(&cwd);
+        let dir = if Path::new(&cwd).exists() {
             cwd
         } else {
             ".".to_string()
@@ -658,9 +882,11 @@ impl App {
             return false;
         }
         self.naming_placeholder = live::generate_auto_name(&dir, &self.live_sessions);
+        self.naming_backend = naming_backend;
         self.naming_cwd = Some(dir);
         self.naming_input = Input::default();
         self.naming_mode = mode;
+        self.naming_focus = NamingFocus::Name;
         self.mode = AppMode::NamingSession;
         true
     }
@@ -714,6 +940,7 @@ impl App {
         self.config.hide_empty = self.hide_empty;
         self.config.group_chains = self.group_chains;
         self.config.live_filter = self.live_filter;
+        self.config.source_filter = self.source_filter.as_str().to_string();
         self.config.favorites = self.favorites.clone();
         // claude_path and tmux_path are saved directly on config when edited
         if let Err(e) = self.config.save() {

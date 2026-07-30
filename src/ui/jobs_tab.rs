@@ -17,6 +17,7 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
     Frame,
 };
+use unicode_width::UnicodeWidthStr;
 
 use crate::theme::{
     ACCENT_AMBER, ACCENT_BLUE, ACCENT_GREEN, ACCENT_MAUVE, ACCENT_PEACH, ACCENT_RED, BG_SURFACE,
@@ -247,34 +248,75 @@ pub(crate) fn draw_jobs_tab(frame: &mut Frame, app: &App, list_area: Rect, right
     draw_job_detail(frame, app, right_chunks[1]);
 }
 
+/// Build the Jobs list title, shrinking the watcher badge when the pane is
+/// too narrow for the spelled-out form (the list is only 30% of the window).
+fn jobs_list_title(app: &App, width: u16) -> Line<'static> {
+    let watcher_ok = app.watch_running;
+    let count = format!("({}) ", app.jobs.len());
+    // Two border corners plus a trailing space, matching `build_title_spans`.
+    let budget = width.saturating_sub(3) as usize;
+    let used = " Jobs ".width() + count.width();
+    let remaining = budget.saturating_sub(used);
+
+    let mut title_spans = vec![
+        Span::styled(
+            " Jobs ",
+            Style::default().fg(ACCENT_PEACH).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(count, Style::default().fg(FG_SUBTEXT)),
+    ];
+
+    let (long, short, style) = if watcher_ok {
+        (
+            "● watcher on ",
+            "● on ",
+            Style::default().fg(ACCENT_GREEN),
+        )
+    } else {
+        (
+            "● watcher off ",
+            "● OFF ",
+            Style::default().fg(ACCENT_RED).add_modifier(Modifier::BOLD),
+        )
+    };
+    if long.width() <= remaining {
+        title_spans.push(Span::styled(long, style));
+    } else if short.width() <= remaining {
+        title_spans.push(Span::styled(short, style));
+    }
+    Line::from(title_spans)
+}
+
+/// Compact watcher-stopped banner lines sized for the narrow Jobs list pane.
+///
+/// A single prose sentence was clipped to `"Press s to sta"` at typical
+/// widths because the pane is only ~30% of the window and the banner was
+/// allocated one row. Stack short lines instead so the OFF state and the
+/// start key stay fully visible.
+fn watcher_stopped_banner(pending: usize) -> Vec<Line<'static>> {
+    let style = Style::default().fg(ACCENT_RED).add_modifier(Modifier::BOLD);
+    let mut lines = vec![Line::from(Span::styled(" OFF", style))];
+    if pending > 0 {
+        lines.push(Line::from(Span::styled(
+            format!(" {pending} pending"),
+            style,
+        )));
+    }
+    lines.push(Line::from(Span::styled(" s to start", style)));
+    lines
+}
+
 /// Render the left-hand job list, including the watcher-state banner lines that
 /// explain why nothing is progressing when the daemon is not running.
 fn draw_jobs_list(frame: &mut Frame, app: &App, area: Rect) {
     let watcher_ok = app.watch_running;
     let border_color = if watcher_ok { ACCENT_PEACH } else { ACCENT_RED };
 
-    let mut title_spans = vec![Span::styled(
-        " Jobs ",
-        Style::default().fg(ACCENT_PEACH).add_modifier(Modifier::BOLD),
-    )];
-    title_spans.push(Span::styled(
-        format!("({}) ", app.jobs.len()),
-        Style::default().fg(FG_SUBTEXT),
-    ));
-    title_spans.push(if watcher_ok {
-        Span::styled("● watcher on ", Style::default().fg(ACCENT_GREEN))
-    } else {
-        Span::styled(
-            "● watcher off ",
-            Style::default().fg(ACCENT_RED).add_modifier(Modifier::BOLD),
-        )
-    });
-
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(border_color))
-        .title(Line::from(title_spans))
+        .title(jobs_list_title(app, area.width))
         .style(Style::default().bg(BG_SURFACE));
 
     let inner = block.inner(area);
@@ -288,16 +330,7 @@ fn draw_jobs_list(frame: &mut Frame, app: &App, area: Rect) {
         )));
     }
     if !watcher_ok {
-        let pending = app.pending_command_count();
-        let msg = if pending > 0 {
-            format!(" watcher stopped — {pending} pending command(s). Press s to start it.")
-        } else {
-            " watcher stopped — jobs will not run. Press s to start it.".to_string()
-        };
-        banner.push(Line::from(Span::styled(
-            msg,
-            Style::default().fg(ACCENT_RED).add_modifier(Modifier::BOLD),
-        )));
+        banner.extend(watcher_stopped_banner(app.pending_command_count()));
     }
 
     let banner_height = banner.len().min(inner.height as usize) as u16;
@@ -891,9 +924,11 @@ fn jobs_scroll_offset(selected: usize, total: usize, visible: usize) -> usize {
 mod tests {
     use super::{
         format_eta, job_detail_lines, job_form_field_help, jobs_scroll_offset, truncate_name,
-        App, JobConfirmAction, JobState, JOB_FORM_MAX_ROW, JOB_FORM_MODEL_ROW,
+        watcher_stopped_banner, App, JobConfirmAction, JobState, JOB_FORM_MAX_ROW,
+        JOB_FORM_MODEL_ROW,
     };
     use crate::config::Config;
+    use unicode_width::UnicodeWidthStr;
 
     #[test]
     fn every_form_row_explains_itself() {
@@ -1035,6 +1070,58 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(text.contains("Mark done \"refactor\"?"), "{text}");
+    }
+
+    /// Render the Jobs tab at a typical narrow width and return the buffer text.
+    fn render_jobs_tab(app: &mut App, width: u16, height: u16) -> String {
+        use ratatui::{backend::TestBackend, Terminal};
+        app.main_tab = crate::app::MainTab::Jobs;
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn watcher_stopped_banner_lines_stay_short() {
+        for pending in [0usize, 1, 12] {
+            for line in watcher_stopped_banner(pending) {
+                let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+                assert!(
+                    text.width() <= 16,
+                    "banner line {text:?} is wider than a 60-col 30% pane"
+                );
+            }
+        }
+        let plain: String = watcher_stopped_banner(0)
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(plain.contains("OFF"), "{plain}");
+        assert!(plain.contains("s to start"), "{plain}");
+        assert!(!plain.contains("Press s to start"), "{plain}");
+    }
+
+    #[test]
+    fn stopped_watcher_banner_is_fully_visible_on_a_narrow_terminal() {
+        let mut app = App::new(vec![], None, Config::default());
+        app.jobs = vec![sample_job()];
+        app.watch_running = false;
+        // 60x20 is the size that previously clipped "Press s to start" mid-word
+        // inside the 30% Jobs list pane.
+        let text = render_jobs_tab(&mut app, 60, 20);
+        assert!(text.contains("OFF"), "{text}");
+        assert!(text.contains("s to start"), "{text}");
+        assert!(!text.contains("Press s to sta"), "{text}");
+        assert!(!text.contains("jobs will not run"), "{text}");
     }
 
     #[test]

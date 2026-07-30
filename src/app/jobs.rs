@@ -357,6 +357,15 @@ impl App {
     /// (bind `Resume`), and a header row (or anything else) prefills only the
     /// cwd for a brand-new job (bind `New`).
     pub fn job_form_from_selection(&mut self) {
+        if let Some(idx) = self.selected_session_index() {
+            if self.sessions[idx].backend == crate::data::AgentBackend::CursorAgent {
+                self.status_error = Some(
+                    "Scheduler jobs are Claude-only — Cursor chats can't be managed as jobs"
+                        .to_string(),
+                );
+                return;
+            }
+        }
         self.reset_job_form();
         if let Some(idx) = self.selected_live_index() {
             let ls = &self.live_sessions[idx];

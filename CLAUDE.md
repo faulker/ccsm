@@ -31,7 +31,7 @@ Central `App` struct holding all UI state. Each sub-file adds `impl App` methods
 
 | File | Concern |
 |------|---------|
-| `mod.rs` | `App` struct, enums (`TreeRow`, `FlatRow`, `AppMode`, `MainTab`, `HelpTab`, `LaunchRequest`, `DuplicateSource`, `NewSessionMode`), `new()`, `spawn_load_session_names()`, `apply_session_names()`, `reload_sessions()`, `open_naming_popup()`, `cycle_naming_mode()`, `save_config()` |
+| `mod.rs` | `App` struct, enums (`TreeRow`, `FlatRow`, `AppMode`, `MainTab`, `HelpTab`, `LaunchRequest`, `DuplicateSource`, `NewSessionMode`, `NamingFocus`), `new()`, `spawn_load_session_names()`, `apply_session_names()`, `reload_sessions()`, `open_naming_popup()`, `cycle_naming_mode()`, `save_config()` |
 | `tree.rs` | `init_tree()`, `recompute_tree()`: tree-view row computation |
 | `flat.rs` | `recompute_flat_rows()`: flat-view row computation |
 | `filter.rs` | `recompute_filter()`: filter text + hide-empty + chain grouping logic |
@@ -45,16 +45,18 @@ Central `App` struct holding all UI state. Each sub-file adds `impl App` methods
 | `tests.rs` | All `#[cfg(test)]` tests |
 
 ### `src/data/`: Session data I/O
-Reads `~/.claude/history.jsonl` and individual session JSONL files from `~/.claude/projects/{path}/{id}.jsonl`.
+Reads Claude history from `~/.claude/history.jsonl` / `~/.claude/projects/{path}/{id}.jsonl`, and Cursor Agent chats from `~/.cursor/chats/{hash}/{chatId}/` (`meta.json` + `store.db`). `load_all_sessions` merges both (Claude-only if Cursor data is absent or unreadable). `SessionInfo.backend` is an `AgentBackend` (`ClaudeCode` / `CursorAgent`); the source filter (`s`) lives on `App` / `config.source_filter` and is applied in `recompute_filter` before hide-empty / text / chains. Cursor listing reads `meta.json` only; titles and entry counts load from `store.db` in the background name thread (same as Claude custom titles). Preview parses `store.db` via hand-rolled protobuf field-1 refs (`rusqlite` 0.37 bundled — do not bump without checking `libsqlite3-sys` / `cfg_select!`).
 
 | File | Concern |
 |------|---------|
 | `mod.rs` | Re-exports public types and functions |
-| `types.rs` | `SessionInfo`, `SessionMeta`, `PreviewMessage`, and all private deserialization structs |
+| `types.rs` | `AgentBackend`, `SessionInfo`, `SessionMeta`, `PreviewMessage`, and all private deserialization structs |
 | `io.rs` | `project_to_dir_name()`, `session_file_path()`, `format_session_boundary_date()` |
-| `history.rs` | `load_sessions()`, `read_session_meta()`, `strip_xml_tags()` |
-| `preview.rs` | `load_session_messages()`, `load_chain_preview()`, `load_preview()` |
-| `titles.rs` | `load_custom_title()`, `save_custom_title()` |
+| `history.rs` | `load_sessions()`, `load_all_sessions()`, `read_session_meta()`, `strip_xml_tags()` |
+| `cursor_history.rs` | `load_cursor_sessions()`: walk `~/.cursor/chats`, parse `meta.json`, titles from `store.db` |
+| `cursor_store.rs` | Read-only `store.db` transcript reconstruction (WAL copy fallback, wrapper stripping) |
+| `preview.rs` | `load_session_messages()`, `load_chain_preview()`, `load_preview()`, `load_cursor_preview()` |
+| `titles.rs` | `load_custom_title()`, `save_custom_title()` (Claude JSONL only) |
 | `tests.rs` | All `#[cfg(test)]` tests |
 
 ### `src/ui/`: TUI rendering
@@ -99,7 +101,7 @@ Reads the 5-hour and 7-day rate-limit windows natively; ccsm depends on no exter
 
 - **`keys.rs`**: Key event handlers split by modal context (rename, naming, duplicate, stop-confirm) and normal mode navigation/actions. `handle_event` reads the terminal and dispatches; the Sessions-tab keymap lives in `dispatch_normal_key_with_shift` so it can be driven from tests. `normalize_key`/`shifted_char` resolve Shift for every text field.
 - **`live.rs`**: Tmux integration using dedicated `ccsm` socket. Discovers running sessions, manages attach/detach/rename/kill, captures pane output for live preview.
-- **`config.rs`**: Config struct serialized to `~/.config/ccsm/config.json`. Fields: view mode, display mode, hide_empty, group_chains, live_filter, favorites, custom binary paths, the usage source and history-file override, and the scheduler's usage thresholds, continue prompt, and `idle_complete_seconds`.
+- **`config.rs`**: Config struct serialized to `~/.config/ccsm/config.json`. Fields: view mode, display mode, hide_empty, group_chains, live_filter, `source_filter` (`both`/`claude`/`cursor`), favorites, custom binary paths (`claude_path`, `agent_path`, `tmux_path`), the usage source and history-file override, and the scheduler's usage thresholds, continue prompt, and `idle_complete_seconds`.
 - **`models.rs`**: Builds the job form's `--model` picker at runtime. Tier aliases (`opus`/`sonnet`/`haiku`/`fable`) plus concrete ids read from `~/.claude.json` (`additionalModelOptionsCache` and `projects.*.lastModelUsage`). Pure `discovered_from_json()` is unit tested; only `available()` touches the filesystem.
 - **`update.rs`**: Background version check against GitHub Releases API (24h cooldown). Downloads platform-specific archive, replaces binary in-place, triggers auto-restart. `.github/workflows/release.yml` codesigns and notarizes the macOS binaries between building and packaging, so the published checksums cover the signed binary; the Apple secrets it needs are documented in `docs/macos-signing.md`.
 - **`watch.rs`**: The `ccsm --watch` daemon. Owns all job state, runs a 1s loop (drain commands, reconcile tmux, poll activity, adaptive usage fetch, `engine::plan`, execute, persist). Lives in its own `ccsm-watch` tmux session.
@@ -113,8 +115,9 @@ Reads the 5-hour and 7-day rate-limit windows natively; ccsm depends on no exter
 - **Leaving the Config tab re-checks the binaries** (`leave_config_tab`, returning false when one is still missing). Esc/Tab out of a bad `claude` or `tmux` path would otherwise land on a session list where nothing can launch, so `AppMode::MissingDeps` is raised again instead
 - Modal state machine via `AppMode` enum drives which key handlers and UI overlays are active
 - `LaunchRequest` enum returned from the event loop tells `main.rs` what to do after terminal teardown (resume, attach, new live/direct session). `NewLive` carries `dangerous`/`worktree` flags rather than having a variant per launch mode; `main::new_session_argv` turns them into argv
-- **New-session launch modes are cycled inside the popup, not bound to separate keys** (this reverses an earlier decision). `n` is the only entry point; `Tab` cycles `NewSessionMode` (plain / danger / worktree / direct) and the popup's border and title follow the selection. The three former `Shift+N`/`Shift+D`/`Shift+W` keys cost 39 of the status bar's 137 hint columns for one concept, which is what made the bar unfittable on a normal terminal. `cycle_naming_mode` skips `Worktree` outside a git repo, so an impossible mode cannot be selected rather than being rejected at submit time
-- **`Tab` cycles the naming popup's mode, never the arrow keys.** Left/Right belong to `tui_input` for moving the cursor within the name being typed
+- **New-session launch modes are cycled inside the popup, not bound to separate keys** (this reverses an earlier decision). `n` is the only entry point; focus starts on the name, `↓` moves to Agent (when both backends) then Type, and `←`/`→` cycle the focused switcher. The popup's border and title follow the Type selection. Letter keys only edit the name while that row is focused, so agent switching never steals `a`. `cycle_naming_mode` skips `Worktree` outside a git repo, so an impossible mode cannot be selected rather than being rejected at submit time
+- **`↓`/`↑` move naming-popup focus; Left/Right cycle Agent or Type.** Left/Right on the name row still belong to `tui_input` for the text cursor
+- **Auto-update checks are skipped in debug builds** (`cargo run` / `cfg!(debug_assertions)`), so local development is never interrupted by a release prompt against a different binary
 - **The model list is discovered, never hard-coded** (`models.rs`). A release-pinned catalogue goes stale the moment Claude Code ships a model, so the picker reads Claude Code's own state and falls back to tier aliases
 - **Inherited defaults are shown, not hidden**: an unset job continue-prompt or model renders as the value that will actually be used, in both the form and the detail pane. `(default)` alone reads as "nothing will be sent"
 - Directory modules use `use super::*` in sub-files, each adds `impl App`/`impl` blocks without duplicating the struct

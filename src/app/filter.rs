@@ -1,20 +1,32 @@
 use super::*;
 
 impl App {
-    /// Recompute `filtered_indices` from the current filter text, hide-empty flag, and chain
-    /// grouping setting, then rebuild both tree and flat views and clamp the selection.
+    /// Recompute `filtered_indices` from the source filter, hide-empty flag, filter text,
+    /// and chain grouping setting, then rebuild both tree and flat views and clamp the selection.
     pub(crate) fn recompute_filter(&mut self) {
         let query = self.filter_input.value().to_lowercase();
+
+        // Source filter runs first so hide-empty / text / chains never see excluded backends.
+        let source_ok = |backend: AgentBackend| match self.source_filter {
+            SourceFilter::Both => true,
+            SourceFilter::Claude => backend == AgentBackend::ClaudeCode,
+            SourceFilter::Cursor => backend == AgentBackend::CursorAgent,
+        };
+
         let initial_indices: Vec<usize> = if query.is_empty() {
             (0..self.sessions.len())
-                .filter(|&i| !self.hide_empty || self.sessions[i].has_data)
+                .filter(|&i| {
+                    source_ok(self.sessions[i].backend)
+                        && (!self.hide_empty || self.sessions[i].has_data)
+                })
                 .collect()
         } else {
             self.sessions
                 .iter()
                 .enumerate()
                 .filter(|(_, s)| {
-                    (!self.hide_empty || s.has_data)
+                    source_ok(s.backend)
+                        && (!self.hide_empty || s.has_data)
                         && (s.project_name.to_lowercase().contains(&query)
                             || s.project.to_lowercase().contains(&query))
                 })

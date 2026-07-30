@@ -126,6 +126,7 @@ pub fn load_sessions(filter_path: Option<&str>) -> Result<Vec<SessionInfo>> {
                 has_data: false,
                 name: None,
                 slug: None,
+                backend: AgentBackend::ClaudeCode,
             });
     }
 
@@ -142,6 +143,23 @@ pub fn load_sessions(filter_path: Option<&str>) -> Result<Vec<SessionInfo>> {
     result.sort_by(|a, b| b.last_timestamp.cmp(&a.last_timestamp));
 
     Ok(result)
+}
+
+/// Load Claude sessions and, when present, Cursor chats, sorted by most recent activity.
+///
+/// A missing or unreadable Cursor store degrades to Claude-only so the TUI always starts.
+pub fn load_all_sessions(filter_path: Option<&str>) -> Result<Vec<SessionInfo>> {
+    let mut sessions = load_sessions(filter_path)?;
+    let cursor_root = dirs::home_dir().map(|h| h.join(".cursor/chats"));
+    if let Some(root) = cursor_root {
+        if root.is_dir() {
+            // Intentionally swallow Cursor scan failures: Claude-only is better than no TUI.
+            let cursor = super::cursor_history::load_cursor_sessions(filter_path);
+            sessions.extend(cursor);
+            sessions.sort_by(|a, b| b.last_timestamp.cmp(&a.last_timestamp));
+        }
+    }
+    Ok(sessions)
 }
 
 /// Read at most the first 20 lines of a session JSONL and return `(slug, exit_only)`.

@@ -10,7 +10,8 @@ pub(crate) mod util;
 
 use crate::app::{App, AppMode, MainTab};
 use crate::theme::{
-    ACCENT_BLUE, ACCENT_MAUVE, ACCENT_PEACH, BG_SURFACE, FG_OVERLAY, FG_SUBTEXT, HIGHLIGHT_BG,
+    ACCENT_BLUE, ACCENT_MAUVE, ACCENT_PEACH, ACCENT_TEAL, BG_SURFACE, FG_OVERLAY, FG_SUBTEXT,
+    HIGHLIGHT_BG,
 };
 use crate::update::UpdateStatus;
 use ratatui::{
@@ -209,18 +210,40 @@ fn draw_sessions_tab(frame: &mut Frame, app: &mut App, list_area: Rect, right_ar
             let (dot, dot_style) = live_dot_style(app, idx);
             spans.push(Span::styled(format!("{} ", dot), dot_style));
             spans.push(Span::styled(ls.display_name.clone(), Style::default().fg(ACCENT_PEACH).add_modifier(Modifier::BOLD)));
+            if let Some(backend) = ls.backend {
+                let color = match backend {
+                    crate::data::AgentBackend::ClaudeCode => ACCENT_PEACH,
+                    crate::data::AgentBackend::CursorAgent => ACCENT_TEAL,
+                };
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled(
+                    backend.short_label().to_string(),
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ));
+            }
             spans.push(Span::raw("  "));
-            spans.push(Span::styled(" ", Style::default().fg(FG_OVERLAY)));
             spans.push(Span::styled(ls.cwd.clone(), Style::default().fg(FG_SUBTEXT)));
         }
     } else {
+        // Name the agent first so list marks are unambiguous in the details bar.
+        if let Some(idx) = app.selected_session_index() {
+            let backend = app.sessions[idx].backend;
+            let color = match backend {
+                crate::data::AgentBackend::ClaudeCode => ACCENT_PEACH,
+                crate::data::AgentBackend::CursorAgent => ACCENT_TEAL,
+            };
+            spans.push(Span::styled(
+                format!(" {} ", backend.short_label()),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ));
+        }
         if meta.all_session_ids.len() > 1 {
             let last_id: String = meta.all_session_ids.last()
                 .map(|id| id.chars().take(8).collect())
                 .unwrap_or_default();
             let extra = meta.all_session_ids.len() - 1;
             spans.push(Span::styled(
-                format!(" # {}", last_id),
+                format!("# {}", last_id),
                 Style::default().fg(ACCENT_BLUE),
             ));
             spans.push(Span::styled(
@@ -230,7 +253,7 @@ fn draw_sessions_tab(frame: &mut Frame, app: &mut App, list_area: Rect, right_ar
         } else if let Some(id) = &meta.session_id {
             let short_id: String = id.chars().take(8).collect();
             spans.push(Span::styled(
-                format!(" # {}", short_id),
+                format!("# {}", short_id),
                 Style::default().fg(ACCENT_BLUE),
             ));
         }
@@ -280,11 +303,9 @@ fn draw_sessions_tab(frame: &mut Frame, app: &mut App, list_area: Rect, right_ar
     let preview_area = right_chunks[1];
     let inner_width = preview_area.width.saturating_sub(2) as usize; // borders
     let inner_height = preview_area.height.saturating_sub(2); // borders
-    let content_height = if is_live_selected {
-        preview_text.lines.len()
-    } else {
-        estimate_wrapped_height(&preview_text, inner_width)
-    };
+    // Live pane lines are often wider than this preview column; wrap them the
+    // same way as history so they cannot paint past the pane into the list.
+    let content_height = estimate_wrapped_height(&preview_text, inner_width);
     let max_scroll = (content_height as u16).saturating_sub(inner_height);
     if app.preview_auto_scroll && is_live_selected {
         app.preview_scroll = max_scroll;
@@ -295,7 +316,7 @@ fn draw_sessions_tab(frame: &mut Frame, app: &mut App, list_area: Rect, right_ar
         }
     }
 
-    let mut preview_widget = Paragraph::new(preview_text)
+    let preview_widget = Paragraph::new(preview_text)
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -307,10 +328,8 @@ fn draw_sessions_tab(frame: &mut Frame, app: &mut App, list_area: Rect, right_ar
                 ))
                 .style(Style::default().bg(BG_SURFACE)),
         )
-        .scroll((app.preview_scroll, 0));
-    if !is_live_selected {
-        preview_widget = preview_widget.wrap(Wrap { trim: false });
-    }
+        .scroll((app.preview_scroll, 0))
+        .wrap(Wrap { trim: false });
 
     frame.render_widget(preview_widget, preview_area);
 }
@@ -350,6 +369,9 @@ fn draw_overlays(frame: &mut Frame, app: &mut App) {
             &app.naming_placeholder,
             app.naming_mode,
             cwd_is_repo,
+            app.naming_backend,
+            app.source_filter == crate::app::SourceFilter::Both,
+            app.naming_focus,
         );
     }
 
@@ -496,6 +518,17 @@ mod tests {
         }
     }
 
+    #[test]
+    fn help_documents_the_source_filter_and_cursor_rename() {
+        // Tall enough that the Actions block (including `s`) fits without scroll.
+        let text = screen(AppMode::Help, 100, 40);
+        assert!(
+            text.contains("Cycle source") || text.contains("source filter"),
+            "missing source filter help:\n{text}"
+        );
+        assert!(text.contains("Claude only"), "missing jobs Claude-only note:\n{text}");
+    }
+
     /// The config list holds ~28 lines but gets 18 rows at 60x20, so the
     /// About block used to be unreachable. It follows the cursor now.
     #[test]
@@ -581,11 +614,179 @@ mod tests {
     }
 
     #[test]
-    fn the_naming_popup_shows_every_launch_mode() {
+    fn help_documents_session_marks_and_naming_focus() {
+        // Tall enough that Session marks and the new-session popup block fit.
+        let text = screen(AppMode::Help, 100, 50);
+        assert!(
+            text.contains("Claude Code session") && text.contains("Cursor Agent session"),
+            "missing C/A mark explanations:\n{text}"
+        );
+        assert!(
+            text.contains("Move focus") || text.contains("name → Agent"),
+            "missing naming focus help:\n{text}"
+        );
+    }
+
+    #[test]
+    fn the_naming_popup_shows_type_row() {
         let text = screen(AppMode::NamingSession, 80, 24);
-        for label in ["plain", "danger", "worktree", "direct"] {
-            assert!(text.contains(label), "missing {label}:\n{text}");
+        assert!(text.contains("Type:"), "missing Type row:\n{text}");
+        assert!(text.contains("plain"), "missing plain mode:\n{text}");
+    }
+
+    #[test]
+    fn live_preview_info_bar_names_the_agent_after_the_session_name() {
+        let mut app = App::new(vec![], None, Config::default());
+        app.jobs = vec![];
+        app.watch_state = None;
+        app.live_sessions = vec![crate::live::LiveSession {
+            tmux_name: "my-live".into(),
+            display_name: "my-live".into(),
+            cwd: "/tmp/proj".into(),
+            project_name: "proj".into(),
+            job_id: None,
+            backend: Some(crate::data::AgentBackend::CursorAgent),
+        }];
+        app.tree_view = false;
+        app.recompute_flat_rows();
+        // Select the live row (after the Running header).
+        app.selected = app
+            .flat_rows
+            .iter()
+            .position(|r| matches!(r, crate::app::FlatRow::LiveItem { .. }))
+            .expect("live row");
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let text: String = (0..24)
+            .map(|y| {
+                (0..100)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Name first, then short agent label — matches the info-bar layout.
+        let name_at = text.find("my-live").expect("session name");
+        let agent_at = text.find("Cursor").expect("agent label");
+        assert!(
+            agent_at > name_at,
+            "agent should appear after the session name:\n{text}"
+        );
+        assert!(
+            !text.contains("Cursor Agent"),
+            "live info bar should use the short label:\n{text}"
+        );
+    }
+
+    #[test]
+    fn history_preview_info_bar_uses_short_agent_label() {
+        let mut app = App::new(
+            vec![crate::data::SessionInfo {
+                session_id: "hist-1".into(),
+                project: "/tmp/proj".into(),
+                project_name: "proj".into(),
+                first_timestamp: 1,
+                last_timestamp: 2,
+                entry_count: 1,
+                has_data: true,
+                name: Some("a chat".into()),
+                slug: None,
+                backend: crate::data::AgentBackend::ClaudeCode,
+            }],
+            None,
+            Config::default(),
+        );
+        app.jobs = vec![];
+        app.watch_state = None;
+        app.live_sessions.clear();
+        app.tree_view = false;
+        app.recompute_filter();
+        app.recompute_flat_rows();
+        app.selected = app
+            .flat_rows
+            .iter()
+            .position(|r| matches!(r, crate::app::FlatRow::HistoryItem { .. }))
+            .expect("history row");
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let text: String = (0..24)
+            .map(|y| {
+                (0..100)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Claude"), "missing short label:\n{text}");
+        assert!(
+            !text.contains("Claude Code"),
+            "history info bar should use the short label:\n{text}"
+        );
+    }
+
+    /// Long live-pane lines must wrap inside the preview column, not paint into
+    /// the session list on the left.
+    #[test]
+    fn live_preview_long_lines_stay_in_preview_pane() {
+        let mut app = App::new(vec![], None, Config::default());
+        app.jobs = vec![];
+        app.watch_state = None;
+        app.live_sessions = vec![crate::live::LiveSession {
+            tmux_name: "wide-live".into(),
+            display_name: "wide-live".into(),
+            cwd: "/tmp".into(),
+            project_name: "tmp".into(),
+            job_id: None,
+            backend: Some(crate::data::AgentBackend::ClaudeCode),
+        }];
+        // Wider than any reasonable preview column; distinctive so list chrome
+        // cannot be mistaken for leaked preview content.
+        let long_line = "W".repeat(400);
+        app.live_preview_cache.insert(
+            "wide-live".into(),
+            (long_line, std::time::Instant::now()),
+        );
+        app.tree_view = false;
+        app.recompute_flat_rows();
+        app.selected = app
+            .flat_rows
+            .iter()
+            .position(|r| matches!(r, crate::app::FlatRow::LiveItem { .. }))
+            .expect("live row");
+
+        const W: u16 = 100;
+        const H: u16 = 24;
+        let mut terminal = Terminal::new(TestBackend::new(W, H)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+
+        // Sessions list is 30% of the body row (under the tab strip).
+        let list_width = (W as u32 * 30 / 100) as u16;
+        let mut leaked = 0u32;
+        let mut preview_w = 0u32;
+        for y in 1..H.saturating_sub(1) {
+            for x in 0..list_width.saturating_sub(1) {
+                if buf[(x, y)].symbol() == "W" {
+                    leaked += 1;
+                }
+            }
+            for x in list_width..W {
+                if buf[(x, y)].symbol() == "W" {
+                    preview_w += 1;
+                }
+            }
         }
-        assert!(text.contains("Tab"), "{text}");
+        assert!(
+            preview_w > 0,
+            "expected wrapped live preview content in the right pane"
+        );
+        assert_eq!(
+            leaked, 0,
+            "live preview must not paint into the session list (found {leaked} W cells)"
+        );
     }
 }
