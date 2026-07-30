@@ -263,6 +263,74 @@ pub fn draw_rename_popup(frame: &mut Frame, input: &tui_input::Input) {
     frame.render_widget(popup, area);
 }
 
+/// Render the popover explaining that interactive Cursor resume failed because
+/// of a known upstream Cursor Agent CLI bug (outside ccsm's control).
+pub fn draw_cursor_resume_failed(frame: &mut Frame) {
+    // Content-tight: min height drives size (percent_y is a floor, not inflation).
+    let area = centered_rect_min(58, 3, 54, 13, frame.area());
+    frame.render_widget(Clear, area);
+
+    let key_style = Style::default()
+        .fg(ACCENT_PEACH)
+        .add_modifier(Modifier::BOLD);
+    let text_style = Style::default().fg(FG_TEXT);
+    let muted = Style::default().fg(FG_SUBTEXT);
+
+    let content = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Cursor Agent resume exited right after loading.",
+            text_style,
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  This is a known Cursor Agent CLI bug, not a ccsm",
+            text_style,
+        )),
+        Line::from(Span::styled(
+            "  bug, and is outside this app's control.",
+            text_style,
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Workaround: `agent update`, or headless resume:",
+            muted,
+        )),
+        Line::from(Span::styled(
+            "    agent --resume <id> -p \"…\"",
+            muted,
+        )),
+        Line::from(Span::styled(
+            "  (A second interactive `agent` can interfere.)",
+            muted,
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Enter", key_style),
+            Span::styled("/", text_style),
+            Span::styled("Esc", key_style),
+            Span::styled(" dismiss", text_style),
+        ]),
+    ];
+
+    let popup = Paragraph::new(content)
+        .alignment(ratatui::layout::Alignment::Left)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(ACCENT_RED))
+                .title(Span::styled(
+                    " Cursor resume failed ",
+                    Style::default()
+                        .fg(ACCENT_RED)
+                        .add_modifier(Modifier::BOLD),
+                ))
+                .style(Style::default().bg(BG_SURFACE)),
+        );
+    frame.render_widget(popup, area);
+}
+
 /// Render the update-available prompt showing the current and new version with y/n options.
 pub fn draw_update_prompt(frame: &mut Frame, info: &crate::update::UpdateInfo) {
     let area = centered_rect_min(40, 15, 36, 6, frame.area());

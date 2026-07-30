@@ -28,8 +28,8 @@ use self::dir_picker::draw_dir_picker;
 use self::info_bar::{build_title_spans, build_usage_status_spans, render_status_bar};
 use self::jobs_tab::{draw_job_confirm_popup, draw_job_form_popup, draw_jobs_tab};
 use self::modals::{
-    draw_duplicate_popup, draw_naming_popup, draw_rename_popup, draw_stop_confirm_popup,
-    draw_update_prompt, render_help_popup,
+    draw_cursor_resume_failed, draw_duplicate_popup, draw_naming_popup, draw_rename_popup,
+    draw_stop_confirm_popup, draw_update_prompt, render_help_popup,
 };
 use self::preview_pane::{build_live_preview_text, build_preview_text};
 use self::session_list::{build_flat_items, build_tree_items};
@@ -349,6 +349,11 @@ fn draw_overlays(frame: &mut Frame, app: &mut App) {
         }
     }
 
+    // Cursor interactive-resume failure (known upstream CLI bug)
+    if app.mode == AppMode::CursorResumeFailed {
+        draw_cursor_resume_failed(frame);
+    }
+
     // Help overlay
     if app.mode == AppMode::Help {
         // The popup clamps the scroll to its content, and the clamped value is
@@ -508,6 +513,7 @@ mod tests {
             (AppMode::NamingSession, "plain"),
             (AppMode::StopSessionConfirm, "Stop session"),
             (AppMode::DuplicateSession, "already exists"),
+            (AppMode::CursorResumeFailed, "known Cursor Agent CLI bug"),
         ];
         for (mode, needle) in cases {
             let text = screen(mode.clone(), 60, 20);
@@ -516,6 +522,38 @@ mod tests {
                 "{mode:?} lost {needle:?} at 60x20:\n{text}"
             );
         }
+    }
+
+    #[test]
+    fn cursor_resume_failed_popover_explains_upstream_bug() {
+        let mut app = App::new(vec![], None, Config::default());
+        app.jobs = vec![];
+        app.watch_state = None;
+        app.open_cursor_resume_failed();
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let text: String = (0..30)
+            .map(|y| {
+                (0..100)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("Cursor resume failed"), "{text}");
+        assert!(text.contains("known Cursor Agent CLI bug"), "{text}");
+        assert!(text.contains("outside this app"), "{text}");
+        assert!(!text.contains("Detail:"), "{text}");
+        assert!(text.contains("dismiss"), "{text}");
+        // Must not rely on the status bar alone.
+        let last_row: String = (0..100).map(|x| buf[(x, 29)].symbol().to_string()).collect();
+        assert!(
+            !last_row.contains("known Cursor Agent CLI bug"),
+            "explanation must live in the popover, not only the status bar:\n{last_row}"
+        );
     }
 
     #[test]

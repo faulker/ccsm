@@ -179,6 +179,16 @@ ccsm already has `data::history::strip_xml_tags` for comparable Claude cleanup.
 - `-w` / `--worktree [name]` mirrors Claude's `--worktree`.
 - `agent --resume <chatId> -p "prompt"` appends a turn to an existing chat and
   reuses the same chat directory rather than creating a new one (verified).
+- **Interactive resume can exit immediately** on some CLI builds (observed on
+  `2026.07.23-e383d2b`): the TUI shows "Loading conversation", then the
+  process dies with SIGTERM (`143`). New sessions (`agent --trust`) stay up;
+  print-mode resume (`-p`) still works. Another interactive `agent` in a
+  second terminal can make this worse. ccsm watches the tmux pane briefly
+  after a Cursor live resume and opens a dismissible popover explaining that
+  this is a known Cursor Agent CLI bug outside ccsm's control (instead of a
+  status-bar flash or quitting); it also clears parent `CURSOR_*` / askpass env
+  when spawning so a nested launch from inside another agent session cannot
+  poison the child.
 
 ## Corrections to `CURSOR-SESSION-ADAPTATION.md`
 

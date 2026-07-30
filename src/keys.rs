@@ -451,6 +451,16 @@ impl App {
         }
     }
 
+    /// Dismiss the Cursor resume failure popover (Enter / Esc / y).
+    pub(crate) fn handle_cursor_resume_failed_event(&mut self, key: crossterm::event::KeyEvent) {
+        match key.code {
+            KeyCode::Enter | KeyCode::Esc | KeyCode::Char('y') => {
+                self.dismiss_cursor_resume_failed();
+            }
+            _ => {}
+        }
+    }
+
     /// Read one terminal event and dispatch it based on the current `AppMode`.
     ///
     /// Tracks Shift state, delegates to modal handlers when a popup is open, and
@@ -521,6 +531,11 @@ impl App {
                     }
                     _ => {}
                 }
+                return Ok(());
+            }
+
+            if self.mode == AppMode::CursorResumeFailed {
+                self.handle_cursor_resume_failed_event(key);
                 return Ok(());
             }
 
@@ -974,6 +989,29 @@ mod tests {
     fn shift_and_a_digit_types_its_symbol() {
         // The reported bug: Shift+2 landed in the field as "2".
         assert_eq!(normalize_key(shifted('2')).code, KeyCode::Char('@'));
+    }
+
+    #[test]
+    fn cursor_resume_failed_dismisses_on_enter_esc_or_y() {
+        use crate::config::Config;
+
+        for code in [KeyCode::Enter, KeyCode::Esc, KeyCode::Char('y')] {
+            let mut app = App::new(vec![], None, Config::default());
+            app.open_cursor_resume_failed();
+            assert_eq!(app.mode, AppMode::CursorResumeFailed);
+            app.handle_cursor_resume_failed_event(KeyEvent::new(code, KeyModifiers::NONE));
+            assert_eq!(app.mode, AppMode::Normal, "dismiss via {code:?}");
+        }
+    }
+
+    #[test]
+    fn cursor_resume_failed_ignores_other_keys() {
+        use crate::config::Config;
+
+        let mut app = App::new(vec![], None, Config::default());
+        app.open_cursor_resume_failed();
+        app.handle_cursor_resume_failed_event(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert_eq!(app.mode, AppMode::CursorResumeFailed);
     }
 
     #[test]

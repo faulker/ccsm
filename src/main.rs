@@ -286,6 +286,12 @@ fn run_app(
                                     &argv_refs,
                                     Some(backend),
                                 )?;
+                                live::ensure_live_pane_stays_up(
+                                    &tmux,
+                                    &tmux_name,
+                                    &format!("Cursor Agent resume ({session_id})"),
+                                    live::CURSOR_STARTUP_WATCH,
+                                )?;
                             }
                         }
                         live::attach_to_session(&tmux, &tmux_name)?;
@@ -306,10 +312,16 @@ fn run_app(
                             }
                             data::AgentBackend::CursorAgent => {
                                 let argv = cursor_resume_argv(&agent, &session_id);
-                                std::process::Command::new(&argv[0])
-                                    .args(&argv[1..])
-                                    .current_dir(dir)
-                                    .status()?;
+                                let mut cmd = std::process::Command::new(&argv[0]);
+                                cmd.args(&argv[1..]).current_dir(dir);
+                                live::clear_cursor_parent_env(&mut cmd);
+                                let status = cmd.status()?;
+                                if !status.success() {
+                                    return Err(live::CursorResumeFailure {
+                                        detail: format!("exited with {status}"),
+                                    }
+                                    .into());
+                                }
                             }
                         }
                     }
@@ -344,10 +356,15 @@ fn run_app(
                                     .status()?;
                             }
                             data::AgentBackend::CursorAgent => {
-                                std::process::Command::new(&agent)
-                                    .arg("--trust")
-                                    .current_dir(dir)
-                                    .status()?;
+                                let mut cmd = std::process::Command::new(&agent);
+                                cmd.arg("--trust").current_dir(dir);
+                                live::clear_cursor_parent_env(&mut cmd);
+                                let status = cmd.status()?;
+                                if !status.success() {
+                                    anyhow::bail!(
+                                        "Cursor Agent exited with {status}"
+                                    );
+                                }
                             }
                         }
                     }
@@ -355,7 +372,11 @@ fn run_app(
                 Ok(())
             })();
             if let Err(e) = outcome {
-                app.status_error = Some(format!("{e:#}"));
+                if e.downcast_ref::<live::CursorResumeFailure>().is_some() {
+                    app.open_cursor_resume_failed();
+                } else {
+                    app.status_error = Some(format!("{e:#}"));
+                }
             }
             // Reload sessions after returning from any launch
             if let Ok(sessions) = data::load_all_sessions(filter_path.as_deref()) {

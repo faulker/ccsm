@@ -3,13 +3,33 @@
 use anyhow::Context;
 use regex::Regex;
 use std::io::Write;
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::LazyLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::data::AgentBackend;
 
 pub const TMUX_SOCKET: &str = "ccsm";
+
+/// Parent-process env vars that poison a nested Cursor Agent launch when ccsm
+/// itself is started from inside another `agent` session.
+const CURSOR_PARENT_ENV_VARS: &[&str] = &[
+    "CURSOR_AGENT",
+    "CURSOR_CONVERSATION_ID",
+    "CURSOR_INVOKED_AS",
+    "CURSOR_SESSION_ID",
+    "CURSOR_ASKPASS_SOCKET",
+    "CURSOR_ASKPASS_SECRET",
+    "SUDO_ASKPASS",
+];
+
+/// How long to watch a freshly started Cursor live session for an immediate
+/// exit before attaching. Interactive `agent --resume` on 2026.07.23 dies
+/// within about a second after loading the conversation.
+pub const CURSOR_STARTUP_WATCH: Duration = Duration::from_millis(1200);
+
+const CURSOR_STARTUP_POLL: Duration = Duration::from_millis(100);
 
 /// The tmux session name reserved for the ccsm scheduler daemon. Filtered out
 /// of `discover_live_sessions` so it never appears in the user's session list
@@ -113,8 +133,17 @@ fn parse_session_lines(text: &str) -> Vec<LiveSession> {
 
 /// Infer Claude vs Cursor from the pane's start command when `@ccsm_backend`
 /// was never set. Matches the executable basename only (`claude`, `agent`).
+/// Skips a leading `env -u VAR …` wrapper used to scrub parent Cursor env.
 fn infer_backend_from_start_command(cmd: &str) -> Option<AgentBackend> {
-    let first = cmd.split_whitespace().next()?;
+    let tokens: Vec<&str> = cmd.split_whitespace().collect();
+    let mut i = 0;
+    if tokens.first().copied() == Some("env") {
+        i = 1;
+        while i + 1 < tokens.len() && tokens[i] == "-u" {
+            i += 2;
+        }
+    }
+    let first = tokens.get(i)?;
     let base = std::path::Path::new(first)
         .file_name()
         .and_then(|n| n.to_str())?;
@@ -199,11 +228,35 @@ pub fn is_tmux_available(tmux: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Prefix `cmd` with `env -u …` so a child Cursor Agent does not inherit the
+/// parent chat's identity when ccsm was launched from inside another agent.
+pub fn with_cleared_cursor_env(cmd: &[&str]) -> Vec<String> {
+    let mut out = Vec::with_capacity(2 + CURSOR_PARENT_ENV_VARS.len() * 2 + cmd.len());
+    out.push("env".to_string());
+    for var in CURSOR_PARENT_ENV_VARS {
+        out.push("-u".to_string());
+        out.push((*var).to_string());
+    }
+    out.extend(cmd.iter().map(|s| (*s).to_string()));
+    out
+}
+
+/// Remove Cursor parent-session env vars from a foreground `Command`.
+pub fn clear_cursor_parent_env(cmd: &mut Command) {
+    for var in CURSOR_PARENT_ENV_VARS {
+        cmd.env_remove(var);
+    }
+}
+
 /// Create a new detached tmux session named `name` with working directory `cwd`,
 /// running `cmd` as the initial command. Starts the ccsm tmux server if needed.
 ///
 /// When `backend` is `Some`, tags the session with `@ccsm_backend` so the TUI
 /// can show which agent is running after a rename or restart.
+///
+/// Cursor launches are wrapped with [`with_cleared_cursor_env`] so nested
+/// agent env (from launching ccsm inside another Cursor session) cannot
+/// poison the new pane.
 pub fn start_live_session(
     tmux: &str,
     name: &str,
@@ -219,21 +272,28 @@ pub fn start_live_session(
         .ok_or_else(|| anyhow::anyhow!("Could not determine home directory for config path"))?
         .to_string_lossy()
         .into_owned();
+    let scrubbed = match backend {
+        Some(AgentBackend::CursorAgent) => Some(with_cleared_cursor_env(cmd)),
+        _ => None,
+    };
     // Pass -f so that if the server isn't running yet, it starts with our config.
     // If the server is already running, -f is ignored by tmux.
-    let mut cmd_args = vec![
-        "-L",
-        TMUX_SOCKET,
-        "-f",
-        &conf_path_str,
-        "new-session",
-        "-d",
-        "-s",
-        name,
-        "-c",
-        cwd,
+    let mut cmd_args: Vec<String> = vec![
+        "-L".into(),
+        TMUX_SOCKET.into(),
+        "-f".into(),
+        conf_path_str,
+        "new-session".into(),
+        "-d".into(),
+        "-s".into(),
+        name.to_string(),
+        "-c".into(),
+        cwd.to_string(),
     ];
-    cmd_args.extend(cmd);
+    match &scrubbed {
+        Some(argv) => cmd_args.extend(argv.iter().cloned()),
+        None => cmd_args.extend(cmd.iter().map(|s| (*s).to_string())),
+    }
     let output = std::process::Command::new(tmux).args(&cmd_args).output()?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -241,8 +301,141 @@ pub fn start_live_session(
     }
     if let Some(backend) = backend {
         set_backend_tag(tmux, name, backend)?;
+        // Cursor interactive resume can exit within ~1s; keep the dead pane
+        // around long enough for ensure_live_pane_stays_up to capture it.
+        if backend == AgentBackend::CursorAgent {
+            set_remain_on_exit(tmux, name, true);
+        }
     }
     Ok(())
+}
+
+/// Build argv for `display-message -p -t =name: "#{pane_dead}"`.
+fn pane_dead_args(name: &str) -> Vec<String> {
+    vec![
+        "-L".to_string(),
+        TMUX_SOCKET.to_string(),
+        "display-message".to_string(),
+        "-p".to_string(),
+        "-t".to_string(),
+        pane_target(name),
+        "#{pane_dead}".to_string(),
+    ]
+}
+
+/// True when the session's active pane has exited (tmux `pane_dead`).
+pub fn pane_is_dead(tmux: &str, name: &str) -> bool {
+    std::process::Command::new(tmux)
+        .args(pane_dead_args(name))
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "1")
+        .unwrap_or(false)
+}
+
+fn set_remain_on_exit_args(name: &str, on: bool) -> Vec<String> {
+    vec![
+        "-L".to_string(),
+        TMUX_SOCKET.to_string(),
+        "set-option".to_string(),
+        "-t".to_string(),
+        pane_target(name),
+        "remain-on-exit".to_string(),
+        if on { "on" } else { "off" }.to_string(),
+    ]
+}
+
+fn set_remain_on_exit(tmux: &str, name: &str, on: bool) {
+    let _ = std::process::Command::new(tmux)
+        .args(set_remain_on_exit_args(name, on))
+        .output();
+}
+
+/// Collapse a pane capture into a short, single-line hint for `status_error`.
+pub fn summarize_pane_tail(tail: &str) -> String {
+    let plain = strip_ansi(tail);
+    let lines: Vec<&str> = plain
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    if lines.is_empty() {
+        return String::new();
+    }
+    let take = lines.len().saturating_sub(4);
+    let snippet = lines[take..].join(" | ");
+    if snippet.chars().count() > 160 {
+        let truncated: String = snippet.chars().take(157).collect();
+        format!("{truncated}…")
+    } else {
+        snippet
+    }
+}
+
+/// Watch a freshly started live session briefly; if the pane dies before
+/// attach, capture the tail, kill the session, and return a
+/// [`CursorResumeFailure`] suitable for the TUI popover.
+///
+/// Used for Cursor resume, where the CLI can flash "Loading conversation"
+/// then exit with SIGTERM before the user can interact. `_what` labels the
+/// call site for logs; the popover owns the user-facing explanation.
+pub fn ensure_live_pane_stays_up(
+    tmux: &str,
+    name: &str,
+    _what: &str,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    set_remain_on_exit(tmux, name, true);
+    let deadline = Instant::now() + timeout;
+    loop {
+        let exists = session_exists(tmux, name);
+        let dead = exists && pane_is_dead(tmux, name);
+        if !exists || dead {
+            let tail = if exists {
+                poll_pane_tail(tmux, name, 24)
+            } else {
+                String::new()
+            };
+            let snippet = summarize_pane_tail(&tail);
+            if exists {
+                let _ = stop_live_session(tmux, name);
+            }
+            return Err(cursor_early_exit_error(&snippet));
+        }
+        if Instant::now() >= deadline {
+            set_remain_on_exit(tmux, name, false);
+            return Ok(());
+        }
+        std::thread::sleep(CURSOR_STARTUP_POLL);
+    }
+}
+
+/// Typed failure for interactive Cursor resume dying before the user can
+/// interact. The TUI downcasts this to open a dedicated popover; other launch
+/// errors stay on the status bar.
+#[derive(Debug)]
+pub struct CursorResumeFailure {
+    /// Pane snippet or exit-status detail; may be empty.
+    pub detail: String,
+}
+
+impl std::fmt::Display for CursorResumeFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.detail.is_empty() {
+            write!(f, "Cursor Agent resume exited early")
+        } else {
+            write!(f, "Cursor Agent resume exited early: {}", self.detail)
+        }
+    }
+}
+
+impl std::error::Error for CursorResumeFailure {}
+
+/// Build a [`CursorResumeFailure`] when a Cursor live session dies before attach.
+fn cursor_early_exit_error(snippet: &str) -> anyhow::Error {
+    CursorResumeFailure {
+        detail: snippet.to_string(),
+    }
+    .into()
 }
 
 /// Attach the current process to the named tmux session on the ccsm socket.
@@ -1338,6 +1531,16 @@ mod tests {
     }
 
     #[test]
+    fn infer_backend_skips_env_unset_wrapper() {
+        assert_eq!(
+            infer_backend_from_start_command(
+                "env -u CURSOR_AGENT -u CURSOR_CONVERSATION_ID agent --trust --resume abc"
+            ),
+            Some(AgentBackend::CursorAgent)
+        );
+    }
+
+    #[test]
     fn parse_session_lines_tag_wins_over_start_command() {
         // Tag says Claude even if the start command looks like agent.
         let text = "sess-a\t/home/sess-a\t\tclaude\tagent --trust\n";
@@ -1423,5 +1626,96 @@ mod tests {
     fn detect_interrupted_negative_on_ordinary_output() {
         let content = "some output\nclaude output here";
         assert!(!detect_interrupted(content));
+    }
+
+    #[test]
+    fn with_cleared_cursor_env_prefixes_env_unset() {
+        let argv = with_cleared_cursor_env(&["agent", "--trust", "--resume", "abc"]);
+        assert_eq!(argv[0], "env");
+        assert!(argv.windows(2).any(|w| w == ["-u", "CURSOR_AGENT"]));
+        assert!(argv.windows(2).any(|w| w == ["-u", "CURSOR_CONVERSATION_ID"]));
+        assert!(argv.windows(2).any(|w| w == ["-u", "CURSOR_ASKPASS_SOCKET"]));
+        assert_eq!(&argv[argv.len() - 4..], ["agent", "--trust", "--resume", "abc"]);
+    }
+
+    #[test]
+    fn pane_dead_args_shape() {
+        assert_eq!(
+            pane_dead_args("my-sess"),
+            vec![
+                "-L",
+                "ccsm",
+                "display-message",
+                "-p",
+                "-t",
+                "=my-sess:",
+                "#{pane_dead}"
+            ]
+        );
+    }
+
+    #[test]
+    fn summarize_pane_tail_keeps_last_nonempty_lines() {
+        let tail = "\x1b[32mhello\x1b[0m\n\n\nLoading conversation\n\nboom\n";
+        let s = summarize_pane_tail(tail);
+        assert!(s.contains("Loading conversation"), "{s}");
+        assert!(s.contains("boom"), "{s}");
+        assert!(!s.contains('\x1b'), "{s}");
+    }
+
+    #[test]
+    fn summarize_pane_tail_empty_when_blank() {
+        assert_eq!(summarize_pane_tail("\n\n  \n"), "");
+    }
+
+    #[test]
+    fn ensure_live_pane_stays_up_reports_early_exit() {
+        let tmux = "tmux";
+        if !is_tmux_available(tmux) {
+            return;
+        }
+        let name = format!("ccsm-test-dead-{}", std::process::id());
+        let _ = stop_live_session(tmux, &name);
+        // Sleep briefly so remain-on-exit can be armed before the pane exits.
+        start_live_session(
+            tmux,
+            &name,
+            std::env::temp_dir().to_str().unwrap_or("/tmp"),
+            &["sh", "-c", "echo RESUME_BLEW_UP; sleep 0.25; exit 1"],
+            None,
+        )
+        .expect("start short-lived pane");
+        let err = ensure_live_pane_stays_up(
+            tmux,
+            &name,
+            "test agent",
+            Duration::from_millis(1200),
+        )
+        .expect_err("pane that exits must error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("Cursor Agent resume exited early"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("RESUME_BLEW_UP") || err.downcast_ref::<CursorResumeFailure>().is_some(),
+            "{msg}"
+        );
+        assert!(!session_exists(tmux, &name), "dead session must be cleaned up");
+    }
+
+    #[test]
+    fn cursor_early_exit_error_is_typed_failure() {
+        let err = cursor_early_exit_error("");
+        let fail = err
+            .downcast_ref::<CursorResumeFailure>()
+            .expect("must be CursorResumeFailure");
+        assert!(fail.detail.is_empty());
+
+        let err = cursor_early_exit_error("Loading conversation");
+        let fail = err
+            .downcast_ref::<CursorResumeFailure>()
+            .expect("must be CursorResumeFailure");
+        assert_eq!(fail.detail, "Loading conversation");
     }
 }

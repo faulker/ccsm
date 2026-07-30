@@ -259,6 +259,8 @@ pub enum AppMode {
     JobConfirm,
     /// Stopping a live session is awaiting y/n confirmation (reached only from the Sessions tab).
     StopSessionConfirm,
+    /// Interactive Cursor Agent resume died immediately (known upstream CLI bug).
+    CursorResumeFailed,
 }
 
 /// Which row of the new-session naming popup has keyboard focus.
@@ -913,6 +915,19 @@ impl App {
             }
         }
         self.naming_mode = next;
+    }
+
+    /// Show the Cursor interactive-resume failure popover.
+    ///
+    /// The popover owns the explanation that this is a known upstream CLI bug.
+    pub fn open_cursor_resume_failed(&mut self) {
+        self.status_error = None;
+        self.mode = AppMode::CursorResumeFailed;
+    }
+
+    /// Dismiss the Cursor resume failure popover.
+    pub fn dismiss_cursor_resume_failed(&mut self) {
+        self.mode = AppMode::Normal;
     }
 
     /// Request attaching to `tmux_name` once the TUI exits, but only if that
