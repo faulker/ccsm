@@ -257,6 +257,11 @@ pub fn clear_cursor_parent_env(cmd: &mut Command) {
 /// Cursor launches are wrapped with [`with_cleared_cursor_env`] so nested
 /// agent env (from launching ccsm inside another Cursor session) cannot
 /// poison the new pane.
+///
+/// The session is left with tmux's default `remain-on-exit off`, so the agent
+/// exiting (`/exit`, Ctrl+D) ends the session and detaches the client back to
+/// ccsm. Only [`ensure_live_pane_stays_up`] arms `remain-on-exit`, and it
+/// always disarms or kills the session before returning.
 pub fn start_live_session(
     tmux: &str,
     name: &str,
@@ -301,11 +306,6 @@ pub fn start_live_session(
     }
     if let Some(backend) = backend {
         set_backend_tag(tmux, name, backend)?;
-        // Cursor interactive resume can exit within ~1s; keep the dead pane
-        // around long enough for ensure_live_pane_stays_up to capture it.
-        if backend == AgentBackend::CursorAgent {
-            set_remain_on_exit(tmux, name, true);
-        }
     }
     Ok(())
 }
@@ -378,6 +378,10 @@ pub fn summarize_pane_tail(tail: &str) -> String {
 /// Used for Cursor resume, where the CLI can flash "Loading conversation"
 /// then exit with SIGTERM before the user can interact. `_what` labels the
 /// call site for logs; the popover owns the user-facing explanation.
+///
+/// Arms `remain-on-exit` so a pane that dies during the watch can still be
+/// captured, and disarms it again on the surviving path. Nothing else may arm
+/// it: a session left armed keeps a dead pane (and its client) alive forever.
 pub fn ensure_live_pane_stays_up(
     tmux: &str,
     name: &str,
@@ -1702,6 +1706,34 @@ mod tests {
             "{msg}"
         );
         assert!(!session_exists(tmux, &name), "dead session must be cleaned up");
+    }
+
+    #[test]
+    fn cursor_session_ends_when_its_pane_exits() {
+        let tmux = "tmux";
+        if !is_tmux_available(tmux) {
+            return;
+        }
+        let name = format!("ccsm-test-cursor-exit-{}", std::process::id());
+        let _ = stop_live_session(tmux, &name);
+        start_live_session(
+            tmux,
+            &name,
+            std::env::temp_dir().to_str().unwrap_or("/tmp"),
+            &["sh", "-c", "exit 0"],
+            Some(AgentBackend::CursorAgent),
+        )
+        .expect("start cursor-backed pane");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while session_exists(tmux, &name) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let still_alive = session_exists(tmux, &name);
+        let _ = stop_live_session(tmux, &name);
+        assert!(
+            !still_alive,
+            "a Cursor session must end when the agent exits, not linger as a dead pane"
+        );
     }
 
     #[test]
